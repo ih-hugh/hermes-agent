@@ -96,8 +96,12 @@ class _NonStreamRequest:
             self._retire_codex_request_token()
             # Reuse reason only on a clean response; error or cancel-swallow
             # really closes so the next attempt builds a fresh pool.
-            self.clients.close_once(
-                "request_complete" if self.result["response"] is not None else "request_error_cleanup")
+            try:
+                self.clients.close_once(
+                    "request_complete" if self.result["response"] is not None else "request_error_cleanup")
+            finally:
+                if getattr(self, "_tool_diagnostic_worker_registered", False):
+                    self.agent._tool_send_observer.close_worker()
 
     def _abort_request(self, reason: str) -> None:
         """Watchdog/interrupt kill: abort the request client (kind-aware, #67142)
@@ -247,7 +251,16 @@ class _NonStreamRequest:
         agent._touch_activity("waiting for non-streaming API response")
 
         self.thread = t = h.threading.Thread(target=h._context_thread_target(self._call), daemon=True)
-        t.start()
+        observer = getattr(self.agent, "_tool_send_observer", None)
+        self._tool_diagnostic_worker_registered = observer is not None
+        if observer is not None:
+            observer.register_worker()
+        try:
+            t.start()
+        except BaseException:
+            if observer is not None:
+                observer.close_worker()
+            raise
         poll_count = 0
         while t.is_alive():
             t.join(timeout=0.3)

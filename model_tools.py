@@ -7,6 +7,7 @@ hooks/middleware) plus registry pass-throughs.
 """
 
 import os
+import hashlib
 import json
 import re
 import asyncio
@@ -193,6 +194,7 @@ _LEGACY_TOOLSET_MAP = {
 # includes registry._generation (bumped on register/deregister/alias) so
 # invalidation is transparent; check_fn drift is handled by registry.py's 30 s TTL.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_scope_cache: Dict[tuple, tuple[tuple[str, ...], tuple[str, ...], bool, str]] = {}
 _tool_defs_cache_lock = threading.Lock()
 # FIFO cap: 8 covers a long-lived gateway's warm set of platform/toolset combos.
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway process sees many distinct
@@ -207,6 +209,35 @@ def _clear_tool_defs_cache() -> None:
     """Drop memoized results when a dynamic-schema dependency changes (discord caps, sandbox mode)."""
     with _tool_defs_cache_lock:
         _tool_defs_cache.clear()
+        _tool_defs_scope_cache.clear()
+
+
+def _observe_actual_scope(scope_info: list[tuple[tuple[str, ...], tuple[str, ...], bool, str]],
+                          skip_tool_search_assembly: bool) -> None:
+    if skip_tool_search_assembly:
+        return
+    try:
+        from agent.tool_diagnostic import current_tool_send_observer
+        observer = current_tool_send_observer.get()
+        if observer is None:
+            return
+        if not scope_info:
+            observer.mark_incomplete("capture_failed")
+        else:
+            from tools.tool_search import is_deferrable_tool_name, load_config_readonly
+            preassembly_names, assembly_names, active, assembly_config_digest = scope_info[-1]
+            readonly_config = load_config_readonly()
+            readonly_digest = hashlib.sha256(repr(readonly_config).encode()).hexdigest()
+            scope_names = tuple(sorted(
+                name for name in preassembly_names
+                if is_deferrable_tool_name(name, readonly_config.effective_defer_tools)
+            )) if active else ()
+            observer.set_tool_scope(assembly_names, scope_names, active)
+            if readonly_digest != assembly_config_digest:
+                observer.mark_incomplete("scope_changed")
+    except Exception:
+        if "observer" in locals() and observer is not None:
+            observer.mark_incomplete("capture_failed")
 
 
 def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
@@ -218,11 +249,15 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    scope_info: list[tuple[tuple[str, ...], tuple[str, ...], bool, str]] = []
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+                                         skip_tool_search_assembly=skip_tool_search_assembly,
+                                         scope_info=scope_info)
     if not quiet_mode:
-        return compute()
+        result = compute()
+        _observe_actual_scope(scope_info, skip_tool_search_assembly)
+        return result
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
@@ -236,16 +271,29 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     if cached is None:
         result = compute()
         if cache_key is None:
+            _observe_actual_scope(scope_info, skip_tool_search_assembly)
             return list(result)
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key)  # another thread may have filled it meanwhile
             if cached is None:
                 if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-                    _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
+                    oldest = next(iter(_tool_defs_cache))
+                    _tool_defs_cache.pop(oldest)
+                    _tool_defs_scope_cache.pop(oldest, None)
                 _tool_defs_cache[cache_key] = cached = result
+                if scope_info:
+                    _tool_defs_scope_cache[cache_key] = scope_info[-1]
+            else:
+                scope_info[:] = ([_tool_defs_scope_cache[cache_key]]
+                                 if cache_key in _tool_defs_scope_cache else [])
     else:
         global _last_resolved_tool_names
         _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+    if not scope_info and cache_key is not None:
+        with _tool_defs_cache_lock:
+            if cache_key in _tool_defs_scope_cache:
+                scope_info.append(_tool_defs_scope_cache[cache_key])
+    _observe_actual_scope(scope_info, skip_tool_search_assembly)
     # Always a shallow copy: run_agent appends memory/LCM schemas to its list; a
     # shared list would accumulate duplicate names (HTTP 400 from DeepSeek/Kimi/MiMo).
     return list(cached)
@@ -488,7 +536,8 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                              scope_info: list[tuple[tuple[str, ...], tuple[str, ...], bool, str]] | None = None) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Selection is per schema, not per process/profile. Kanban's local checks
@@ -496,11 +545,12 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
     with scoped_kanban_toolset_selection(enabled_toolsets):
         filtered_tools = _apply_dynamic_schemas(registry.get_definitions(tools_to_include, quiet=quiet_mode))
+    resolved_names = [t["function"]["name"] for t in filtered_tools]
     global _last_resolved_tool_names
-    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    _last_resolved_tool_names = resolved_names
 
     if not quiet_mode:
-        print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
+        print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(resolved_names)}"
               if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
     # Normalize schema shapes llama.cpp's grammar converter rejects (bare
     # "type": "object", string-valued nodes from malformed MCP servers).
@@ -514,6 +564,9 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     # tool_search/describe/call bridge when the deferrable surface exceeds the
     # configured share of the context window. Core tools are never deferred.
     # Must be the LAST step (after sanitization); idempotent if called twice.
+    ts_cfg = None
+    assembly = None
+    preassembly_tools = filtered_tools
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
@@ -527,6 +580,37 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+
+    # This sidecar is observational. A digest or classification failure must
+    # never discard the already-assembled bridge, including on opt-out runs.
+    if (
+        scope_info is not None
+        and not skip_tool_search_assembly
+        and ts_cfg is not None
+        and (ts_cfg.enabled == "off" or assembly is not None)
+    ):
+        try:
+            preassembly_names = tuple(t["function"]["name"] for t in preassembly_tools)
+            config_digest = hashlib.sha256(repr(ts_cfg).encode()).hexdigest()
+            deferred_names = ()
+            if assembly is not None and assembly.activated:
+                from tools.tool_search import classify_tools
+
+                deferred_defs = classify_tools(
+                    preassembly_tools, ts_cfg.effective_defer_tools
+                )[1]
+                deferred_names = tuple(
+                    sorted(t["function"]["name"] for t in deferred_defs)
+                )
+            scope_info.append((
+                preassembly_names,
+                deferred_names,
+                bool(assembly and assembly.activated),
+                config_digest,
+            ))
+        except Exception:
+            # _observe_actual_scope marks opted-in runs capture_failed on missing scope.
+            pass
 
     return filtered_tools
 
@@ -709,6 +793,8 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    from agent.tool_diagnostic_transport import observe_bridge_dispatch
+    observe_bridge_dispatch(current_defs)
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None

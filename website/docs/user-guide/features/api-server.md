@@ -250,6 +250,7 @@ Returns a machine-readable description of the API server's stable surface for ex
     "chat_completions": true,
     "responses_api": true,
     "run_submission": true,
+    "run_tool_diagnostic": {"supported_versions": ["names-v1"]},
     "run_status": true,
     "run_events_sse": true,
     "run_stop": true
@@ -446,6 +447,14 @@ Runs accept a simple `input` string and optional `session_id`, `instructions`, `
 
 For safely retryable creation, send an `Idempotency-Key` header (1–255 visible ASCII characters). Hermes durably reserves the key before starting work. An identical retry returns the original `run_id` with HTTP 202 and `Idempotency-Replayed: true`, including after a gateway restart and after the run has completed, failed, or been cancelled. Reusing the same key with a different JSON payload returns HTTP 409 with code `idempotency_key_conflict`. Keys are isolated by authenticated API profile/credential and retained for 24 hours after their last status update; clients should use unique, unguessable keys and must not reuse them for unrelated operations. Requests without the header retain the legacy behavior and always create a new run.
 
+An operator can opt one run into a names-only tool inventory with
+`"diagnostics": {"tool_inventory": "names-v1"}`. The complete request body,
+including this choice, participates in the idempotency fingerprint. Unknown
+diagnostic versions return HTTP 400 before admission. This option requires a
+profile API bearer and a known process-start identity; room grants cannot use it.
+There is no diagnostic state for an opted-out run. Version support is declared
+at `features.run_tool_diagnostic.supported_versions` in `/v1/capabilities`.
+
 When `session_id` identifies an existing Hermes session and no explicit
 `conversation_history` or `previous_response_id` is supplied, the run loads
 that session's active transcript. Session turn leases serialize concurrent
@@ -468,6 +477,71 @@ Poll the current run state. This is useful for dashboards that need status witho
 ```
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
+
+### GET /v1/runs/\{run_id\}/tool-diagnostic
+
+Read the names-only inventory for the exact API-key/profile owner of an opted-in
+run. A room grant is refused even if another header supplies a bearer. Unknown
+runs and runs under another profile or key both return 404.
+
+```json
+{
+  "object": "hermes.run.tool_diagnostic",
+  "version": "names-v1",
+  "run_id": "run_abc123",
+  "profile": "builder",
+  "process": {"pid": 1234, "started_at": 178000000000},
+  "state": "complete",
+  "attempts": [{
+    "api_request_id": "opaque-sha256-correlation-id",
+    "attempt_index": 1,
+    "api_mode": "chat_completions",
+    "call_role": "main",
+    "advertised_tool_names": ["read_file", "tool_call"],
+    "tool_schema_sha256": "sha256-of-final-sdk-tool-definitions",
+    "deferred_tool_names": ["process_manage", "todo_list"],
+    "tool_search_active": true
+  }]
+}
+```
+
+`process.started_at` is the gateway's opaque positive process-start identity
+token; compare it for equality, not as a timestamp. Each ordered attempt is a
+Hermes-managed SDK invocation, including Hermes retries, after its local
+request rewrites. `api_request_id` is a SHA-256 correlation value of Hermes's
+internal request ID, which may contain a caller-supplied session ID. The digest
+is SHA-256 over UTF-8 JSON of that invocation's
+final tool definitions, serialized with sorted keys and compact separators.
+Neither schema bodies nor request messages are retained. Deferred names
+describe the Tool Search scope selected for that invocation; a later bridge
+call is checked against the scope it actually resolves without changing its
+dispatch decision. This is a temporal observation, not a permanent
+configuration guarantee or an inventory of SDK-internal HTTP retries.
+
+`pending` means the producer or a send-producing worker is still open.
+`complete` requires their positive closure and a contiguous nonempty attempt
+sequence. `incomplete` includes a bounded `reason` code and cannot qualify
+the run as captured. The first version supports the ordinary OpenAI SDK chat
+completions route with resolved API-server toolsets `terminal`, `file`, and
+`todo` (`no_mcp` is a configuration sentinel removed during resolution);
+unsupported API modes, auxiliary sends, and other toolset
+configurations are incomplete. Run outcome must be checked separately.
+Enabled plugins outside the bundled plugin tree, selected plugin tools,
+middleware, auxiliary tasks, context engines, subscriptions, persistent
+plugin carryover, other active callback registries, and unrecognized hooks also make this first version
+incomplete because those paths can start sends outside the observed main SDK
+route. Unselected bundled plugin registrations are allowed. The only supported
+active hooks are the exact bundled Raft activity callbacks; their source and
+identity are checked from already-loaded modules without invoking them.
+The stock gateway message-injection scheduler registration is also allowed
+only when bound to its owning `GatewayRunner` and verified against the bundled
+gateway source, including a `python -m gateway.run` launch; a substituted
+registration makes the result incomplete.
+Records hold at most 16 attempts and 256 opted-in runs per process. Names
+expire 15 minutes after producer closure or within one hour of admission,
+whichever comes first. The same owner then receives a names-free 410
+`expired` tombstone for 15 minutes; after that the response is 404. A
+gateway restart does not restore diagnostics.
 
 ### GET /v1/runs/\{run_id\}/events
 
