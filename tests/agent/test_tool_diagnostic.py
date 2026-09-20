@@ -493,9 +493,7 @@ def test_only_reachable_extension_prevents_complete_claim(
         _system_prompt_sections={"custom": object()}
         if extension == "prompt_section"
         else {},
-        _plugin_commands={"custom": object()}
-        if extension == "plugin_command"
-        else {},
+        _plugin_commands={"custom": object()} if extension == "plugin_command" else {},
     )
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     observer = ToolSendObserver("run_extension", "builder", "owner", 123, 456)
@@ -519,8 +517,13 @@ def test_only_reachable_extension_prevents_complete_claim(
     )
     observer.close_producer()
     if extension in {
-        "external", "middleware", "hook", "selected_tool", "carryover",
-        "prompt_section", "plugin_command",
+        "external",
+        "middleware",
+        "hook",
+        "selected_tool",
+        "carryover",
+        "prompt_section",
+        "plugin_command",
     }:
         assert observer.snapshot()["reason"] == "unsupported_configuration"
     else:
@@ -554,4 +557,26 @@ def test_only_exact_stock_raft_activity_hooks_are_exempt(monkeypatch):
     forged = lambda **_kw: None
     forged.__module__ = raft.__name__
     manager._hooks = {**stock, "pre_llm_call": [forged]}
+    assert _extensions_active(set()) is True
+
+
+def test_only_stock_gateway_owned_message_injector_is_exempt(monkeypatch, tmp_path):
+    from agent.tool_diagnostic_transport import _extensions_active
+    from gateway.run import GatewayRunner
+    from hermes_cli.plugins import PluginManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = PluginManager()
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+    runner._install_plugin_message_injector()
+    assert _extensions_active(set()) is False
+
+    manager.set_gateway_message_injector(runner, lambda **_kwargs: True)
+    assert _extensions_active(set()) is True
+
+    manager.set_gateway_message_injector(
+        object(), runner._schedule_plugin_message_injection
+    )
     assert _extensions_active(set()) is True

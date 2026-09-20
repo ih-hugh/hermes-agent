@@ -26,8 +26,11 @@ _BUNDLED_RAFT_ADAPTER = (
     Path(__file__).resolve().parents[1] / "plugins/platforms/raft/adapter.py"
 ).resolve()
 _BUNDLED_PLUGIN_ROOT = _BUNDLED_RAFT_ADAPTER.parents[2]
+_STOCK_GATEWAY_INBOUND = (
+    Path(__file__).resolve().parents[1] / "gateway/run_inbound.py"
+).resolve()
+_STOCK_GATEWAY_RUN = (Path(__file__).resolve().parents[1] / "gateway/run.py").resolve()
 _UNOBSERVED_CALLBACK_REGISTRIES = (
-    "_gateway_message_injector",
     "_plugin_commands",
     "_system_prompt_sections",
     "_approval_transports",
@@ -63,6 +66,35 @@ def _only_stock_raft_hooks(hooks: dict[str, list[Any]]) -> bool:
         ):
             return False
     return True
+
+
+def _only_stock_gateway_injector(registration: object) -> bool:
+    """Accept only the core GatewayRunner scheduler, without loading or calling it."""
+    if registration is None:
+        return True
+    if not isinstance(registration, tuple) or len(registration) != 2:
+        return False
+    owner, callback = registration
+    inbound_module = sys.modules.get("gateway.run_inbound")
+    run_module = sys.modules.get("gateway.run")
+    if inbound_module is None or run_module is None:
+        return False
+    inbound_class = vars(inbound_module).get("GatewayInboundMixin")
+    runner_class = vars(run_module).get("GatewayRunner")
+    function = getattr(callback, "__func__", None)
+    code = getattr(function, "__code__", None)
+    return bool(
+        isinstance(getattr(inbound_module, "__file__", None), str)
+        and Path(inbound_module.__file__).resolve() == _STOCK_GATEWAY_INBOUND
+        and isinstance(getattr(run_module, "__file__", None), str)
+        and Path(run_module.__file__).resolve() == _STOCK_GATEWAY_RUN
+        and type(owner) is runner_class
+        and getattr(callback, "__self__", None) is owner
+        and inbound_class is not None
+        and vars(inbound_class).get("_schedule_plugin_message_injection") is function
+        and code is not None
+        and Path(code.co_filename).resolve() == _STOCK_GATEWAY_INBOUND
+    )
 
 
 def _pure_drift_markers() -> tuple[int, str]:
@@ -101,6 +133,9 @@ def _extensions_active(selected_tool_names: set[str]) -> bool:
         or getattr(manager, "_context_engine", None)
         or getattr(manager, "_subscriptions", None)
         or getattr(manager, "_persistent_carryover", None)
+        or not _only_stock_gateway_injector(
+            getattr(manager, "_gateway_message_injector", None)
+        )
         or any(getattr(manager, name, None) for name in _UNOBSERVED_CALLBACK_REGISTRIES)
         or selected_tool_names & set(getattr(manager, "_plugin_tool_names", ()))
     )

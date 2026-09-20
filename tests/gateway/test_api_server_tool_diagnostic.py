@@ -382,6 +382,10 @@ async def test_real_run_agent_and_sdk_receiver_reconcile_all_attempts(
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._install_plugin_message_injector()
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "one-key"}))
     app = web.Application()
     app.router.add_post("/v1/runs", adapter._handle_runs)
@@ -429,6 +433,7 @@ async def test_real_run_agent_and_sdk_receiver_reconcile_all_attempts(
     finally:
         await client.close()
         await adapter.disconnect()
+        runner._clear_plugin_message_injector()
         server.shutdown()
         server.server_close()
         server_thread.join()
