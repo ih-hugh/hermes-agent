@@ -1,7 +1,11 @@
 """Private readback and admission rules for names-v1 tool diagnostics."""
 
 import asyncio
+import hashlib
+import json
 import threading
+from contextlib import contextmanager, nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -166,7 +170,7 @@ async def test_cancelled_awaiting_task_does_not_close_executor_producer():
     agent.tools = []
     agent.api_mode = "chat_completions"
     agent.provider = "nous"
-    agent.enabled_toolsets = ["terminal", "file", "todo", "no_mcp"]
+    agent.enabled_toolsets = ["terminal", "file", "todo"]
     from tools.registry import registry
 
     agent._tool_snapshot_generation = registry._generation
@@ -259,3 +263,172 @@ async def test_agent_construction_failure_closes_incomplete_diagnostic():
     finally:
         await client.close()
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_executor_profile_scope_entry_failure_closes_incomplete_diagnostic():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "one-key"}))
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    agent = MagicMock()
+    scopes = 0
+
+    @contextmanager
+    def failing_scope():
+        raise RuntimeError("scope entry failed")
+        yield
+
+    def profile_scope(_profile):
+        nonlocal scopes
+        scopes += 1
+        return nullcontext() if scopes == 1 else failing_scope()
+
+    try:
+        with (
+            patch.object(adapter, "_create_agent", return_value=agent),
+            patch.object(adapter, "_profile_scope", side_effect=profile_scope),
+        ):
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "hello", "diagnostics": {"tool_inventory": "names-v1"}},
+                headers={"Authorization": "Bearer one-key"},
+            )
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            for _ in range(40):
+                observer = adapter._run_tool_diagnostics[run_id]
+                if observer.closed_at is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert scopes >= 2
+            assert observer.snapshot()["state"] == "incomplete"
+            assert observer.snapshot()["reason"] == "unclosed_producer"
+            agent.run_conversation.assert_not_called()
+    finally:
+        await client.close()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_real_run_agent_and_sdk_receiver_reconcile_all_attempts(
+    tmp_path, monkeypatch
+):
+    """Join admission, real AIAgent construction, worker closure, SDK and readback."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # gateway.run captures its process home at import time; this is a new
+    # process-level gateway in a scratch home, not a multiplexed profile.
+    monkeypatch.setattr("gateway.run._hermes_home", home)
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  api_server: [terminal, file, todo, no_mcp]\n"
+        "auxiliary:\n"
+        "  title_generation:\n"
+        "    enabled: false\n"
+        "plugins:\n"
+        "  enabled: []\n",
+        encoding="utf-8",
+    )
+    received = []
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if not self.path.endswith("/chat/completions"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            tools = body.get("tools", [])
+            received.append({
+                "names": [item["function"]["name"] for item in tools],
+                "digest": hashlib.sha256(
+                    json.dumps(
+                        tools,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode()
+                ).hexdigest(),
+            })
+            chunk = {
+                "id": "local-main",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "local",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            data = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "one-key"}))
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get(
+        "/v1/runs/{run_id}/tool-diagnostic", adapter._handle_run_tool_diagnostic
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "model": "local",
+                "provider": "openai",
+                "api_mode": "chat_completions",
+                "api_key": "local-test",
+                "base_url": base_url,
+            },
+        ):
+            response = await client.post(
+                "/v1/runs",
+                json={"input": "Say ok", "diagnostics": {"tool_inventory": "names-v1"}},
+                headers={"Authorization": "Bearer one-key"},
+            )
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            for _ in range(200):
+                readback = await client.get(
+                    f"/v1/runs/{run_id}/tool-diagnostic",
+                    headers={"Authorization": "Bearer one-key"},
+                )
+                assert readback.status == 200
+                diagnostic = await readback.json()
+                if diagnostic["state"] != "pending":
+                    break
+                await asyncio.sleep(0.02)
+            assert diagnostic["state"] == "complete", diagnostic.get("reason")
+            assert received
+            assert len(diagnostic["attempts"]) == len(received)
+            for attempt, wire in zip(diagnostic["attempts"], received, strict=True):
+                assert attempt["advertised_tool_names"] == wire["names"]
+                assert attempt["tool_schema_sha256"] == wire["digest"]
+                assert attempt["api_mode"] == "chat_completions"
+                assert attempt["call_role"] == "main"
+    finally:
+        await client.close()
+        await adapter.disconnect()
+        server.shutdown()
+        server.server_close()
+        server_thread.join()

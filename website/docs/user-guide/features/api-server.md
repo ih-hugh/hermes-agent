@@ -522,12 +522,17 @@ configuration guarantee or an inventory of SDK-internal HTTP retries.
 `complete` requires their positive closure and a contiguous nonempty attempt
 sequence. `incomplete` includes a bounded `reason` code and cannot qualify
 the run as captured. The first version supports the ordinary OpenAI SDK chat
-completions route with the API-server toolsets `terminal`, `file`, `todo`,
-and `no_mcp`; unsupported API modes, auxiliary sends, and other toolset
+completions route with resolved API-server toolsets `terminal`, `file`, and
+`todo` (`no_mcp` is a configuration sentinel removed during resolution);
+unsupported API modes, auxiliary sends, and other toolset
 configurations are incomplete. Run outcome must be checked separately.
-An enabled native plugin, registered middleware or hook, or another loaded
-extension also makes this first version incomplete because those paths can
-start sends outside the observed main SDK route.
+Enabled plugins outside the bundled plugin tree, selected plugin tools,
+middleware, auxiliary tasks, context engines, subscriptions, persistent
+plugin carryover, other active callback registries, and unrecognized hooks also make this first version
+incomplete because those paths can start sends outside the observed main SDK
+route. Unselected bundled plugin registrations are allowed. The only supported
+active hooks are the exact bundled Raft activity callbacks; their source and
+identity are checked from already-loaded modules without invoking them.
 Records hold at most 16 attempts and 256 opted-in runs per process. Names
 expire 15 minutes after producer closure or within one hour of admission,
 whichever comes first. The same owner then receives a names-free 410

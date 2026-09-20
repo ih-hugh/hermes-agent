@@ -539,6 +539,22 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage)``."""
+    observer = run.tool_observer
+    try:
+        return _run_agent_sync_body(self, run, agent, approval_notify, _api_server=_api_server)
+    except BaseException:
+        if observer is not None:
+            observer.mark_incomplete("unclosed_producer")
+        raise
+    finally:
+        # Own the producer from the first import through profile-scope entry,
+        # run cleanup, and usage extraction. The awaiting coroutine cannot
+        # certify this closure after its Future is cancelled.
+        if observer is not None:
+            observer.close_producer()
+
+
+def _run_agent_sync_body(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     from gateway.session_context import clear_session_vars
     from gateway.hosted_room_execution_policy import (
         RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy)
@@ -611,8 +627,6 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                         reset(token)
                 if observer_token is not None:
                     current_tool_send_observer.reset(observer_token)
-                if observer is not None:
-                    observer.close_producer()
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 

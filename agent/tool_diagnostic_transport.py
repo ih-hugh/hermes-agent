@@ -3,12 +3,66 @@
 from __future__ import annotations
 
 import hashlib
+import sys
+from pathlib import Path
 from typing import Any
 
 from agent.tool_diagnostic import ToolSendObserver, current_tool_send_observer
 
 _BRIDGE_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
-_SUPPORTED_TOOLSETS = frozenset({"terminal", "file", "todo", "no_mcp"})
+# `no_mcp` is a config sentinel removed by _get_platform_tools before it
+# passes enabled_toolsets to AIAgent. Observe the resolved runtime selection.
+_SUPPORTED_TOOLSETS = frozenset({"terminal", "file", "todo"})
+_RAFT_HOOK_FUNCTIONS = {
+    "on_session_start": "_on_session_start",
+    "on_session_end": "_on_session_end",
+    "on_session_finalize": "_on_session_finalize",
+    "pre_llm_call": "_on_pre_llm_call",
+    "post_llm_call": "_on_post_llm_call",
+    "pre_tool_call": "_on_pre_tool_call",
+    "post_tool_call": "_on_post_tool_call",
+}
+_BUNDLED_RAFT_ADAPTER = (
+    Path(__file__).resolve().parents[1] / "plugins/platforms/raft/adapter.py"
+).resolve()
+_BUNDLED_PLUGIN_ROOT = _BUNDLED_RAFT_ADAPTER.parents[2]
+_UNOBSERVED_CALLBACK_REGISTRIES = (
+    "_gateway_message_injector",
+    "_plugin_commands",
+    "_system_prompt_sections",
+    "_approval_transports",
+    "_slack_action_handlers",
+    "_platform_handler_factories",
+    "_memory_hook_registrations",
+)
+
+
+def _only_stock_raft_hooks(hooks: dict[str, list[Any]]) -> bool:
+    """Allow exact, already-loaded Raft activity callbacks only.
+
+    The bundled adapter's `_raft_hook` gate runs its body only for Raft
+    sessions; its body emits platform activity and makes no model SDK call.
+    Never import a module, discover a plugin, or invoke a callback here.
+    """
+    for kind, callbacks in hooks.items():
+        expected_name = _RAFT_HOOK_FUNCTIONS.get(kind)
+        if expected_name is None or len(callbacks) != 1:
+            return False
+        callback = callbacks[0]
+        module = sys.modules.get(getattr(callback, "__module__", ""))
+        if module is None:
+            return False
+        source = getattr(module, "__file__", None)
+        code = getattr(callback, "__code__", None)
+        if (
+            not isinstance(source, str)
+            or Path(source).resolve() != _BUNDLED_RAFT_ADAPTER
+            or code is None
+            or Path(code.co_filename).resolve() != _BUNDLED_RAFT_ADAPTER
+            or getattr(module, expected_name, None) is not callback
+        ):
+            return False
+    return True
 
 
 def _pure_drift_markers() -> tuple[int, str]:
@@ -19,20 +73,36 @@ def _pure_drift_markers() -> tuple[int, str]:
     return registry._generation, config_digest
 
 
-def _extensions_active() -> bool:
-    """Read already-loaded extension state; never discover or invoke a plugin."""
+def _extensions_active(selected_tool_names: set[str]) -> bool:
+    """Reject reachable callbacks/tools, without discovering or invoking plugins."""
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
+    hooks = {kind: callbacks for kind, callbacks in manager._hooks.items() if callbacks}
+    # User/project/entry-point plugin setup can perform sends even if it leaves
+    # no registered tool or callback. The stock bundled tree is assessed by
+    # reachable registrations below, rather than by its installed plugin count.
+    external_plugin = any(
+        getattr(plugin, "enabled", False)
+        and (
+            getattr(getattr(plugin, "manifest", None), "source", None) != "bundled"
+            or not isinstance(getattr(plugin.manifest, "path", None), str)
+            or not Path(plugin.manifest.path)
+            .resolve()
+            .is_relative_to(_BUNDLED_PLUGIN_ROOT)
+        )
+        for plugin in manager._plugins.values()
+    )
     return bool(
-        any(getattr(plugin, "enabled", False) for plugin in manager._plugins.values())
+        external_plugin
         or any(manager._middleware.values())
-        or any(manager._hooks.values())
+        or (hooks and not _only_stock_raft_hooks(hooks))
         or getattr(manager, "_aux_tasks", None)
         or getattr(manager, "_context_engine", None)
         or getattr(manager, "_subscriptions", None)
-        or getattr(manager, "_plugin_tool_names", None)
         or getattr(manager, "_persistent_carryover", None)
+        or any(getattr(manager, name, None) for name in _UNOBSERVED_CALLBACK_REGISTRIES)
+        or selected_tool_names & set(getattr(manager, "_plugin_tool_names", ()))
     )
 
 
@@ -64,17 +134,19 @@ def bind_agent_tool_scope(agent: Any, observer: ToolSendObserver) -> None:
             != registry._generation
         ):
             observer.mark_incomplete("scope_changed")
-        if _extensions_active():
+        if _extensions_active(tool_names | set(names)):
             observer.mark_incomplete("unsupported_configuration")
         observer.set_drift_markers(*_pure_drift_markers())
     except Exception:
         observer.mark_incomplete("capture_failed")
 
 
-def _check_pure_drift(observer: ToolSendObserver) -> None:
+def _check_pure_drift(
+    observer: ToolSendObserver, selected_tool_names: set[str]
+) -> None:
     try:
         observer.check_drift_markers(*_pure_drift_markers())
-        if _extensions_active():
+        if _extensions_active(selected_tool_names):
             observer.mark_incomplete("unsupported_configuration")
     except Exception:
         observer.mark_incomplete("capture_failed")
@@ -88,7 +160,6 @@ def observe_sdk_send(
     if observer is None:
         return
     try:
-        _check_pure_drift(observer)
         tools = sdk_kwargs.get("tools", [])
         names, active = observer.frozen_scope()
         actual_names = (
@@ -101,6 +172,10 @@ def observe_sdk_send(
             else set()
         )
         actual_active = _BRIDGE_NAMES.issubset(actual_names)
+        _check_pure_drift(
+            observer,
+            {name for name in actual_names if isinstance(name, str)} | set(names),
+        )
         if active != actual_active:
             observer.mark_incomplete("scope_changed")
         observer.observe_scope(names, actual_active)
@@ -154,10 +229,9 @@ def observe_bridge_dispatch(current_defs: list[dict[str, Any]]) -> None:
     try:
         from tools.tool_search import scoped_deferrable_names
 
-        _check_pure_drift(observer)
-        observer.observe_scope(
-            tuple(sorted(scoped_deferrable_names(current_defs))), True
-        )
+        scoped_names = tuple(sorted(scoped_deferrable_names(current_defs)))
+        _check_pure_drift(observer, set(scoped_names))
+        observer.observe_scope(scoped_names, True)
     except Exception:
         observer.mark_incomplete("capture_failed")
 

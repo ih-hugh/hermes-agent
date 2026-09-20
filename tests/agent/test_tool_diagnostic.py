@@ -1,9 +1,11 @@
 """The names-only send observer must reconcile actual invocations safely."""
 
 import hashlib
+import importlib
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -302,7 +304,7 @@ def test_bridge_scope_drift_is_incomplete_without_changing_dispatch(monkeypatch)
     from tools import tool_search as ts
 
     monkeypatch.setattr(
-        "agent.tool_diagnostic_transport._extensions_active", lambda: False
+        "agent.tool_diagnostic_transport._extensions_active", lambda _names: False
     )
 
     cfg = ts.ToolSearchConfig.from_raw({"enabled": "on", "defer": ["process_manage"]})
@@ -372,7 +374,7 @@ def test_ordinary_tool_selection_records_same_scope_on_cache_hit(monkeypatch, tm
         token = current_tool_send_observer.set(observer)
         try:
             definitions = model_tools.get_tool_definitions(
-                enabled_toolsets=["terminal", "file", "todo", "no_mcp"], quiet_mode=True
+                enabled_toolsets=["terminal", "file", "todo"], quiet_mode=True
             )
         finally:
             current_tool_send_observer.reset(token)
@@ -435,26 +437,72 @@ def test_unknown_toolset_and_auxiliary_path_are_sticky_incomplete():
     assert auxiliary.snapshot()["reason"] == "unsupported_call_role"
 
 
-@pytest.mark.parametrize("extension", ["plugin", "middleware", "hook", "registration"])
-def test_loaded_extension_prevents_complete_claim(monkeypatch, tmp_path, extension):
+def test_no_mcp_config_sentinel_is_removed_before_agent_scope(monkeypatch, tmp_path):
+    from hermes_cli.tools_config import _get_platform_tools
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    resolved = _get_platform_tools(
+        {"platform_toolsets": {"api_server": ["terminal", "file", "todo", "no_mcp"]}},
+        "api_server",
+    )
+    assert resolved == {"terminal", "file", "todo"}
+
+
+@pytest.mark.parametrize(
+    "extension",
+    [
+        "plugin",
+        "external",
+        "middleware",
+        "hook",
+        "registration",
+        "selected_tool",
+        "carryover",
+        "prompt_section",
+        "plugin_command",
+    ],
+)
+def test_only_reachable_extension_prevents_complete_claim(
+    monkeypatch, tmp_path, extension
+):
     from agent.tool_diagnostic_transport import bind_agent_tool_scope
     from tools.registry import registry
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    bundled_path = Path(__file__).resolve().parents[2] / "plugins/platforms/raft"
     manager = SimpleNamespace(
-        _plugins={"custom": SimpleNamespace(enabled=True)}
-        if extension == "plugin"
+        _plugins={
+            "custom": SimpleNamespace(
+                enabled=True,
+                manifest=SimpleNamespace(
+                    source="user" if extension == "external" else "bundled",
+                    path=str(tmp_path)
+                    if extension == "external"
+                    else str(bundled_path),
+                ),
+            )
+        }
+        if extension in {"plugin", "external"}
         else {},
         _middleware={"llm_request": [object()]} if extension == "middleware" else {},
         _hooks={"pre_tool_call": [object()]} if extension == "hook" else {},
-        _plugin_tool_names={"custom_tool"} if extension == "registration" else set(),
+        _plugin_tool_names={"custom_tool"}
+        if extension in {"registration", "selected_tool"}
+        else set(),
+        _persistent_carryover=[object()] if extension == "carryover" else [],
+        _system_prompt_sections={"custom": object()}
+        if extension == "prompt_section"
+        else {},
+        _plugin_commands={"custom": object()}
+        if extension == "plugin_command"
+        else {},
     )
     monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
     observer = ToolSendObserver("run_extension", "builder", "owner", 123, 456)
     observer.set_tool_scope((), (), False)
     agent = SimpleNamespace(
-        tools=[],
-        enabled_toolsets=["terminal", "file", "todo", "no_mcp"],
+        tools=[_tool("custom_tool")] if extension == "selected_tool" else [],
+        enabled_toolsets=["terminal", "file", "todo"],
         api_mode="chat_completions",
         provider="nous",
         base_url="https://example.invalid/v1",
@@ -465,9 +513,45 @@ def test_loaded_extension_prevents_complete_claim(monkeypatch, tmp_path, extensi
         "main",
         "chat_completions",
         "main",
-        [],
+        agent.tools,
         deferred_tool_names=(),
         tool_search_active=False,
     )
     observer.close_producer()
-    assert observer.snapshot()["reason"] == "unsupported_configuration"
+    if extension in {
+        "external", "middleware", "hook", "selected_tool", "carryover",
+        "prompt_section", "plugin_command",
+    }:
+        assert observer.snapshot()["reason"] == "unsupported_configuration"
+    else:
+        assert observer.snapshot()["state"] == "complete"
+
+
+def test_only_exact_stock_raft_activity_hooks_are_exempt(monkeypatch):
+    from agent.tool_diagnostic_transport import _RAFT_HOOK_FUNCTIONS, _extensions_active
+
+    raft = importlib.import_module("plugins.platforms.raft.adapter")
+    stock = {
+        kind: [getattr(raft, function_name)]
+        for kind, function_name in _RAFT_HOOK_FUNCTIONS.items()
+    }
+    manager = SimpleNamespace(
+        _plugins={},
+        _middleware={},
+        _hooks=stock,
+        _aux_tasks={},
+        _context_engine=None,
+        _subscriptions={},
+        _plugin_tool_names=set(),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    assert _extensions_active(set()) is False
+
+    manager._hooks = {**stock, "pre_llm_call": [lambda **_kw: None]}
+    assert _extensions_active(set()) is True
+    manager._hooks = {**stock, "pre_api_request": [raft._on_session_start]}
+    assert _extensions_active(set()) is True
+    forged = lambda **_kw: None
+    forged.__module__ = raft.__name__
+    manager._hooks = {**stock, "pre_llm_call": [forged]}
+    assert _extensions_active(set()) is True
