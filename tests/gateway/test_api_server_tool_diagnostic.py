@@ -3,9 +3,19 @@
 import asyncio
 import hashlib
 import json
+import os
+import secrets
+import signal
+import socket
+import subprocess
+import sys
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -437,3 +447,193 @@ async def test_real_run_agent_and_sdk_receiver_reconcile_all_attempts(
         server.shutdown()
         server.server_close()
         server_thread.join()
+
+
+def test_module_launched_gateway_accepts_stock_scheduler(tmp_path):
+    """The supported ``python -m gateway.run`` identity must complete on loopback."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    guard = tmp_path / "guard"
+    guard.mkdir()
+    (guard / "sitecustomize.py").write_text(
+        "import ipaddress, socket\n"
+        "_connect = socket.socket.connect\n"
+        "_connect_ex = socket.socket.connect_ex\n"
+        "_bind = socket.socket.bind\n"
+        "_resolve = socket.getaddrinfo\n"
+        "def _local(host):\n"
+        "    if host in ('localhost', 'localhost.'): return True\n"
+        "    try: return ipaddress.ip_address(host).is_loopback\n"
+        "    except (ValueError, TypeError): return False\n"
+        "def _checked_connect(self, addr):\n"
+        "    if self.family in (socket.AF_INET, socket.AF_INET6) and not _local(addr[0]): raise OSError('non-loopback connect blocked')\n"
+        "    return _connect(self, addr)\n"
+        "def _checked_connect_ex(self, addr):\n"
+        "    if self.family in (socket.AF_INET, socket.AF_INET6) and not _local(addr[0]): raise OSError('non-loopback connect blocked')\n"
+        "    return _connect_ex(self, addr)\n"
+        "def _checked_bind(self, addr):\n"
+        "    if self.family in (socket.AF_INET, socket.AF_INET6) and not _local(addr[0]): raise OSError('non-loopback bind blocked')\n"
+        "    return _bind(self, addr)\n"
+        "def _checked_resolve(host, *args, **kwargs):\n"
+        "    if host is not None and not _local(host): raise OSError('non-loopback DNS blocked')\n"
+        "    return _resolve(host, *args, **kwargs)\n"
+        "socket.socket.connect = _checked_connect\n"
+        "socket.socket.connect_ex = _checked_connect_ex\n"
+        "socket.socket.bind = _checked_bind\n"
+        "socket.getaddrinfo = _checked_resolve\n",
+        encoding="utf-8",
+    )
+
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path != "/v1/chat/completions":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            tools = body.get("tools", [])
+            self.server.received.append({
+                "names": [item["function"]["name"] for item in tools],
+                "digest": hashlib.sha256(
+                    json.dumps(
+                        tools,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode()
+                ).hexdigest(),
+            })
+            chunk = {
+                "id": "module-local",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "local",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            data = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass
+
+    receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    receiver.received = []
+    receiver_thread = threading.Thread(target=receiver.serve_forever, daemon=True)
+    receiver_thread.start()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        gateway_port = probe.getsockname()[1]
+    (home / "config.yaml").write_text(
+        "fallback_providers: []\nplatforms:\n  api_server:\n    enabled: true\n"
+        f"    host: 127.0.0.1\n    port: {gateway_port}\n"
+        "gateway:\n  multiplex_profiles: false\n  loop_watchdog: false\n"
+        "platform_toolsets:\n  api_server: [terminal, file, todo, no_mcp]\n"
+        "agent:\n  max_iterations: 5\n"
+        "model:\n  default: local\n  provider: custom\n"
+        f"  base_url: http://127.0.0.1:{receiver.server_port}/v1\n"
+        "  api_mode: chat_completions\n  api_key: local-placeholder\n"
+        "  streaming: true\n"
+        "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+        "delegation:\n  orchestrator_enabled: false\n"
+        "plugins:\n  enabled: []\n"
+        "auxiliary:\n  title_generation:\n    enabled: false\n"
+        "checkpoints:\n  enabled: false\n"
+        "security:\n  tirith_enabled: false\n",
+        encoding="utf-8",
+    )
+    repo = Path(__file__).resolve().parents[2]
+    key = secrets.token_hex(24)
+    env = {
+        "HOME": str(tmp_path),
+        "HERMES_HOME": str(home),
+        "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+        "PYTHONPATH": os.pathsep.join((str(guard), str(repo))),
+        "PYTHONNOUSERSITE": "1",
+        "API_SERVER_HOST": "127.0.0.1",
+        "API_SERVER_PORT": str(gateway_port),
+        "API_SERVER_KEY": key,
+        "OPENAI_API_KEY": "local-placeholder",
+        "GATEWAY_MULTIPLEX_PROFILES": "false",
+        "TMPDIR": str(tmp_path),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "gateway.run"],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    base = f"http://127.0.0.1:{gateway_port}/p/default"
+
+    def request(method, path, payload=None):
+        raw = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Authorization": f"Bearer {key}"}
+        if raw is not None:
+            headers["Content-Type"] = "application/json"
+        req = Request(base + path, data=raw, headers=headers, method=method)
+        with urlopen(req, timeout=10) as response:
+            return json.loads(response.read())
+
+    try:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            assert process.poll() is None, "scratch gateway exited before health"
+            try:
+                if request("GET", "/v1/capabilities"):
+                    break
+            except (OSError, URLError, HTTPError, ValueError):
+                time.sleep(0.2)
+        else:
+            pytest.fail("scratch gateway did not answer")
+        admitted = request(
+            "POST",
+            "/v1/runs",
+            {
+                "input": "Say ok",
+                "diagnostics": {"tool_inventory": "names-v1"},
+            },
+        )
+        run_id = admitted["run_id"]
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                diagnostic = request("GET", f"/v1/runs/{run_id}/tool-diagnostic")
+            except (OSError, URLError):
+                time.sleep(0.1)
+                continue
+            if diagnostic["state"] != "pending":
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("scratch diagnostic did not settle")
+        assert diagnostic["state"] == "complete", diagnostic.get("reason")
+        assert receiver.received
+        assert len(diagnostic["attempts"]) == len(receiver.received)
+        for attempt, wire in zip(
+            diagnostic["attempts"], receiver.received, strict=True
+        ):
+            assert attempt["advertised_tool_names"] == wire["names"]
+            assert attempt["tool_schema_sha256"] == wire["digest"]
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+        receiver.shutdown()
+        receiver.server_close()
+        receiver_thread.join()

@@ -535,7 +535,8 @@ active hooks are the exact bundled Raft activity callbacks; their source and
 identity are checked from already-loaded modules without invoking them.
 The stock gateway message-injection scheduler registration is also allowed
 only when bound to its owning `GatewayRunner` and verified against the bundled
-gateway source; a substituted registration makes the result incomplete.
+gateway source, including a `python -m gateway.run` launch; a substituted
+registration makes the result incomplete.
 Records hold at most 16 attempts and 256 opted-in runs per process. Names
 expire 15 minutes after producer closure or within one hour of admission,
 whichever comes first. The same owner then receives a names-free 410

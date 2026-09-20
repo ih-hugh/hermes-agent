@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 from agent.tool_diagnostic import ToolSendObserver, current_tool_send_observer
@@ -75,21 +76,23 @@ def _only_stock_gateway_injector(registration: object) -> bool:
     if not isinstance(registration, tuple) or len(registration) != 2:
         return False
     owner, callback = registration
+    if not isinstance(callback, MethodType):
+        return False
     inbound_module = sys.modules.get("gateway.run_inbound")
-    run_module = sys.modules.get("gateway.run")
+    runner_class = type(owner)
+    run_module = sys.modules.get(runner_class.__module__)
     if inbound_module is None or run_module is None:
         return False
     inbound_class = vars(inbound_module).get("GatewayInboundMixin")
-    runner_class = vars(run_module).get("GatewayRunner")
-    function = getattr(callback, "__func__", None)
+    function = callback.__func__
     code = getattr(function, "__code__", None)
     return bool(
         isinstance(getattr(inbound_module, "__file__", None), str)
         and Path(inbound_module.__file__).resolve() == _STOCK_GATEWAY_INBOUND
         and isinstance(getattr(run_module, "__file__", None), str)
         and Path(run_module.__file__).resolve() == _STOCK_GATEWAY_RUN
-        and type(owner) is runner_class
-        and getattr(callback, "__self__", None) is owner
+        and vars(run_module).get("GatewayRunner") is runner_class
+        and callback.__self__ is owner
         and inbound_class is not None
         and vars(inbound_class).get("_schedule_plugin_message_injection") is function
         and code is not None

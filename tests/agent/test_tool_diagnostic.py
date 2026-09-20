@@ -580,3 +580,14 @@ def test_only_stock_gateway_owned_message_injector_is_exempt(monkeypatch, tmp_pa
         object(), runner._schedule_plugin_message_injection
     )
     assert _extensions_active(set()) is True
+
+    class SpoofedCallable:
+        def __init__(self):
+            self.__func__ = runner._schedule_plugin_message_injection.__func__
+            self.__self__ = runner
+
+        def __call__(self, **_kwargs):
+            return True
+
+    manager.set_gateway_message_injector(runner, SpoofedCallable())
+    assert _extensions_active(set()) is True
