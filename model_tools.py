@@ -564,30 +564,53 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     # tool_search/describe/call bridge when the deferrable surface exceeds the
     # configured share of the context window. Core tools are never deferred.
     # Must be the LAST step (after sanitization); idempotent if called twice.
+    ts_cfg = None
+    assembly = None
+    preassembly_tools = filtered_tools
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        preassembly_names = tuple(t["function"]["name"] for t in filtered_tools)
-        config_digest = hashlib.sha256(repr(ts_cfg).encode()).hexdigest()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
-            if scope_info is not None:
-                from tools.tool_search import classify_tools
-                deferred_defs = classify_tools(filtered_tools, ts_cfg.effective_defer_tools)[1]
-                scope_info.append((
-                    preassembly_names,
-                    tuple(sorted(t["function"]["name"] for t in deferred_defs)) if assembly.activated else (),
-                    bool(assembly.activated), config_digest))
             if assembly.activated and not quiet_mode:
                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
                       f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
                       f"tool_search/describe/call — "
                       f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}.")
             filtered_tools = assembly.tool_defs
-        elif scope_info is not None and not skip_tool_search_assembly:
-            scope_info.append((preassembly_names, (), False, config_digest))
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+
+    # This sidecar is observational. A digest or classification failure must
+    # never discard the already-assembled bridge, including on opt-out runs.
+    if (
+        scope_info is not None
+        and not skip_tool_search_assembly
+        and ts_cfg is not None
+        and (ts_cfg.enabled == "off" or assembly is not None)
+    ):
+        try:
+            preassembly_names = tuple(t["function"]["name"] for t in preassembly_tools)
+            config_digest = hashlib.sha256(repr(ts_cfg).encode()).hexdigest()
+            deferred_names = ()
+            if assembly is not None and assembly.activated:
+                from tools.tool_search import classify_tools
+
+                deferred_defs = classify_tools(
+                    preassembly_tools, ts_cfg.effective_defer_tools
+                )[1]
+                deferred_names = tuple(
+                    sorted(t["function"]["name"] for t in deferred_defs)
+                )
+            scope_info.append((
+                preassembly_names,
+                deferred_names,
+                bool(assembly and assembly.activated),
+                config_digest,
+            ))
+        except Exception:
+            # _observe_actual_scope marks opted-in runs capture_failed on missing scope.
+            pass
 
     return filtered_tools
 

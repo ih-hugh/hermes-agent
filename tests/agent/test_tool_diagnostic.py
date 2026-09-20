@@ -387,6 +387,84 @@ def test_ordinary_tool_selection_records_same_scope_on_cache_hit(monkeypatch, tm
     assert set(scopes[0][0]) <= {"process_manage", "todo_list"}
 
 
+@pytest.mark.parametrize("failure", ["digest", "classification"])
+def test_scope_bookkeeping_failure_preserves_assembled_definitions(
+    monkeypatch, tmp_path, failure
+):
+    import model_tools
+    from agent.tool_diagnostic import current_tool_send_observer
+    from tools import tool_search as ts
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = ts.ToolSearchConfig.from_raw({
+        "enabled": "on",
+        "defer": ["process_manage", "todo_list"],
+    })
+    monkeypatch.setattr(ts, "load_config", lambda: cfg)
+    monkeypatch.setattr(ts, "load_config_readonly", lambda: cfg)
+
+    def definitions():
+        return model_tools.get_tool_definitions(
+            enabled_toolsets=["terminal", "file", "todo"], quiet_mode=True
+        )
+
+    model_tools._clear_tool_defs_cache()
+    expected = definitions()
+    assert {"tool_search", "tool_describe", "tool_call"} <= {
+        item["function"]["name"] for item in expected
+    }
+
+    for opted_in in (False, True):
+        model_tools._clear_tool_defs_cache()
+        observer = (
+            ToolSendObserver("run_x", "builder", "owner", 123, 456)
+            if opted_in
+            else None
+        )
+        token = current_tool_send_observer.set(observer)
+        try:
+            with monkeypatch.context() as fault:
+                if failure == "digest":
+
+                    def fail_digest(_value):
+                        raise RuntimeError("observer digest failed")
+
+                    fault.setattr(
+                        model_tools, "hashlib", SimpleNamespace(sha256=fail_digest)
+                    )
+                else:
+                    original_classify = ts.classify_tools
+                    calls = 0
+
+                    def fail_observer_classification(*args, **kwargs):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            raise RuntimeError("observer classification failed")
+                        return original_classify(*args, **kwargs)
+
+                    fault.setattr(ts, "classify_tools", fail_observer_classification)
+                actual = definitions()
+                assert actual == expected
+                assert definitions() == expected  # cached return keeps the same bridge
+        finally:
+            current_tool_send_observer.reset(token)
+
+        if observer is not None:
+            observer.capture_sdk_send(
+                "request_x",
+                "chat_completions",
+                "main",
+                actual,
+                deferred_tool_names=(),
+                tool_search_active=True,
+            )
+            observer.close_producer()
+            report = observer.snapshot()
+            assert report["state"] == "incomplete"
+            assert report["reason"] == "capture_failed"
+
+
 def test_unknown_toolset_and_auxiliary_path_are_sticky_incomplete():
     from agent.tool_diagnostic import current_tool_send_observer
     from agent.tool_diagnostic_transport import (
