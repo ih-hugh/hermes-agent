@@ -24,6 +24,7 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.platforms import api_server_tool_diagnostic as _tool_diag
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -98,12 +99,14 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    _tool_diag.initialize(self)
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+        ("GET", "/v1/runs/{run_id}/tool-diagnostic", self._handle_run_tool_diagnostic),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
@@ -332,6 +335,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    tool_observer: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -392,6 +396,14 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    diagnostic_requested, diagnostic_error = _tool_diag.requested_version(body)
+    if diagnostic_error is not None:
+        return _json_error(_openai_error, "Unsupported tool diagnostic request",
+                           code=diagnostic_error, status=400)
+    if diagnostic_requested:
+        error = _tool_diag.admission_error(self, request, _openai_error=_openai_error)
+        if error is not None:
+            return error
     room_dispatch, room_execution_policy = (
         v if isinstance(v, dict) else None for v in (
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
@@ -443,6 +455,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             retention_until=_room_retention_until(request))
         if outcome == "conflict" or (outcome == "reused" and record is not None):
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
+    if diagnostic_requested:
+        error = _tool_diag.capacity_error(self, _openai_error=_openai_error)
+        if error is not None:
+            return error
     # Enforce concurrency only for a genuinely new run.
     limited = self._concurrency_limited_response()
     if limited is not None:
@@ -472,6 +488,17 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    # There is no await between this final capacity check and the observer's
+    # creation. Session resolution above can yield to another admission.
+    if diagnostic_requested:
+        _tool_diag.sweep(self)
+        error = _tool_diag.capacity_error(self, _openai_error=_openai_error)
+        if error is not None:
+            self._run_owners.pop(run_id, None)
+            return error
+    tool_observer = (_tool_diag.create(
+        self, run_id, _api_server._api_request_profile.get() or "default",
+        self._run_owners[run_id]) if diagnostic_requested else None)
     q = self._run_streams[run_id] = asyncio.Queue()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
@@ -483,6 +510,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
             retention_until=_room_retention_until(request))
         if outcome != "created":
+            self._run_tool_diagnostics.pop(run_id, None)
             _forget_run(
                 self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
                 self._run_statuses, self._run_owners)
@@ -498,7 +526,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        tool_observer=tool_observer)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -525,8 +554,16 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
+    observer = run.tool_observer
+    observer_token = None
     with self._profile_scope(run.request_profile):
         try:
+            if observer is not None:
+                from agent.tool_diagnostic import current_tool_send_observer
+                agent._tool_send_observer = observer
+                observer_token = current_tool_send_observer.set(observer)
+                from agent.tool_diagnostic_transport import bind_agent_tool_scope
+                bind_agent_tool_scope(agent, observer)
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
             # chat_id carries the raw session id like _run_agent() does; without it
@@ -561,18 +598,21 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 user_message=run.user_message, conversation_history=run.conversation_history,
                 task_id=effective_task_id, **author_kwargs)
         finally:
-            # Clear ownership now so a later stop can't reap work this run left running.
-            _api_server._clear_turn_process_ownership(agent)
-            # Declared-conversation binding, same precedence gate as _run_agent.
-            if run.declared_selected:
-                self._bind_declared_conversation(
-                    getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
             try:
+                # Clear ownership now so a later stop can't reap work this run left running.
+                _api_server._clear_turn_process_ownership(agent)
+                if run.declared_selected:
+                    self._bind_declared_conversation(
+                        getattr(agent, "session_id", None) or session_id, run.gateway_session_key)
                 unregister_gateway_notify(run.approval_session_key)
             finally:
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
+                if observer_token is not None:
+                    current_tool_send_observer.reset(observer_token)
+                if observer is not None:
+                    observer.close_producer()
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
@@ -618,19 +658,28 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
 
+    producer_dispatched = False
     try:
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                **run.agent_kwargs)
+        from agent.tool_diagnostic import current_tool_send_observer
+        observer_token = current_tool_send_observer.set(run.tool_observer) if run.tool_observer else None
+        try:
+            with self._profile_scope(run.request_profile):
+                agent = self._create_agent(
+                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                    **run.agent_kwargs)
+        finally:
+            if observer_token is not None:
+                current_tool_send_observer.reset(observer_token)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage = await loop.run_in_executor(
+        executor_future = loop.run_in_executor(
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        producer_dispatched = True
+        result, usage = await executor_future
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
@@ -653,6 +702,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         logger.exception("[api_server] run %s failed", run_id)
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
+        if run.tool_observer is not None and not producer_dispatched:
+            run.tool_observer.mark_incomplete("unclosed_producer")
+            run.tool_observer.close_producer()
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
@@ -673,7 +725,8 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     """Drop the owner stamp only once nothing keyed by *run_id* survives: ownership must
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
-            self._run_approval_sessions)
+            self._run_approval_sessions, self._run_tool_diagnostics,
+            self._run_tool_diagnostic_tombstones)
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -894,6 +947,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     """Expire old SSE buffers without treating transport age as run age."""
     if now is None:
         now = time.time()
+    _tool_diag.sweep(self, now)
     for run_id, created_at in list(self._run_streams_created.items()):
         if now - created_at <= self._RUN_STREAM_TTL or run_id in self._run_stream_subscribers:
             continue

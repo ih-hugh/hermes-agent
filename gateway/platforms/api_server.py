@@ -119,6 +119,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_tool_diagnostic as _api_tool_diag
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
@@ -2274,6 +2275,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
+                "run_tool_diagnostic": {"supported_versions": ["names-v1"]},
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
                 # Always advertised for feature-detection; enabled follows config.
@@ -3827,6 +3829,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 
     _handle_get_run = _run_route_delegate("_handle_get_run")
+    async def _handle_run_tool_diagnostic(self, request: "web.Request") -> "web.Response":
+        return await _api_tool_diag.handle_get(self, request, _api_server=sys.modules[__name__])
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")

@@ -487,6 +487,8 @@ def maybe_auto_title(
     if not _auto_title_enabled():  # config read after the cheap guards so the file isn't touched every turn
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
+    from agent.tool_diagnostic_transport import mark_auxiliary_send
+    mark_auxiliary_send()
     apply_instant_title(session_db, session_id, user_message, title_callback)
     threading.Thread(
         target=auto_title_session,

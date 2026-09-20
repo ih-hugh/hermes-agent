@@ -687,16 +687,24 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
     if agent.api_mode == "codex_responses":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
     if agent.api_mode == "anthropic_messages":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         # Request-local client so the stale/interrupt watchdog aborts sockets
         # from the stranger thread while the worker owns the SDK close (#67142).
         request_client = make_client("anthropic_messages_request", kind="anthropic_messages")
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         return _bedrock_converse_call(api_kwargs, stream=False)
     if agent.provider == "moa":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         # MoA is a virtual provider backed by the in-process MoAClient facade — never
         # rebuild a request-local client from the virtual metadata. After a client
         # replacement agent.client may be a native OpenAI client while provider stays
@@ -706,7 +714,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
-    return make_client("chat_completion_request").chat.completions.create(**api_kwargs)
+    request_client = make_client("chat_completion_request")
+    from agent.tool_diagnostic_transport import observe_sdk_send
+    observe_sdk_send(agent, api_kwargs)
+    return request_client.chat.completions.create(**api_kwargs)
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2057,8 +2068,13 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
 
     def _attempt(retry_count: int) -> str:
         summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")
+        def _send_summary(request):
+            from agent.tool_diagnostic_transport import mark_auxiliary_send
+            mark_auxiliary_send()
+            return summary_client.chat.completions.create(**request)
+
         response = _managed_summary_call(
-            agent, api_request_id, summary_kwargs, lambda request: summary_client.chat.completions.create(**request), retry_count=retry_count)
+            agent, api_request_id, summary_kwargs, _send_summary, retry_count=retry_count)
         return _summary_text(agent, response)
     return _attempt
 
@@ -2678,6 +2694,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
+        from agent.tool_diagnostic_transport import observe_sdk_send
+        observe_sdk_send(self.agent, stream_kwargs)
         return request_client.chat.completions.create(**stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
@@ -3155,6 +3173,8 @@ class _StreamingCall(StreamingWaitMonitor):
     def _call_wire(self, stream_attempt_id: int):
         if self.agent.api_mode != "anthropic_messages":
             return self._call_chat_completions(stream_attempt_id)
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(self.agent, self.api_kwargs)
         # Per-request client so the watchdog aborts its socket, not the shared one.
         request_client = self.clients.set_client(
             self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
@@ -3201,6 +3221,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self._call()
         finally:
             self._call_done.set()
+            if getattr(self, "_tool_diagnostic_worker_registered", False):
+                self.agent._tool_send_observer.close_worker()
 
     def _kill_stale_stream(self, elapsed: float) -> None:
         """SSE pings but no chunks: cancel the attempt and abort the request-local
@@ -3343,7 +3365,16 @@ class _StreamingCall(StreamingWaitMonitor):
                 monitor.join(timeout=2.0)
         else:
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
-            self.worker.start()
+            observer = getattr(self.agent, "_tool_send_observer", None)
+            self._tool_diagnostic_worker_registered = observer is not None
+            if observer is not None:
+                observer.register_worker()
+            try:
+                self.worker.start()
+            except BaseException:
+                if observer is not None:
+                    observer.close_worker()
+                raise
             self._monitor_loop()
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
@@ -3369,8 +3400,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         return _stream_codex_passthrough(agent, api_kwargs, on_first_delta)
     if agent.api_mode == "bedrock_converse":
+        from agent.tool_diagnostic_transport import mark_unsupported_send
+        mark_unsupported_send(agent, api_kwargs)
         return _BedrockStream(agent, api_kwargs, on_first_delta).run()
     # Cross-turn stale-stream circuit breaker (see ``_stale_streak()``).
     _check_stale_giveup(agent)

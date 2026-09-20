@@ -2405,6 +2405,8 @@ _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
 @contextlib.contextmanager
 def _relay_aux_call_scope(args: tuple, kwargs: dict):
     """Bind a fresh relay call context for one auxiliary call; mark it failed on any exception."""
+    from agent.tool_diagnostic_transport import mark_auxiliary_send
+    mark_auxiliary_send()
     task = args[0] if args else kwargs.get("task")
     token = _RELAY_AUX_CALL_CONTEXT.set({
         "task": str(task or "unknown"),

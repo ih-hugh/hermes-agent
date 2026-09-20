@@ -433,6 +433,9 @@ def delegate_task(
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+    observer = getattr(parent_agent, "_tool_send_observer", None)
+    if observer is not None:
+        observer.mark_incomplete("unsupported_call_role")
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
