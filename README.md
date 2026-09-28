@@ -3,6 +3,12 @@
 </p>
 
 # Hermes Agent ☤
+
+> This is BytFactory's maintained fork of Nous Research's Hermes Agent. See
+> [FORK.md](FORK.md) for carried patches, exact source checkpoints, and the upstream
+> maintenance plan. Factory deployments use reviewed commit pins; the upstream
+> quick-install and update instructions below are not the factory deployment procedure.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
