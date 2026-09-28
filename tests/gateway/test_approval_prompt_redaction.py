@@ -116,12 +116,16 @@ class TestApprovalCommandWiring:
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
-    def test_sse_api_path_redacts_before_enqueue(self):
-        from gateway.platforms import api_server_runs
+    def test_sse_api_event_builder_redacts_before_return(self):
+        from gateway.platforms import api_server, api_server_runs
 
-        self._assert_redacts_then_uses(
-            api_server_runs, "_approval_notify", "put_nowait"
-        )
+        raw = "curl -H 'Authorization: token " + _FAKE_GHP + "' https://example.test"
+        event = api_server_runs._approval_run_event(
+            "run-redact", {"request_id": "req-redact", "command": raw}, _api_server=api_server)
+        assert event["event"] == "approval.request"
+        assert event["request_id"] == "req-redact"
+        assert _FAKE_GHP not in event["command"]
+        assert "curl" in event["command"]
 
 
 class TestApprovalTextFallbackContract:
@@ -137,4 +141,3 @@ class TestApprovalTextFallbackContract:
         assert "`/approve`" in text
         assert "approve session" not in text
         assert "approve always" not in text
-

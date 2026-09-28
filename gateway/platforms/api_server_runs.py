@@ -142,7 +142,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
-        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
+        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id", "approval"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -156,12 +156,17 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: Dict[str, Any]) -> None:
-        self._set_run_status(
-            run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            with suppress(Exception):
-                loop.call_soon_threadsafe(q.put_nowait, event)
+        def _publish() -> None:
+            current = self._run_statuses.get(run_id)
+            if current is not None and current.get("status") not in TERMINAL_STATUSES | {"stopping"}:
+                self._set_run_status(run_id, current["status"], last_event=event.get("event"))
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                with suppress(Exception):
+                    q.put_nowait(event)
+
+        with suppress(Exception):
+            loop.call_soon_threadsafe(_publish)
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
@@ -630,26 +635,67 @@ def _run_agent_sync_body(self, run: _RunLaunch, agent, approval_notify, *, _api_
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
+def _approval_run_event(run_id: str, approval_data: Dict[str, Any], *, _api_server) -> Dict[str, Any]:
+    """Build one egress-safe prompt from the live approval queue."""
+    event = dict(approval_data)
+    if "command" in event:
+        from gateway.run import _redact_approval_command
+        event["command"] = _redact_approval_command(event.get("command"))
+    event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
+        smart_denied=bool(event.get("smart_denied")),
+        allow_session=event.get("allow_session") is not False,
+        allow_permanent=event.get("allow_permanent") is not False)))
+    return event
+
+
+def _project_run_approval(self, run_id: str, *, _api_server) -> None:
+    """Make pollable status name only a request still waiting in this run's queue."""
+    current = self._run_statuses.get(run_id)
+    if (current is None or run_id not in self._run_approval_sessions
+            or current.get("status") in TERMINAL_STATUSES | {"stopping"}
+            or run_id in self._stopping_run_ids):
+        return
+    from tools.approval import list_gateway_approvals
+    pending = list_gateway_approvals(self._run_approval_sessions[run_id])
+    if pending:
+        current_id = (current.get("approval") or {}).get("request_id")
+        selected = next((item for item in pending if item.get("request_id") == current_id), None)
+        if selected is None:
+            selected = pending[0]
+        if current.get("status") != "waiting_for_approval" or selected.get("request_id") != current_id:
+            self._set_run_status(
+                run_id, "waiting_for_approval", last_event="approval.request",
+                approval=_approval_run_event(run_id, selected, _api_server=_api_server))
+    elif current.get("status") == "waiting_for_approval":
+        self._set_run_status(run_id, "running")
+
+
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
-    """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
+    """Present a request while pending and withdraw it when the core settles its wait."""
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: Dict[str, Any]) -> None:
-        event = dict(approval_data or {})
-        # Clients must never receive the raw flagged command: redact before it hits the stream.
-        # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
-        # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
-        # flagged. Reuse the gateway seam.
-        if "command" in event:
-            from gateway.run import _redact_approval_command
-            event["command"] = _redact_approval_command(event.get("command"))
-        event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
-            smart_denied=bool(event.get("smart_denied")),
-            allow_session=event.get("allow_session") is not False,
-            allow_permanent=event.get("allow_permanent") is not False)))
-        self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
+        request_id = approval_data.get("request_id")
+
+        def _settled(_reason: str) -> None:
+            with suppress(Exception):
+                loop.call_soon_threadsafe(
+                    lambda: _project_run_approval(self, run_id, _api_server=_api_server))
+
+        from tools.approval import register_gateway_settle
+        registered = bool(request_id) and register_gateway_settle(
+            run.approval_session_key, request_id, _settled)
+
+        def _publish() -> None:
+            _project_run_approval(self, run_id, _api_server=_api_server)
+            from tools.approval import list_gateway_approvals
+            if (registered and self._run_statuses.get(run_id, {}).get("status") == "waiting_for_approval"
+                    and any(item.get("request_id") == request_id for item in
+                            list_gateway_approvals(run.approval_session_key))):
+                q.put_nowait(_approval_run_event(run_id, approval_data, _api_server=_api_server))
+
         with suppress(Exception):
-            loop.call_soon_threadsafe(q.put_nowait, event)
+            loop.call_soon_threadsafe(_publish)
 
     return _approval_notify
 
@@ -831,7 +877,9 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
 
 def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
     """Record a control-plane event on the run status and (best effort) its SSE stream."""
-    self._set_run_status(run_id, "running", last_event=name)
+    current = self._run_statuses.get(run_id)
+    if current is not None and current.get("status") not in TERMINAL_STATUSES | {"stopping"}:
+        self._set_run_status(run_id, current["status"], last_event=name)
     q = self._run_streams.get(run_id)
     if q is not None:
         with suppress(Exception):
@@ -883,9 +931,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         logger.exception("[api_server] approval resolution failed for run %s", run_id)
         return _json_error(_openai_error, str(exc), status=500)
     if resolved <= 0:
+        _project_run_approval(self, run_id, _api_server=_api_server)
         return _json_error(
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
     request_id_field = {"request_id": request_id} if request_id else {}
+    _project_run_approval(self, run_id, _api_server=_api_server)
     _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
