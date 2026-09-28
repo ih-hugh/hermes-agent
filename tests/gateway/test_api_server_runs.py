@@ -27,6 +27,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms import api_server as api_server_module, api_server_runs
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -105,6 +106,51 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _approval_run(adapter: APIServerAdapter, run_id: str):
+    """A runs-API status and real approval waiter, without starting a model."""
+    queue = asyncio.Queue()
+    adapter._run_streams[run_id] = queue
+    adapter._run_approval_sessions[run_id] = run_id
+    _claim_run(adapter, run_id)
+    run = api_server_runs._RunLaunch(
+        owner=adapter, run_id=run_id, queue=queue, session_id=run_id,
+        gateway_session_key=None, declared_selected=False, user_message="",
+        conversation_history=[], session_history_delivery=False, agent_kwargs={},
+        request_profile=None, browser_control_principal=None,
+        browser_control_transport_family=None,
+    )
+    notify = api_server_runs._make_approval_notify(
+        adapter, run, _api_server=api_server_module)
+    progress = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+    return notify, progress
+
+
+async def _wait_pending(run_id: str, count: int) -> None:
+    for _ in range(100):
+        if len(approval_mod.list_gateway_approvals(run_id)) == count:
+            await asyncio.sleep(0)
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"approval queue did not reach {count} pending requests")
+
+
+async def _wait_presented(adapter: APIServerAdapter, run_id: str, request_id: str) -> None:
+    for _ in range(100):
+        approval = adapter._run_statuses.get(run_id, {}).get("approval") or {}
+        if approval.get("request_id") == request_id:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"approval {request_id} was not presented")
+
+
+async def _wait_run_status(adapter: APIServerAdapter, run_id: str, expected: str) -> None:
+    for _ in range(100):
+        if adapter._run_statuses.get(run_id, {}).get("status") == expected:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"run {run_id} did not reach {expected}")
 
 
 def _make_slow_agent(**kwargs):
@@ -1512,6 +1558,138 @@ class TestRunIdempotency:
                 )
         assert response.status == 202
         history.assert_not_awaited()
+
+
+class TestRunApprovalProjection:
+    @pytest.mark.asyncio
+    async def test_timed_out_request_clears_status_despite_later_tool_progress(
+        self, adapter, monkeypatch
+    ):
+        run_id = "run-timeout"
+        notify, progress = _approval_run(adapter, run_id)
+        adapter._set_run_status(run_id, "running")
+        monkeypatch.setattr(approval_gateway_wait._ctx, "_get_approval_timeout", lambda: 1)
+
+        try:
+            waiter = asyncio.create_task(asyncio.to_thread(
+                approval_gateway_wait._await_gateway_decision,
+                run_id, notify,
+                {"request_id": "timed-out", "command": "echo safe", "pattern_key": "safe"},
+            ))
+            await _wait_pending(run_id, 1)
+            await _wait_presented(adapter, run_id, "timed-out")
+            assert adapter._run_statuses[run_id]["status"] == "waiting_for_approval"
+
+            result = await waiter
+            assert result["resolved"] is False
+            assert approval_mod.list_gateway_approvals(run_id) == []
+            await _wait_run_status(adapter, run_id, "running")
+            assert adapter._run_statuses[run_id]["status"] == "running"
+            assert "approval" not in adapter._run_statuses[run_id]
+
+            await asyncio.to_thread(progress, "tool.completed", "terminal", "done")
+            await asyncio.sleep(0)
+            assert adapter._run_statuses[run_id]["status"] == "running"
+            assert adapter._run_statuses[run_id]["last_event"] == "tool.completed"
+        finally:
+            approval_mod.unregister_gateway_notify(run_id)
+
+    @pytest.mark.asyncio
+    async def test_only_live_request_is_presented_and_late_callbacks_cannot_reopen_run(
+        self, adapter, tmp_path
+    ):
+        run_id = "run-concurrent"
+        _use_idempotency_db(adapter, tmp_path / "approvals.db")
+        notify, progress = _approval_run(adapter, run_id)
+        initial = adapter._set_run_status(run_id, "running", session_id=run_id)
+        scope = adapter._run_owners[run_id]
+        created, _ = adapter._run_idempotency_store.reserve(
+            scope, "approval-key", "fingerprint", run_id, initial,
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started,
+        )
+        assert created == "created"
+        adapter._run_idempotency_ids.add(run_id)
+        app = _create_runs_app(adapter)
+
+        async def start(request_id: str, command: str | None = None):
+            return await asyncio.to_thread(
+                approval_gateway_wait._await_gateway_decision, run_id, notify,
+                {"request_id": request_id, "command": command or f"echo {request_id}",
+                 "pattern_key": request_id},
+            )
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                first = asyncio.create_task(start("approval-A"))
+                await _wait_pending(run_id, 1)
+                await _wait_presented(adapter, run_id, "approval-A")
+                fake_token = "ghp_" + "X" * 36
+                second = asyncio.create_task(start(
+                    "approval-B", f"curl -H 'Authorization: token {fake_token}' https://example.test"))
+                await _wait_pending(run_id, 2)
+                await _wait_presented(adapter, run_id, "approval-B")
+                assert adapter._run_statuses[run_id]["approval"]["request_id"] == "approval-B"
+                assert fake_token not in adapter._run_statuses[run_id]["approval"]["command"]
+                await asyncio.wait_for(adapter._run_streams[run_id].get(), 1)
+                presented = await asyncio.wait_for(adapter._run_streams[run_id].get(), 1)
+                assert presented["request_id"] == "approval-B"
+                assert fake_token not in presented["command"]
+                durable = adapter._run_idempotency_store.status_for_run(scope, run_id)
+                assert durable["status"]["approval"]["request_id"] == "approval-B"
+                assert fake_token not in durable["status"]["approval"]["command"]
+
+                denied = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "deny", "request_id": "approval-A"},
+                )
+                assert denied.status == 200
+                await first
+                await asyncio.sleep(0)
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                assert status["status"] == "waiting_for_approval"
+                assert status["approval"]["request_id"] == "approval-B"
+
+                stale = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "deny", "request_id": "approval-A"},
+                )
+                assert stale.status == 409
+                assert (await stale.json())["error"]["code"] == "approval_not_pending"
+                assert (await (await cli.get(f"/v1/runs/{run_id}")).json())["approval"]["request_id"] == "approval-B"
+
+                denied_b = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "deny", "request_id": "approval-B"},
+                )
+                assert denied_b.status == 200
+                await second
+                await asyncio.sleep(0)
+                assert adapter._run_statuses[run_id]["status"] == "running"
+                assert "approval" not in adapter._run_statuses[run_id]
+
+                third = asyncio.create_task(start("approval-C"))
+                await _wait_pending(run_id, 1)
+                await _wait_presented(adapter, run_id, "approval-C")
+                adapter._set_run_status(run_id, "stopping")
+                assert approval_mod.resolve_gateway_approval(
+                    run_id, "deny", request_id="approval-C") == 1
+                await third
+                await asyncio.sleep(0)
+                assert adapter._run_statuses[run_id]["status"] == "stopping"
+                await asyncio.to_thread(notify, {
+                    "request_id": "late", "command": "echo late", "pattern_key": "late"})
+                await asyncio.sleep(0)
+                assert adapter._run_statuses[run_id]["status"] == "stopping"
+
+                adapter._set_run_status(run_id, "completed", output="done")
+                await asyncio.to_thread(progress, "tool.completed", "terminal", "done")
+                await asyncio.to_thread(notify, {
+                    "request_id": "later", "command": "echo later", "pattern_key": "later"})
+                await asyncio.sleep(0)
+                assert adapter._run_statuses[run_id]["status"] == "completed"
+                assert "approval" not in adapter._run_statuses[run_id]
+        finally:
+            approval_mod.unregister_gateway_notify(run_id)
 
 
 class TestHostedRoomRuns:
