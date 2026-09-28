@@ -648,7 +648,7 @@ def _approval_run_event(run_id: str, approval_data: Dict[str, Any], *, _api_serv
     return event
 
 
-def _project_run_approval(self, run_id: str, *, _api_server, preferred_id: str | None = None) -> None:
+def _project_run_approval(self, run_id: str, *, _api_server) -> None:
     """Make pollable status name only a request still waiting in this run's queue."""
     current = self._run_statuses.get(run_id)
     if (current is None or run_id not in self._run_approval_sessions
@@ -659,11 +659,9 @@ def _project_run_approval(self, run_id: str, *, _api_server, preferred_id: str |
     pending = list_gateway_approvals(self._run_approval_sessions[run_id])
     if pending:
         current_id = (current.get("approval") or {}).get("request_id")
-        selected = next((item for item in pending if item.get("request_id") == preferred_id), None)
+        selected = next((item for item in pending if item.get("request_id") == current_id), None)
         if selected is None:
-            selected = next((item for item in pending if item.get("request_id") == current_id), None)
-        if selected is None:
-            selected = pending[-1]
+            selected = pending[0]
         if current.get("status") != "waiting_for_approval" or selected.get("request_id") != current_id:
             self._set_run_status(
                 run_id, "waiting_for_approval", last_event="approval.request",
@@ -689,8 +687,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             run.approval_session_key, request_id, _settled)
 
         def _publish() -> None:
-            _project_run_approval(self, run_id, _api_server=_api_server,
-                                  preferred_id=request_id if registered else None)
+            _project_run_approval(self, run_id, _api_server=_api_server)
             from tools.approval import list_gateway_approvals
             if (registered and self._run_statuses.get(run_id, {}).get("status") == "waiting_for_approval"
                     and any(item.get("request_id") == request_id for item in

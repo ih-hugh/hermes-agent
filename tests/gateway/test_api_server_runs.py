@@ -1627,16 +1627,13 @@ class TestRunApprovalProjection:
                 second = asyncio.create_task(start(
                     "approval-B", f"curl -H 'Authorization: token {fake_token}' https://example.test"))
                 await _wait_pending(run_id, 2)
-                await _wait_presented(adapter, run_id, "approval-B")
-                assert adapter._run_statuses[run_id]["approval"]["request_id"] == "approval-B"
-                assert fake_token not in adapter._run_statuses[run_id]["approval"]["command"]
                 await asyncio.wait_for(adapter._run_streams[run_id].get(), 1)
                 presented = await asyncio.wait_for(adapter._run_streams[run_id].get(), 1)
                 assert presented["request_id"] == "approval-B"
                 assert fake_token not in presented["command"]
+                assert adapter._run_statuses[run_id]["approval"]["request_id"] == "approval-A"
                 durable = adapter._run_idempotency_store.status_for_run(scope, run_id)
-                assert durable["status"]["approval"]["request_id"] == "approval-B"
-                assert fake_token not in durable["status"]["approval"]["command"]
+                assert durable["status"]["approval"]["request_id"] == "approval-A"
 
                 denied = await cli.post(
                     f"/v1/runs/{run_id}/approval",
@@ -1644,10 +1641,14 @@ class TestRunApprovalProjection:
                 )
                 assert denied.status == 200
                 await first
-                await asyncio.sleep(0)
+                await _wait_presented(adapter, run_id, "approval-B")
                 status = await (await cli.get(f"/v1/runs/{run_id}")).json()
                 assert status["status"] == "waiting_for_approval"
                 assert status["approval"]["request_id"] == "approval-B"
+                assert fake_token not in status["approval"]["command"]
+                durable = adapter._run_idempotency_store.status_for_run(scope, run_id)
+                assert durable["status"]["approval"]["request_id"] == "approval-B"
+                assert fake_token not in durable["status"]["approval"]["command"]
 
                 stale = await cli.post(
                     f"/v1/runs/{run_id}/approval",
