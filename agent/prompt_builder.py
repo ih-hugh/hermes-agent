@@ -921,6 +921,10 @@ def _format_backend_probe(output: str) -> str:
 
 def _probe_remote_backend(env_type: str) -> str | None:
     """Describe the active non-local backend via a live probe; None if it failed (cached, failures included)."""
+    from agent.recovery_producers import current_registry
+    if current_registry() is not None:
+        # Construction must not create an untracked prompt-probe workspace.
+        return None
     from hermes_constants import hermes_home_key
     cache_key = (hermes_home_key(), env_type, _tenv_read("TERMINAL_CWD", ""))
     formatted = _BACKEND_PROBE_CACHE.get(cache_key)

@@ -8,6 +8,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from copy import deepcopy
 from contextlib import suppress
 from dataclasses import dataclass
@@ -98,6 +99,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._protected_run_ids: set[str] = set()
     self._protected_run_stores: dict[str, Any] = {}
     self._protected_run_registries: dict[str, Any] = {}
+    # Small process-local identity only; heavy run/registry state retires at its barrier.
+    self._protected_provider_identities: dict[object, tuple[weakref.ReferenceType, bytes]] = {}
     self._protected_status_tasks: dict[str, asyncio.Task[None]] = {}
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
@@ -206,6 +209,9 @@ def _schedule_run_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop",
     """Inventory a callback before enqueue, including during active-parent closing."""
     registry = self._protected_run_registries.get(run_id)
     if registry is None:
+        if run_id in self._protected_run_ids:
+            from hermes_state_recovery import RecoveryRefused
+            raise RecoveryRefused("producer_closed")
         with suppress(Exception):
             loop.call_soon_threadsafe(callback)
         return
@@ -217,6 +223,27 @@ def _schedule_run_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop",
     except BaseException:
         lease.cancel_before_start()
         raise
+
+
+def _selected_provider_capture_for_scope(self, scope, store):
+    """Reacquire a lightweight same-process selected identity after run transport pruning."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_provider import ProviderLedger, SelectedProviderCapture
+
+    retained = self._protected_provider_identities.get(scope)
+    if retained is None or retained[0]() is None:
+        raise RecoveryRefused("provider_identity_unavailable")
+    admission = ProviderLedger(store).admission(scope)
+    if admission.canonical_bytes() != retained[1]:
+        raise RecoveryRefused("provider_admission_mismatch")
+    capture = SelectedProviderCapture(admission, retained[0]())
+    capture.require_selected()
+    return capture
+
+
+def _retire_selected_provider_identity(self, scope) -> None:
+    """Called only after a committed seal or explicit abandoned-session retirement."""
+    self._protected_provider_identities.pop(scope, None)
 
 
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
@@ -672,10 +699,19 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         try:
             provider_capture = await asyncio.to_thread(
                 capture_selected_provider_admission, session_id)
-        except RecoveryRefused as exc:
+            provider_ref = weakref.ref(provider_capture.provider)
+            prior_provider = self._protected_provider_identities.get(protected_scope)
+            if prior_provider is not None:
+                if (prior_provider[0]() is not provider_capture.provider
+                        or prior_provider[1] != provider_capture.admission.canonical_bytes()):
+                    raise RecoveryRefused("provider_selection_changed")
+            elif recovery_admission.generation != 0 or len(self._protected_provider_identities) >= 1024:
+                raise RecoveryRefused("provider_identity_unavailable")
+        except (RecoveryRefused, TypeError) as exc:
             self._run_owners.pop(run_id, None)
             return _json_error(_openai_error, "Protected provider admission refused",
-                               code=exc.code, status=503)
+                               code=exc.code if isinstance(exc, RecoveryRefused)
+                               else "provider_identity_unavailable", status=503)
     tool_observer = (_tool_diag.create(
         self, run_id, _api_server._api_request_profile.get() or "default",
         self._run_owners[run_id]) if diagnostic_requested else None)
@@ -710,6 +746,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         recovery_registry = ProducerRegistry(
             protected_store, protected_scope, run_id, recovery_admission.generation,
             issue_producer_permit(protected_store, recovery_handoff))
+        recovery_registry.provider_capture = provider_capture
+        self._protected_provider_identities.setdefault(
+            protected_scope, (provider_ref, provider_capture.admission.canonical_bytes()))
         recovery_status_barrier = recovery_registry.enter(recovery_registry.permit, "callback")
         recovery_write_permit = issue_write_permit(
             recovery_registry.permit, protected_store, protected_scope, run_id,
@@ -935,6 +974,7 @@ async def _finalize_protected_producers(self, run: _RunLaunch) -> None:
             registry.wait_until_quiescent, excluding=run.recovery_status_barrier)
         await _await_protected_status(self, run.run_id)
         run.recovery_status_barrier.run(lambda: None)
+        self._protected_run_registries.pop(run.run_id, None)
     except BaseException:
         logger.exception("[api_server] protected producer finalization failed for %s", run.run_id)
         raise

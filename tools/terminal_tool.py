@@ -923,6 +923,12 @@ def _plan_execution(
 
     config = _get_env_config()
     env_type = "local" if _host_local else config["env_type"]
+    from agent.recovery_producers import current_registry, refuse_untracked_work
+    protected = current_registry()
+    if protected is not None and (
+            _host_local or background or env_type != "byf_workspace"
+            or task_id != protected.scope.session_id):
+        refuse_untracked_work()
 
     # Fail closed under a refusal scope: the routed profile's terminal
     # policy could not be resolved, so running with the launch process's
@@ -1024,6 +1030,13 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     with _env_lock:
         env: Any = _lookup_active_env(eff, task_id)
     if env is not None:
+        from agent.recovery_producers import current_registry
+        if current_registry() is not None:
+            from tools.terminal_tool_recovery import ProtectedWorkspaceEnvironment
+            from hermes_state_recovery import RecoveryRefused
+            if not isinstance(env, ProtectedWorkspaceEnvironment):
+                raise RecoveryRefused("provider_environment_mismatch")
+            env.validate_current(eff)
         return env
 
     with _creation_locks_lock:
@@ -1033,6 +1046,13 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
         with _env_lock:
             env = _lookup_active_env(eff, task_id)
         if env is not None:
+            from agent.recovery_producers import current_registry
+            if current_registry() is not None:
+                from tools.terminal_tool_recovery import ProtectedWorkspaceEnvironment
+                from hermes_state_recovery import RecoveryRefused
+                if not isinstance(env, ProtectedWorkspaceEnvironment):
+                    raise RecoveryRefused("provider_environment_mismatch")
+                env.validate_current(eff)
             return env
 
         if env_type == "singularity":
@@ -1206,10 +1226,14 @@ def terminal_tool(
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
+    from hermes_state_recovery import RecoveryRefused
+    from agent.recovery_producers import current_registry, refuse_untracked_work
     try:
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        if current_registry() is not None and plan.promoted_from_foreground_timeout is not None:
+            refuse_untracked_work()
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1248,9 +1272,15 @@ def terminal_tool(
         )
     except _Rejected as r:
         return r.result_json
+    except RecoveryRefused:
+        raise
     except EnvironmentConnectionError as e:
+        if current_registry() is not None:
+            refuse_untracked_work()
         return _degraded_result(e, task_id)
     except Exception as e:
+        if current_registry() is not None:
+            refuse_untracked_work()
         return _fatal_error_json(e)
 
 
