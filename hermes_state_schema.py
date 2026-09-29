@@ -1010,6 +1010,19 @@ class SessionSchemaMixin:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_recovery_provider_create_per_session
                 ON recovery_provider_invocations(session_id) WHERE kind='create_environment';
+            CREATE INDEX IF NOT EXISTS idx_recovery_write_acks_session_revision
+                ON recovery_write_acks(session_id,ack_revision,write_id);
+            CREATE TABLE IF NOT EXISTS recovery_seal_documents (
+                session_id TEXT PRIMARY KEY REFERENCES recovery_sessions(session_id),
+                result_json BLOB NOT NULL, receipt_json BLOB NOT NULL,
+                receipt_sha256 TEXT NOT NULL, page_count INTEGER NOT NULL
+                    CHECK (page_count BETWEEN 1 AND 4096)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sealed_pages (
+                session_id TEXT NOT NULL REFERENCES recovery_seal_documents(session_id),
+                route_page INTEGER NOT NULL CHECK (route_page BETWEEN 0 AND 4095),
+                page_bytes BLOB NOT NULL, PRIMARY KEY (session_id,route_page)
+            );
         """)
         # Task 2a's first checkout may already have the producer table without parentage.
         if not any(row[1] == "parent_producer_id" for row in

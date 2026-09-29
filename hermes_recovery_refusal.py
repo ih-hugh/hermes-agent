@@ -35,6 +35,8 @@ _REQUIRED_COLUMNS = {
     "recovery_write_acks": {"write_id", "session_id", "run_id", "generation", "mutation", "state"},
     "recovery_provider_admissions": {"session_id", "provider", "hermes_revision", "source_sha256", "provider_sha256", "lease_id", "grant_sha256", "admission_json", "admission_sha256"},
     "recovery_provider_invocations": {"invocation_id", "session_id", "run_id", "generation", "producer_id", "sequence", "kind", "state", "create_invocation_id", "container_id", "container_attestation_sha256", "exit_code", "outcome_reason"},
+    "recovery_seal_documents": {"session_id", "result_json", "receipt_json", "receipt_sha256", "page_count"},
+    "recovery_sealed_pages": {"session_id", "route_page", "page_bytes"},
     "recovery_exclusions": {"claim_id", "kind", "session_id"},
 }
 

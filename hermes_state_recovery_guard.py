@@ -38,6 +38,8 @@ _LEDGER = (
     "recovery_write_acks",
     "recovery_provider_admissions",
     "recovery_provider_invocations",
+    "recovery_seal_documents",
+    "recovery_sealed_pages",
     "recovery_exclusions",
 )
 T = TypeVar("T")
@@ -295,6 +297,15 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
             # operation; a general store guard would grant broader authority.
             continue
         for operation in ("INSERT", "UPDATE", "DELETE"):
+            if table in {"recovery_seal_documents", "recovery_sealed_pages"} and operation != "INSERT":
+                # Immutable rows have unconditional triggers, including for
+                # a process holding the private store-writer authority.
+                name = f"recovery_guard_{table}_{operation.lower()}"
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
+                    "BEGIN SELECT RAISE(ABORT, 'recovery_immutable_seal'); END"
+                )
+                continue
             name = f"recovery_guard_{table}_{operation.lower()}"
             conn.execute(
                 f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
