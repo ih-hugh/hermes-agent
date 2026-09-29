@@ -298,27 +298,54 @@ def test_lookup_root_requires_recorded_close(tmp_path: Path):
         second.db.close()
 
 
-def test_readback_keeps_revision_and_members_in_one_snapshot(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("wal_reset_vulnerable", [False, True])
+def test_readback_keeps_revision_and_members_in_one_snapshot(tmp_path: Path, monkeypatch,
+                                                             wal_reset_vulnerable: bool):
+    import hermes_state_wal
+
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: wal_reset_vulnerable)
     first, second = _stores(tmp_path)
+    expected_mode = "delete" if wal_reset_vulnerable else "wal"
+    assert first.db._conn.execute("PRAGMA journal_mode").fetchone()[0] == expected_mode
     identity = _identity(first, owner=current_incarnation())
     try:
         admitted = first.reserve(_root(), identity)
         permit = issue_producer_permit(first, admitted.handoff)
         first.begin_close(identity.scope, _seal())
         original_view = RecoveryStore._view
+        original_settle = RecoveryStore._settle_member
+        updated = threading.Event()
         changed = False
+
+        def signal_after_update(conn, scope, run_id):
+            original_settle(conn, scope, run_id)
+            updated.set()
 
         def change_between_reads(cls, conn, row):
             nonlocal changed
             if not changed:
                 changed = True
-                first.close_producer(identity.scope, "run_root", permit)
+                future = pool.submit(first.close_producer, identity.scope, "run_root", permit)
+                futures.append(future)
+                assert updated.wait(timeout=5), "writer did not update during the read snapshot"
+                if wal_reset_vulnerable:
+                    assert not future.done(), "DELETE-mode commit completed before the read ended"
+                else:
+                    future.result(timeout=5)  # WAL must commit before the member SELECT.
             return original_view(conn, row)
 
+        futures = []
+        monkeypatch.setattr(RecoveryStore, "_settle_member", staticmethod(signal_after_update))
         monkeypatch.setattr(RecoveryStore, "_view", classmethod(change_between_reads))
-        view = second.lookup_root(_identity(second).scope, "run_root")
-        assert view.revision == 2
-        assert view.members[0].producer_state == "open"
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            view = second.lookup_root(_identity(second).scope, "run_root")
+            assert view.revision == 2
+            assert view.members[0].producer_state == "open"
+            assert len(futures) == 1
+            futures[0].result(timeout=5)
+        changed_view = second.lookup_root(_identity(second).scope, "run_root")
+        assert changed_view.revision == 3
+        assert changed_view.members[0].producer_state == "closed"
     finally:
         first.db.close()
         second.db.close()
