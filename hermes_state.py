@@ -1068,7 +1068,9 @@ class SessionDB(
                             except Exception:
                                 pass
                             raise
-                        require_time()
+                        # A successful COMMIT is the settlement boundary. Its
+                        # result must reach the caller even if the deadline
+                        # passes inside SQLite's non-preemptible commit.
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if current_deadline() is None:
@@ -1078,7 +1080,6 @@ class SessionDB(
                         self._try_wal_checkpoint()
                     if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                         self._try_incremental_merge_fts()
-                require_time()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.

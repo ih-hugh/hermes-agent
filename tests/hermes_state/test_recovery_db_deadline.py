@@ -10,8 +10,23 @@ from contextlib import contextmanager
 import pytest
 
 import hermes_state_wal
+import hermes_state
+import hermes_state_recovery_deadline as deadline_module
+from agent.recovery_context import (
+    AdmissionHandoff,
+    current_incarnation,
+    issue_producer_permit,
+)
+from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
 from hermes_state import SessionCompressionInProgressError, SessionDB
+from hermes_state_recovery import (
+    AdmissionIdentity,
+    RecoveryRefused,
+    RecoveryScope,
+    RecoveryStore,
+)
 from hermes_state_recovery_deadline import RecoveryDeadlineExceeded, recovery_deadline
+from tests.recovery_provider_fixture import provider_admission
 
 
 @pytest.fixture
@@ -240,3 +255,106 @@ def test_shorter_compression_budget_preserves_compression_error(db: SessionDB) -
     with recovery_deadline(time.monotonic() + 1.0):
         with pytest.raises(SessionCompressionInProgressError):
             db._execute_write(transient, patience_s=1.0)
+
+
+class _CommitClockConnection(sqlite3.Connection):
+    """Advance a fake deadline clock only after SQLite's actual commit succeeds."""
+
+    advance_after_commit = None
+
+    def commit(self) -> None:
+        super().commit()
+        if self.advance_after_commit is not None:
+            self.advance_after_commit()
+
+
+def _clocked_db(tmp_path, monkeypatch: pytest.MonkeyPatch) -> SessionDB:
+    connect = hermes_state._connect_tracked_db
+
+    def clocked_connect(*args, **kwargs):
+        return connect(*args, factory=_CommitClockConnection, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hermes_state, "_connect_tracked_db", clocked_connect)
+        return SessionDB(db_path=tmp_path / "state.db")
+
+
+def test_successful_late_commit_returns_actual_callback_result(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _clocked_db(tmp_path, monkeypatch)
+    try:
+        db._execute_write(
+            lambda conn: conn.execute("CREATE TABLE late_commit(value TEXT)")
+        )
+        assert isinstance(db._conn, _CommitClockConnection)
+        ticks = [100.0]
+        monkeypatch.setattr(deadline_module.time, "monotonic", lambda: ticks[0])
+        db._conn.advance_after_commit = lambda: ticks.__setitem__(0, 101.0)
+        marker = object()
+        with recovery_deadline(100.5):
+            result = db._execute_write(
+                lambda conn: (
+                    conn.execute("INSERT INTO late_commit VALUES('saved')"),
+                    marker,
+                )[1]
+            )
+        assert result is marker
+        row = db._read_one("SELECT value FROM late_commit")
+        assert row is not None and row[0] == "saved"
+    finally:
+        db.close()
+
+
+def test_precommit_expiry_still_rolls_back_without_result(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db._execute_write(lambda conn: conn.execute("CREATE TABLE precommit(value TEXT)"))
+    ticks = [100.0]
+    monkeypatch.setattr(deadline_module.time, "monotonic", lambda: ticks[0])
+
+    def write(conn: sqlite3.Connection) -> str:
+        conn.execute("INSERT INTO precommit VALUES('rolled back')")
+        ticks[0] = 101.0
+        return "uncommitted"
+
+    with recovery_deadline(100.5):
+        with pytest.raises(RecoveryDeadlineExceeded):
+            db._execute_write(write)
+    assert db._read_one("SELECT value FROM precommit") is None
+
+
+def test_late_reserve_commit_retains_one_use_handoff(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = _clocked_db(tmp_path, monkeypatch)
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "default", "a" * 64, "late-reserve")
+    try:
+        assert isinstance(db._conn, _CommitClockConnection)
+        ticks = [100.0]
+        monkeypatch.setattr(deadline_module.time, "monotonic", lambda: ticks[0])
+        db._conn.advance_after_commit = lambda: ticks.__setitem__(0, 101.0)
+        with recovery_deadline(100.5):
+            result = store.reserve(
+                RecoveryAdmission(
+                    schema="hermes.recovery/v1", generation=0, parent_run_id=None
+                ),
+                AdmissionIdentity(
+                    scope,
+                    "byf-recovery-v1:late",
+                    "b" * 64,
+                    "run_late",
+                    current_incarnation(),
+                    provider_admission(scope.session_id),
+                ),
+            )
+        assert result.outcome == "created"
+        assert isinstance(result.handoff, AdmissionHandoff)
+        replay = store.lookup_key(scope, "byf-recovery-v1:late", "b" * 64)
+        assert replay is not None and replay.outcome == "replayed"
+        assert issue_producer_permit(store, result.handoff) is not None
+        with pytest.raises(RecoveryRefused, match="admission_handoff_consumed"):
+            issue_producer_permit(store, result.handoff)
+    finally:
+        db.close()
