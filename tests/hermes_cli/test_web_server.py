@@ -724,18 +724,20 @@ class TestWebServerEndpoints:
         assert isinstance(db, _OkDB)
         assert opens == [True, False, True]
 
-    def test_get_sessions_zero_byte_store_returns_empty_list(self):
+    def test_get_sessions_zero_byte_store_refuses_unknown_authority(self):
         from hermes_constants import get_hermes_home
 
         db_path = get_hermes_home() / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         db_path.touch()
+        before = db_path.read_bytes()
 
         response = self.client.get("/api/sessions?limit=50&offset=0")
 
-        assert response.status_code == 200
-        assert response.json()["sessions"] == []
-        assert response.json()["total"] == 0
+        assert response.status_code == 503
+        assert "not cleared" in response.json()["detail"]
+        assert "sessions" not in response.json()
+        assert db_path.read_bytes() == before
 
     def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self):
         from concurrent.futures import ThreadPoolExecutor

@@ -24,6 +24,9 @@ class TestBlankSlateMinimalToolsets:
         from toolsets import resolve_toolset
         cfg = {}
         _blank_slate_minimal_toolsets(cfg)
+        disabled = set(cfg["agent"]["disabled_toolsets"])
+        assert {"web", "kanban"} <= disabled
+        assert "terminal_only" not in disabled
         kept_tools = set()
         for ts in cfg["platform_toolsets"]["cli"]:
             kept_tools.update(resolve_toolset(ts))

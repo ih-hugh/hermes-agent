@@ -102,9 +102,10 @@ def _is_stale_schema_error(exc: BaseException) -> bool:
 def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     """Open a SessionDB at an explicit path with an explicit access mode.
 
-    Read-only opens bootstrap a missing/zero-byte store once and heal a stale or
-    malformed schema through ONE writable open before reopening read-only; the
-    healthy read path never takes a write lock.  Tables outside SCHEMA_SQL
+    Read-only opens bootstrap a genuinely missing store once and heal a stale or
+    malformed schema through ONE writable open before reopening read-only. A
+    pre-existing zero-byte file has unknown authority and is refused without
+    replacement. The healthy read path never takes a write lock. Tables outside SCHEMA_SQL
     (telemetry ``tel_*``, FTS shadow tables) are outside both probe and heal.
     """
     import sqlite3
@@ -120,7 +121,8 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
 
     def _needs_bootstrap() -> bool:
         try:
-            return db_path.stat().st_size == 0
+            db_path.stat()
+            return False
         except FileNotFoundError:
             return True
         except OSError:
