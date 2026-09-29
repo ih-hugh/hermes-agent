@@ -10,8 +10,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
+import re
+import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.recovery_producers import (
     FrozenProtectedRuntime,
@@ -23,10 +30,33 @@ from hermes_state_recovery import RecoveryRefused
 
 if TYPE_CHECKING:
     from gateway.platforms.api_server_recovery import RecoveryOwnerContext
+    from hermes_cli.plugins import PluginManager
 
 
 _OPENAI_BASE = "https://api.openai.com/v1"
 _MODEL_FIELDS = frozenset({"provider", "api_mode", "default", "context_length"})
+_REVISION = re.compile(r"[0-9a-f]{40}\Z")
+
+
+class _SourceIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticInputs:
+    profile: str
+    home: Path
+    scope_digest: str = field(repr=False)
+    model: str
+    key: str = field(repr=False)
+    config_json: bytes = field(repr=False)
+    config_sha256: str
+    manager: PluginManager = field(repr=False)
+    provider: object = field(repr=False)
+    tool_generation: int
+    terminal_generation: tuple[int, int]
 
 
 def _refuse() -> None:
@@ -43,6 +73,33 @@ def prepare_static_chat_runtime(
     owner: RecoveryOwnerContext, *, session_id: str
 ) -> FrozenProtectedRuntime:
     """Validate exact loaded local inputs before any protected constructor effect."""
+    if type(session_id) is not str or not 1 <= len(session_id) <= 128:
+        _refuse()
+    inputs = _inspect_static_chat_runtime(owner)
+    return _issue_static_preparation(
+        FrozenProtectedRuntime(
+            inputs.profile,
+            inputs.home,
+            inputs.scope_digest,
+            session_id,
+            inputs.model,
+            "openai-api",
+            "chat_completions",
+            _OPENAI_BASE,
+            inputs.key,
+            inputs.config_json,
+            inputs.config_sha256,
+            inputs.manager,
+            inputs.provider,
+            inputs.tool_generation,
+            inputs.terminal_generation,
+        )
+    )
+
+
+def _inspect_static_chat_runtime(owner: RecoveryOwnerContext) -> _StaticInputs:
+    """Inspect configured/loaded inputs without minting a constructor capability."""
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
     from agent.secret_scope import get_secret_str
     from agent.terminal_env_registry import registry_generation
     from hermes_cli.auth import has_usable_secret
@@ -56,9 +113,7 @@ def prepare_static_chat_runtime(
     from utils import fast_safe_load
 
     if (
-        type(session_id) is not str
-        or not 1 <= len(session_id) <= 128
-        or type(owner.profile) is not str
+        type(owner.profile) is not str
         or not owner.profile
         or type(owner.scope_digest) is not str
         or len(owner.scope_digest) != 64
@@ -110,7 +165,7 @@ def prepare_static_chat_runtime(
             or not 1 <= len(model) <= 256
             or model != model.strip()
             or type(length) is not int
-            or length <= 0
+            or length < MINIMUM_CONTEXT_LENGTH
             or raw.get("custom_providers") not in (None, [])
             or raw.get("fallback_model") not in (None, [])
             or any(
@@ -176,26 +231,92 @@ def prepare_static_chat_runtime(
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
-        return _issue_static_preparation(
-            FrozenProtectedRuntime(
-                owner.profile,
-                owner.home.resolve(),
-                owner.scope_digest,
-                session_id,
-                model,
-                "openai-api",
-                "chat_completions",
-                _OPENAI_BASE,
-                key,
-                config_json,
-                hashlib.sha256(raw_bytes).hexdigest(),
-                manager,
-                provider,
-                tool_generation,
-                terminal_generation,
-            )
+        return _StaticInputs(
+            owner.profile,
+            owner.home.resolve(),
+            owner.scope_digest,
+            model,
+            key,
+            config_json,
+            hashlib.sha256(raw_bytes).hexdigest(),
+            manager,
+            provider,
+            tool_generation,
+            terminal_generation,
         )
     except RecoveryRefused:
         raise
     except Exception as exc:
         raise RecoveryRefused("unsupported_configuration") from exc
+
+
+def static_runtime_ready(owner: RecoveryOwnerContext, *, deadline: float) -> bool:
+    """Observe exact loaded source eligibility; never issue work authority."""
+    from hermes_cli.build_info import get_code_identity
+
+    if (
+        type(deadline) is not float
+        or not math.isfinite(deadline)
+        or deadline <= time.monotonic()
+    ):
+        return False
+    try:
+        before = _inspect_static_chat_runtime(owner)
+        lock = before.manager._discovery_lock
+        if not lock.acquire(blocking=False):
+            return False
+        try:
+            # PluginManager uses an RLock; the shared inspection reacquires it
+            # on this same worker without opening a reload window.
+            locked = _inspect_static_chat_runtime(owner)
+            if not _same_static_inputs(before, locked):
+                return False
+            provider = locked.provider
+            selected_module = sys.modules.get(type(provider).__module__)
+            native_type = getattr(selected_module, "BundleIdentity", None)
+            inspect_source = getattr(provider, "read_recovery_source", None)
+            if (
+                type(provider).__name__ != "ByfWorkspaceProvider"
+                or type(provider).__module__.split(".")[-1] != "byf_workspace"
+                or selected_module is None
+                or not isinstance(native_type, type)
+                or not callable(inspect_source)
+            ):
+                return False
+            raw = inspect_source(deadline=deadline)
+            if type(raw) is not tuple or len(raw) != 2:
+                return False
+            revision, native = raw
+            candidate = get_code_identity().get("sha")
+            if (
+                type(revision) is not str
+                or _REVISION.fullmatch(revision) is None
+                or revision != candidate
+                or type(native) is not native_type
+            ):
+                return False
+            source = _SourceIdentity.model_validate(native.model_dump(mode="json"))
+            if native.model_dump(mode="json") != source.model_dump():
+                return False
+            after = _inspect_static_chat_runtime(owner)
+            return time.monotonic() < deadline and _same_static_inputs(locked, after)
+        finally:
+            lock.release()
+    except Exception:
+        return False
+
+
+def _same_static_inputs(left: _StaticInputs, right: _StaticInputs) -> bool:
+    return (
+        left.profile == right.profile
+        and left.home == right.home
+        and left.scope_digest == right.scope_digest
+        and left.model == right.model
+        and left.key == right.key
+        and left.config_json == right.config_json
+        and left.config_sha256 == right.config_sha256
+        and left.manager is right.manager
+        and left.provider is right.provider
+        and left.tool_generation == right.tool_generation
+        and left.terminal_generation == right.terminal_generation
+    )
