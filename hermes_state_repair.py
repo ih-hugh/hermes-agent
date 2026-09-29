@@ -591,7 +591,9 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
 
 
 def _recovery_repair_classification(
-    db_path: Path, *, connection: Optional[sqlite3.Connection] = None,
+    db_path: Path,
+    *,
+    connection: Optional[sqlite3.Connection] = None,
 ) -> str:
     """Prove legacy, or refuse when an admitted recovery ledger may be present.
 
@@ -603,39 +605,34 @@ def _recovery_repair_classification(
         return "legacy"  # a snapshot destination may not exist yet
     try:
         with contextlib.ExitStack() as owned:
-            conn = connection or owned.enter_context(contextlib.closing(
-                sqlite3.connect(f"{db_path.absolute().as_uri()}?mode=ro", uri=True)))
+            conn = connection or owned.enter_context(
+                contextlib.closing(
+                    sqlite3.connect(f"{db_path.absolute().as_uri()}?mode=ro", uri=True)
+                )
+            )
             # Guard triggers are installed in the same transaction as the first
             # member. writable_schema permits catalog inspection when unrelated
             # FTS entries are malformed; restore its connection-local value.
             prior_writable = conn.execute("PRAGMA writable_schema").fetchone()[0]
             conn.execute("PRAGMA writable_schema=ON")
             try:
-                objects = conn.execute(
-                    "SELECT type,name FROM sqlite_master WHERE name GLOB 'recovery_*'",
-                ).fetchall()
-                if any(kind == "trigger" and name.startswith("recovery_guard_")
-                       for kind, name in objects):
-                    return "protected"
-                if not objects:
-                    return "legacy"
-                tables = [name for kind, name in objects if kind == "table"]
-                from hermes_state_recovery_guard import _LEDGER
+                from hermes_state_recovery import RecoveryRefused
+                from hermes_state_recovery_exclusions import _catalog, _protected_exists
 
-                # A nonempty recovery catalog is legacy only when every known
-                # authority table is present exactly once and no unknown object
-                # survives. Keep this inventory shared with the trigger installer.
-                if (len(tables) != len(objects) or len(tables) != len(_LEDGER)
-                        or set(tables) != set(_LEDGER)):
+                try:
+                    catalog = _catalog(conn)
+                except RecoveryRefused:
                     return "unknown"
-                for table in tables:
-                    try:
-                        quoted = table.replace('"', '""')
-                        row = conn.execute(f'SELECT 1 FROM "{quoted}" LIMIT 1').fetchone()
-                    except sqlite3.DatabaseError:
-                        return "unknown"
-                    if row is not None and table != "recovery_store":
-                        return "protected"
+                if catalog in {"absent", "old_ordinary"}:
+                    return "legacy"
+                # Exclusion-only guards are now installed on every ordinary
+                # SessionDB. Their exact shape is checked by _catalog; claims
+                # themselves must survive, so repair cannot treat a claimed
+                # store as disposable ordinary data.
+                if conn.execute("SELECT 1 FROM recovery_exclusions LIMIT 1").fetchone():
+                    return "protected"
+                if catalog == "full" and _protected_exists(conn, catalog):
+                    return "protected"
                 return "legacy"
             finally:
                 conn.execute(f"PRAGMA writable_schema={prior_writable}")

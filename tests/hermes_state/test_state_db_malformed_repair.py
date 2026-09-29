@@ -194,6 +194,68 @@ def test_readable_catalog_without_recovery_objects_proves_legacy(tmp_path):
     assert _recovery_repair_classification(db_path) == "legacy"
 
 
+def test_current_never_opted_session_db_proves_legacy_for_repair(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        guards = {
+            name
+            for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name GLOB 'recovery_guard_*'"
+            )
+        }
+        assert guards == {
+            "recovery_guard_recovery_exclusions_insert",
+            "recovery_guard_recovery_exclusions_update",
+            "recovery_guard_recovery_exclusions_delete",
+        }
+    assert _recovery_repair_classification(db_path) == "legacy"
+
+
+def test_empty_exact_exclusion_bootstrap_proves_legacy_for_repair(tmp_path):
+    from hermes_state_recovery_exclusions import install_exclusion_schema
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE ordinary (id INTEGER PRIMARY KEY)")
+        install_exclusion_schema(conn)
+    assert _recovery_repair_classification(db_path) == "legacy"
+
+
+def test_ordinary_exclusion_claim_still_refuses_repair(tmp_path):
+    from hermes_recovery_dispatch import claim_exact_ordinary
+
+    db_path = tmp_path / "state.db"
+    sid = _build_healthy_db(db_path)
+    claim_exact_ordinary(db_path, (sid,))
+    assert _recovery_repair_classification(db_path) == "protected"
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is False
+    assert "protected recovery store" in report["error"]
+    assert report["backup_path"] is None
+
+
+def test_changed_exclusion_guard_is_unknown_for_repair(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER recovery_guard_recovery_exclusions_insert")
+        conn.execute(
+            "CREATE TRIGGER recovery_guard_recovery_exclusions_insert "
+            "BEFORE INSERT ON recovery_exclusions BEGIN SELECT 1; END"
+        )
+    assert _recovery_repair_classification(db_path) == "unknown"
+
+
+def test_admitted_recovery_store_still_refuses_repair(tmp_path):
+    from tests.hermes_state.test_recovery_write_guard import _protected_db
+
+    db, _, _, _ = _protected_db(tmp_path)
+    db.close()
+    assert _recovery_repair_classification(tmp_path / "state.db") == "protected"
+
+
 def test_missing_recovery_session_catalog_entry_is_unknown(tmp_path):
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
