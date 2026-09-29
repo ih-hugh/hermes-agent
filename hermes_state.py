@@ -574,40 +574,67 @@ class SessionDB(
             begin_raw_schema_claim, existing_protected_store, finish_raw_schema_claim,
         )
 
+        try:
+            observed = self.db_path.lstat()
+            observed_identity = (observed.st_dev, observed.st_ino)
+        except FileNotFoundError:
+            observed_identity = None
         if existing_protected_store(self.db_path):
-            self._open_writer_existing_schema()
+            self._open_writer_existing_schema(observed_identity)
             return
         try:
             lease = begin_raw_schema_claim(self.db_path)
         except RecoveryRefused as exc:
             # A protected root may have won between the read-only branch hint
             # and the claim. Its committed guard/schema is now the only path.
-            if exc.code != "protected_session_dispatch" or not existing_protected_store(self.db_path):
+            if exc.code != "protected_session_dispatch":
                 raise
-            self._open_writer_existing_schema()
+            try:
+                observed = self.db_path.lstat()
+            except OSError as stat_exc:
+                raise RecoveryRefused("protected_session_authority_unavailable") from stat_exc
+            if not existing_protected_store(self.db_path):
+                raise RecoveryRefused("protected_session_authority_unavailable") from exc
+            self._open_writer_existing_schema((observed.st_dev, observed.st_ino))
             return
         # Failed or uncertain schema work intentionally leaves this exact raw
         # claim sticky. Only known successful initialization releases it.
-        self._open_writer_reconcile()
+        self._open_writer_reconcile(lease)
         finish_raw_schema_claim(lease, conn=self._conn)
 
-    def _open_writer_existing_schema(self) -> None:
+    def _open_writer_existing_schema(self, expected_identity: tuple[int, int] | None) -> None:
         """Attach a protected store without schema DDL, reconciliation or repair."""
         from hermes_recovery_refusal import require_compatible_recovery_connection
         from hermes_state_schema import schema_read_probe_statements
         from hermes_state_recovery import RecoveryRefused
         from hermes_state_recovery_guard import register_connection_guard
+        from hermes_state_recovery_exclusions import _catalog, _protected_exists
 
+        if expected_identity is None:
+            raise RecoveryRefused("protected_session_authority_unavailable")
         preflight_db_writability(self.db_path, db_label="state.db")
-        if not self.db_path.is_file():
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (not stat.S_ISREG(observed.st_mode)
+                or (observed.st_dev, observed.st_ino) != expected_identity):
             raise RecoveryRefused("protected_session_authority_unavailable")
         conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            self.db_path.absolute().as_uri() + "?mode=rw", tracking_path=self.db_path,
+            uri=True, check_same_thread=False, timeout=1.0, isolation_level=None,
         )
         self._conn = conn
         conn.row_factory = sqlite3.Row
         register_connection_guard(conn, self)
         require_compatible_recovery_connection(conn)
+        try:
+            observed = self.db_path.lstat()
+            if ((observed.st_dev, observed.st_ino) != expected_identity
+                    or not _protected_exists(conn, _catalog(conn))):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
         try:
             for statement in schema_read_probe_statements():
                 conn.execute(statement).fetchone()
@@ -615,7 +642,19 @@ class SessionDB(
             raise RecoveryRefused("protected_session_authority_unavailable") from exc
         # Keep ordinary writer file-permission hardening after validating the
         # exact protected catalog, without changing its on-disk journal mode.
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (observed.st_dev, observed.st_ino) != expected_identity:
+            raise RecoveryRefused("protected_session_authority_unavailable")
         _secure_state_db_files(self.db_path)
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (observed.st_dev, observed.st_ino) != expected_identity:
+            raise RecoveryRefused("protected_session_authority_unavailable")
         apply_database_pragmas(conn, db_label="state.db")
         conn.execute("PRAGMA foreign_keys=ON")
         self._wal_active = _on_disk_journal_mode(conn) == "wal"
@@ -627,9 +666,11 @@ class SessionDB(
         if self._wal_active:
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
-    def _open_writer_reconcile(self) -> None:
-        """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
-        malformed sqlite_master), generation stamp."""
+    def _open_writer_reconcile(self, lease) -> None:
+        """Initialize only the already claimed file; uncertain work retains its raw claim."""
+        from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+        assert_raw_schema_lease_target(lease)
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
@@ -637,25 +678,13 @@ class SessionDB(
         # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
         preflight_db_writability(self.db_path, db_label="state.db")
         try:
-            # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
-            # openers don't race the absent-path -> schema-commit window.
-            if not self.db_path.exists() or has_invalid_sqlite_header_preopen(self.db_path):
-                with quarantine_cross_process_lock(self.db_path) as lock_acquired:
-                    if not lock_acquired:
-                        logger.warning(
-                            "startup quarantine lock for %s not acquired within 5s; proceeding",
-                            self.db_path,
-                        )
-                    self._handle_quarantine_if_invalid(already_locked=lock_acquired)
-                    self._connect_and_init_with_lock_patience()
-            else:
-                self._handle_quarantine_if_invalid(already_locked=False)
-                self._connect_and_init_with_lock_patience()
+            self._connect_and_init_with_lock_patience(lease)
         except sqlite3.DatabaseError as exc:
             # A malformed schema fails on the very first statement (before _init_schema), so the
             # FTS-rebuild layer never sees it: repair sqlite_master in place (backup first), reopen once.
             if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
                 raise
+            assert_raw_schema_lease_target(lease)
             logger.error(
                 "state.db schema is malformed (%s) — attempting automatic "
                 "repair (a backup copy is made first).", exc,
@@ -663,7 +692,8 @@ class SessionDB(
             self._close_connection_quietly(self._conn)
             if not repair_state_db_schema(self.db_path).get("repaired"):
                 raise
-            self._connect_and_init_with_lock_patience()
+            assert_raw_schema_lease_target(lease)
+            self._connect_and_init_with_lock_patience(lease)
         # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
         self._ensure_db_file_generation()
         if self._wal_active:
@@ -737,14 +767,24 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self) -> sqlite3.Connection:
+    def _open_writer_conn(self, lease=None) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
-        conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
-        )
+        if lease is None:
+            conn = _connect_tracked_db(
+                str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            )
+        else:
+            conn = _connect_tracked_db(
+                self.db_path.absolute().as_uri() + "?mode=rw", tracking_path=self.db_path,
+                uri=True, check_same_thread=False, timeout=1.0, isolation_level=None,
+            )
         try:
+            if lease is not None:
+                from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+                assert_raw_schema_lease_target(lease, conn=conn)
             conn.row_factory = sqlite3.Row
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
@@ -765,17 +805,22 @@ class SessionDB(
             raise
         return conn
 
-    def _connect_and_init(self) -> None:
+    def _connect_and_init(self, lease) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
-        _secure_state_db_files(self.db_path, create_main=True)
-        self._conn = self._open_writer_conn()
+        from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+        assert_raw_schema_lease_target(lease)
+        _secure_state_db_files(self.db_path)
+        assert_raw_schema_lease_target(lease)
+        self._conn = self._open_writer_conn(lease)
+        assert_raw_schema_lease_target(lease, conn=self._conn)
         self._init_schema()
 
-    def _connect_and_init_with_lock_patience(self) -> None:
+    def _connect_and_init_with_lock_patience(self, lease) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
         _init_schema's DDL runs on a 1s-timeout connection, so a sibling's VACUUM
         or checkpoint used to fail the ENTIRE open and callers disabled
@@ -789,7 +834,7 @@ class SessionDB(
         deadline = time.monotonic() + self._WRITE_PATIENCE_S
         while True:
             try:
-                self._connect_and_init()
+                self._connect_and_init(lease)
                 return
             except sqlite3.OperationalError as exc:
                 err = str(exc).lower()

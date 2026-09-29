@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import os
 from multiprocessing import get_context
 from pathlib import Path
 from uuid import uuid4
@@ -345,6 +346,146 @@ def test_sessiondb_existing_protected_branch_skips_schema_reconciliation(tmp_pat
         assert claim_ordinary_sessions(path, ("other",)).session_ids == ("other",)
     finally:
         second.close()
+
+
+@pytest.mark.parametrize("damage", ["zero", "missing"])
+def test_claimed_initializer_never_replaces_changed_authority_file(tmp_path: Path,
+                                                                     monkeypatch, damage):
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    retained = tmp_path / "retained.db"
+    original = exclusions.begin_raw_schema_claim
+    claimed, changed = threading.Event(), threading.Event()
+    leases = []
+
+    def change_file():
+        if not claimed.wait(5):
+            return
+        if damage == "zero":
+            path.write_bytes(bytes(4096))
+        else:
+            os.replace(path, retained)
+        changed.set()
+
+    adversary = threading.Thread(target=change_file)
+    adversary.start()
+
+    def change_after_claim(target):
+        lease = original(target)
+        leases.append(lease)
+        claimed.set()
+        assert changed.wait(5)
+        return lease
+
+    monkeypatch.setattr(exclusions, "begin_raw_schema_claim", change_after_claim)
+    monkeypatch.setattr("hermes_state.quarantine_invalid_state_db",
+                        lambda *_args, **_kwargs: pytest.fail("claimed file was quarantined"))
+    try:
+        with pytest.raises(RecoveryRefused, match="(invalid_raw_schema_lease|protected_session_authority_unavailable)"):
+            SessionDB(path)
+    finally:
+        claimed.set()
+        adversary.join(5)
+    assert changed.is_set() and not adversary.is_alive()
+    with pytest.raises(RecoveryRefused, match="invalid_raw_schema_lease"):
+        finish_raw_schema_claim(leases[0])
+    if damage == "zero":
+        assert path.read_bytes() == bytes(4096)
+        assert not list(tmp_path.glob("state.db.*.bak"))
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            SessionDB(path)  # a competing root cannot initialize the unreadable replacement
+    else:
+        assert not path.exists()
+        with sqlite3.connect(retained) as raw:
+            assert raw.execute(
+                "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+            ).fetchone()[0] == 1
+        competing = SessionDB(retained)
+        try:
+            assert _reserve(RecoveryStore(competing), "future", "future-root").reason == "raw_schema_active"
+        finally:
+            competing.close()
+
+
+def test_protected_attach_rechecks_opened_catalog_after_stale_hint(tmp_path: Path,
+                                                                    monkeypatch):
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    ordinary = SessionDB(path)
+    ordinary.close()
+    original = exclusions.existing_protected_store
+    monkeypatch.setattr(exclusions, "existing_protected_store", lambda target: True)
+    try:
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            SessionDB(path)
+    finally:
+        monkeypatch.setattr(exclusions, "existing_protected_store", original)
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT count(*) FROM recovery_sessions").fetchone()[0] == 0
+
+
+def test_protected_attach_refuses_path_swap_after_positive_hint(tmp_path: Path, monkeypatch):
+    import hermes_state_recovery_exclusions as exclusions
+
+    path, replacement, retained = (tmp_path / "state.db", tmp_path / "replacement.db",
+                                   tmp_path / "retained.db")
+    protected = SessionDB(path)
+    try:
+        assert _reserve(RecoveryStore(protected), "protected", "root").outcome == "created"
+    finally:
+        protected.close()
+    ordinary = SessionDB(replacement)
+    ordinary.close()
+    original = exclusions.existing_protected_store
+    hinted, swapped = threading.Event(), threading.Event()
+
+    def replace_path():
+        if not hinted.wait(5):
+            return
+        os.replace(path, retained)
+        os.replace(replacement, path)
+        swapped.set()
+
+    adversary = threading.Thread(target=replace_path)
+    adversary.start()
+
+    def swap_after_hint(target):
+        result = original(target)
+        if result:
+            hinted.set()
+            assert swapped.wait(5)
+        return result
+
+    monkeypatch.setattr(exclusions, "existing_protected_store", swap_after_hint)
+    monkeypatch.setattr(SessionDB, "_init_schema",
+                        lambda _self: pytest.fail("stale protected hint ran schema work"))
+    try:
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            SessionDB(path)
+    finally:
+        hinted.set()
+        adversary.join(5)
+    assert swapped.is_set() and not adversary.is_alive()
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT count(*) FROM recovery_sessions").fetchone()[0] == 0
+    with sqlite3.connect(retained) as raw:
+        assert raw.execute("SELECT count(*) FROM recovery_sessions").fetchone()[0] == 1
+
+
+def test_claimed_and_protected_existing_only_uri_escapes_filename(tmp_path: Path):
+    path = tmp_path / "state?#%.db"
+    db = SessionDB(path)
+    try:
+        assert _reserve(RecoveryStore(db), "protected", "root").outcome == "created"
+    finally:
+        db.close()
+    again = SessionDB(path)
+    try:
+        assert again._read_one("SELECT session_id FROM recovery_sessions")[0] == "protected"
+    finally:
+        again.close()
 
 
 def test_simultaneous_schema_openers_release_only_their_own_claim(tmp_path: Path,

@@ -326,8 +326,40 @@ def begin_raw_schema_claim(path: Path) -> RawSchemaLease:
     return lease
 
 
+def assert_raw_schema_lease_target(lease: RawSchemaLease,
+                                   *, conn: sqlite3.Connection | None = None) -> Path:
+    """Refuse a moved or unreadable claimed file before any initializer effect."""
+    if type(lease) is not RawSchemaLease:
+        raise RecoveryRefused("invalid_raw_schema_lease")
+    with _LOCK:
+        record = _RAW_LEASES.get(lease)
+    if record is None or record[:2] != (os.getpid(), _NONCE):
+        raise RecoveryRefused("invalid_raw_schema_lease")
+    _, _, path, _claim_id, device, inode = record
+    try:
+        identity = path.lstat()
+        if (not stat.S_ISREG(identity.st_mode)
+                or (identity.st_dev, identity.st_ino) != (device, inode)):
+            raise RecoveryRefused("invalid_raw_schema_lease")
+        from hermes_state import has_invalid_sqlite_header_preopen
+
+        if has_invalid_sqlite_header_preopen(path):
+            raise RecoveryRefused("invalid_raw_schema_lease")
+        if conn is not None:
+            databases = conn.execute("PRAGMA database_list").fetchall()
+            main = [row[2] for row in databases if row[1] == "main"]
+            if len(main) != 1 or not main[0] or Path(main[0]).resolve() != path:
+                raise RecoveryRefused("invalid_raw_schema_lease")
+    except OSError as exc:
+        raise RecoveryRefused("invalid_raw_schema_lease") from exc
+    except sqlite3.DatabaseError as exc:
+        raise RecoveryRefused("invalid_raw_schema_lease") from exc
+    return path
+
+
 def finish_raw_schema_claim(lease: RawSchemaLease,
                             *, conn: sqlite3.Connection | None = None) -> None:
+    assert_raw_schema_lease_target(lease, conn=conn)
     if type(lease) is not RawSchemaLease:
         raise RecoveryRefused("invalid_raw_schema_lease")
     with _LOCK:
