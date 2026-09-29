@@ -10,7 +10,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from openai._models import construct_type
+from openai.types.completion_usage import CompletionUsage
 
+from agent import turn_usage, usage_pricing
 from agent.recovery_context import (
     bind_write_permit,
     current_incarnation,
@@ -36,6 +39,158 @@ from hermes_state_recovery import (
 )
 from hermes_state_usage import UsageDelta
 from hermes_state_recovery_message_result import prepare_message_batch
+
+
+def _protected_usage_case(tmp_path: Path, monkeypatch, *, model: str, usage: CompletionUsage):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "usage-session")
+    admitted = store.reserve(
+        RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+        AdmissionIdentity(
+            scope, "byf-recovery-v1:usage", "a" * 64, "usage-run",
+            current_incarnation(), provider_admission(scope.session_id),
+        ),
+    )
+    registry = ProducerRegistry(
+        store, scope, "usage-run", 0, issue_producer_permit(store, admitted.handoff)
+    )
+    writer = issue_write_permit(registry.permit, store, scope, "usage-run", 0)
+    with bind_write_permit(writer):
+        db.create_session(scope.session_id, "api_server")
+    response = SimpleNamespace(id="scratch-response", usage=usage)
+
+    def physical() -> None:
+        send = registry.sends.begin(registry.permit, "usage-send")
+        send.invoke(lambda: None)
+        registry.bind_response_send(response, send)
+
+    registry.enter(registry.permit, "sdk").run(physical)
+    monkeypatch.setattr(turn_usage, "calibrate_from_usage", lambda *_: None)
+    monkeypatch.setattr(turn_usage, "capture_usage_anchor", lambda *_: None)
+    agent = SimpleNamespace(
+        _recovery_registry=registry,
+        context_compressor=SimpleNamespace(update_from_response=lambda _: None, threshold_tokens=0),
+        client=None, provider="openai-api", api_mode="chat_completions", model=model,
+        base_url="https://api.openai.com/v1", api_key="SCRATCH_ONLY",
+        session_id=scope.session_id, _session_db=db, _session_db_created=True,
+        _recovery_write_permit=writer, session_api_calls=0, session_prompt_tokens=0,
+        session_completion_tokens=0, session_total_tokens=0, session_input_tokens=0,
+        session_output_tokens=0, session_cache_read_tokens=0, session_cache_write_tokens=0,
+        session_reasoning_tokens=0, session_estimated_cost_usd=0.0, verbose_logging=False,
+        quiet_mode=True,
+    )
+    return db, store, scope, agent, response
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {"total_tokens": 1},
+        {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 6},
+        {"prompt_tokens": "2", "completion_tokens": 3, "total_tokens": 5},
+        {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5,
+         "prompt_tokens_details": {"cached_tokens": 5}},
+        {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5,
+         "completion_tokens_details": {"reasoning_tokens": -1}},
+    ],
+)
+def test_protected_partial_or_invalid_native_usage_stays_unknown(
+    tmp_path: Path, monkeypatch, raw_usage: dict[str, object]
+) -> None:
+    usage = construct_type(value=raw_usage, type_=CompletionUsage)
+    db, store, scope, agent, response = _protected_usage_case(
+        tmp_path, monkeypatch, model="gpt-4.1", usage=usage
+    )
+    try:
+        turn_usage.record_response_usage(
+            agent, response, messages=[], api_call_count=1, api_duration=0.1,
+            compression_attempts=0, max_compression_attempts=1,
+        )
+        assert store.send_inventory(scope, "usage-run")[0][2] == "unknown"
+        assert db._read_one("SELECT 1 FROM session_model_usage WHERE session_id=?", (scope.session_id,)) is None
+    finally:
+        db.close()
+
+
+def test_protected_native_zero_usage_is_accounted(tmp_path: Path, monkeypatch) -> None:
+    usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+    db, store, scope, agent, response = _protected_usage_case(
+        tmp_path, monkeypatch, model="gpt-4.1", usage=usage
+    )
+    try:
+        turn_usage.record_response_usage(
+            agent, response, messages=[], api_call_count=1, api_duration=0.1,
+            compression_attempts=0, max_compression_attempts=1,
+        )
+        assert store.send_inventory(scope, "usage-run")[0][2] == "accounted"
+        row = db._read_one(
+            "SELECT input_tokens,output_tokens,api_call_count FROM session_model_usage "
+            "WHERE session_id=? AND model=?", (scope.session_id, "gpt-4.1"),
+        )
+        assert row is not None and tuple(row) == (0, 0, 1)
+    finally:
+        db.close()
+
+
+def test_protected_native_cache_and_reasoning_usage_is_accounted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    usage = construct_type(
+        value={
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 1},
+            "completion_tokens_details": {"reasoning_tokens": 2},
+        },
+        type_=CompletionUsage,
+    )
+    db, store, scope, agent, response = _protected_usage_case(
+        tmp_path, monkeypatch, model="gpt-4.1", usage=usage
+    )
+    try:
+        turn_usage.record_response_usage(
+            agent, response, messages=[], api_call_count=1, api_duration=0.1,
+            compression_attempts=0, max_compression_attempts=1,
+        )
+        assert store.send_inventory(scope, "usage-run")[0][2] == "accounted"
+        row = db._read_one(
+            "SELECT input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,"
+            "reasoning_tokens,api_call_count FROM session_model_usage "
+            "WHERE session_id=? AND model=?", (scope.session_id, "gpt-4.1"),
+        )
+        assert row is not None and tuple(row) == (7, 4, 2, 1, 2, 1)
+    finally:
+        db.close()
+
+
+def test_protected_unknown_price_never_fetches_endpoint_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    usage = CompletionUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5)
+    db, store, scope, agent, response = _protected_usage_case(
+        tmp_path, monkeypatch, model="new-unpriced-model", usage=usage
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        usage_pricing, "fetch_endpoint_model_metadata",
+        lambda base_url, api_key="": calls.append(base_url) or {},
+    )
+    try:
+        turn_usage.record_response_usage(
+            agent, response, messages=[], api_call_count=1, api_duration=0.1,
+            compression_attempts=0, max_compression_attempts=1,
+        )
+        assert calls == []
+        assert store.send_inventory(scope, "usage-run")[0][2] == "accounted"
+        row = db._read_one(
+            "SELECT payload_json FROM recovery_usage_slots WHERE delta_id=?",
+            ("usage-send:usage",),
+        )
+        assert row is not None and b'"estimated_cost_usd":null' in row[0]
+    finally:
+        db.close()
 
 
 def test_queued_usage_applies_once_and_ack_survives_reopen(tmp_path: Path) -> None:
@@ -128,7 +283,9 @@ def test_queued_usage_applies_once_and_ack_survives_reopen(tmp_path: Path) -> No
         reopened.close()
 
 
-def test_failed_protected_apply_stays_failed_after_legacy_flush(tmp_path: Path) -> None:
+def test_failed_protected_apply_stays_failed_after_legacy_flush(
+    tmp_path: Path, monkeypatch
+) -> None:
     db = SessionDB(tmp_path / "state.db")
     store = RecoveryStore(db)
     scope = RecoveryScope(store.store_id, "factory", "b" * 64, "missing-session")
@@ -143,6 +300,14 @@ def test_failed_protected_apply_stays_failed_after_legacy_flush(tmp_path: Path) 
     registry = ProducerRegistry(
         store, scope, "root", 0, issue_producer_permit(store, admitted.handoff)
     )
+    original_apply = RecoveryStore.apply_usage_delta
+
+    def fail_exact_usage(self, permit, delta, digest):
+        if delta.write_id == "attempt-failed:usage":
+            raise RecoveryRefused("scratch_usage_apply_failure")
+        return original_apply(self, permit, delta, digest)
+
+    monkeypatch.setattr(RecoveryStore, "apply_usage_delta", fail_exact_usage)
 
     def _failed_accounting() -> None:
         send = registry.sends.begin(registry.permit, "attempt-failed")

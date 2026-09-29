@@ -17,7 +17,11 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    normalize_usage,
+    validated_protected_chat_usage,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -85,7 +89,13 @@ def record_response_usage(
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
     agent.session_api_calls += 1
-    if not (hasattr(response, 'usage') and response.usage):
+    response_usage = getattr(response, "usage", None)
+    protected_usage = (
+        validated_protected_chat_usage(response_usage)
+        if protected_send is not None and response_usage
+        else None
+    )
+    if not response_usage or (protected_send is not None and protected_usage is None):
         if protected_send is not None:
             from agent.recovery_producers import SendOutcome
 
@@ -107,7 +117,13 @@ def record_response_usage(
         )
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
-    canonical_usage = normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode)
+    if protected_send is not None:
+        assert protected_usage is not None
+        canonical_usage = protected_usage
+    else:
+        canonical_usage = normalize_usage(
+            response_usage, provider=agent.provider, api_mode=agent.api_mode
+        )
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
@@ -233,6 +249,7 @@ def record_response_usage(
     cost_result = estimate_usage_cost(
         _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
         base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
+        allow_remote_metadata=protected_send is None,
     )
     # Cost delta = aggregator + MoA advisor cost (already priced per-advisor at each
     # advisor's own model rate), so state.db's estimated_cost_usd matches the folded
@@ -257,6 +274,7 @@ def record_response_usage(
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
     # loop); drained at finalize via _persist_session.
     if protected_send is not None:
+        assert registry is not None
         from agent.recovery_context import bind_write_permit, issue_usage_write_permit
         from agent.recovery_producers import SendOutcome
         from hermes_state_recovery import RecoveryRefused
