@@ -19,7 +19,8 @@ from agent.recovery_context import (
 from hermes_state import SessionDB
 from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
 from hermes_state_recovery import RecoveryRefused
-from hermes_state_repair import _copy_database_snapshot
+from hermes_state_repair import _copy_database_snapshot, _recovery_repair_classification
+from hermes_state_repair import repair_state_db_schema
 from hermes_state_recovery_guard import guarded_write
 
 
@@ -241,6 +242,47 @@ def test_repair_backup_refuses_protected_store_before_creating_destination(
         assert not destination.exists()
     finally:
         db.close()
+
+
+def test_damaged_protected_schema_refuses_repair_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    db, _, scope, _ = _protected_db(tmp_path)
+    path = db.db_path
+    db.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type,name,tbl_name,rootpage,sql) "
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master "
+            "WHERE name='messages_fts'"
+        )
+    original = path.read_bytes()
+    report = repair_state_db_schema(path)
+    assert report["repaired"] is False
+    assert "protected recovery store" in report["error"]
+    assert report["backup_path"] is None
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA writable_schema=ON")
+        assert conn.execute(
+            "SELECT 1 FROM recovery_sessions WHERE session_id=?", (scope.session_id,)
+        ).fetchone()
+
+
+def test_protected_classification_reads_literal_sqlite_filename(tmp_path: Path) -> None:
+    path = tmp_path / "state?name#percent%.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE recovery_sessions (session_id TEXT)")
+        conn.execute(
+            "CREATE TRIGGER recovery_guard_recovery_sessions_insert "
+            "BEFORE INSERT ON recovery_sessions BEGIN SELECT 1; END"
+        )
+    before = set(tmp_path.iterdir())
+    assert _recovery_repair_classification(path) == "protected"
+    assert set(tmp_path.iterdir()) == before
 
 
 def test_bound_permit_guards_old_and_new_session_ids(tmp_path: Path) -> None:

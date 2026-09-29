@@ -26,7 +26,11 @@ import hermes_state
 import hermes_state_repair
 import hermes_state_wal
 from hermes_state import SessionDB, is_malformed_db_error
-from hermes_state_repair import repair_state_db_schema
+from hermes_state_repair import (
+    _copy_database_snapshot,
+    _recovery_repair_classification,
+    repair_state_db_schema,
+)
 
 
 def _build_healthy_db(db_path: Path) -> str:
@@ -142,17 +146,76 @@ def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
 
 
 
-def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
-    """A file too damaged to recover must report failure, keep a backup, and
-    never raise from the repair routine itself."""
+def test_unclassifiable_file_refuses_repair_before_artifacts(tmp_path):
+    """An unreadable catalog cannot prove that protected admission never occurred."""
     db_path = tmp_path / "state.db"
-    db_path.write_bytes(b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200)
+    original = b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200
+    db_path.write_bytes(original)
 
     report = repair_state_db_schema(db_path)
     assert report["repaired"] is False
-    assert report["error"]
-    # The (damaged) original bytes are preserved for manual restore.
-    assert report["backup_path"] and Path(report["backup_path"]).exists()
+    assert "unclassifiable" in report["error"]
+    assert report["backup_path"] is None
+    assert db_path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+
+    destination = tmp_path / "copy.db"
+    with pytest.raises(sqlite3.DatabaseError, match="unclassifiable"):
+        _copy_database_snapshot(db_path, destination)
+    assert not destination.exists()
+    assert db_path.read_bytes() == original
+
+
+def test_readable_catalog_with_unreadable_recovery_ledger_refuses_repair(tmp_path):
+    """A visible recovery table is not proof of an empty ledger if it cannot be read."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql='CREATE TABLE recovery_sessions (' "
+            "WHERE type='table' AND name='recovery_sessions'"
+        )
+    original = db_path.read_bytes()
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is False
+    assert "unclassifiable" in report["error"]
+    assert report["backup_path"] is None
+    assert db_path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+
+
+def test_readable_catalog_without_recovery_objects_proves_legacy(tmp_path):
+    db_path = tmp_path / "old-state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE ordinary (id INTEGER PRIMARY KEY)")
+    assert _recovery_repair_classification(db_path) == "legacy"
+
+
+def test_missing_recovery_session_catalog_entry_is_unknown(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "DELETE FROM sqlite_master WHERE type='table' AND name='recovery_sessions'"
+        )
+    original = db_path.read_bytes()
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is False
+    assert "unclassifiable" in report["error"]
+    assert report["backup_path"] is None
+    assert db_path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+
+
+def test_repair_classification_reads_literal_sqlite_filename(tmp_path):
+    db_path = tmp_path / "state?name#percent%.db"
+    _build_healthy_db(db_path)
+    assert _recovery_repair_classification(db_path) == "legacy"
 
 
 
