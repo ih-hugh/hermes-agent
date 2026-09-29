@@ -28,8 +28,9 @@ from hermes_state_recovery_guard import guarded_write
 
 def _protected_db(
     tmp_path: Path,
+    *, filename: str = "state.db",
 ) -> tuple[SessionDB, RecoveryStore, RecoveryScope, object]:
-    db = SessionDB(tmp_path / "state.db")
+    db = SessionDB(tmp_path / filename)
     store = RecoveryStore(db)
     scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
     admitted = store.reserve(
@@ -381,15 +382,28 @@ def test_damaged_protected_schema_refuses_repair_without_artifacts(
 
 def test_protected_classification_reads_literal_sqlite_filename(tmp_path: Path) -> None:
     path = tmp_path / "state?name#percent%.db"
-    with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TABLE recovery_sessions (session_id TEXT)")
-        conn.execute(
-            "CREATE TRIGGER recovery_guard_recovery_sessions_insert "
-            "BEFORE INSERT ON recovery_sessions BEGIN SELECT 1; END"
-        )
+    db, _store, scope, _handoff = _protected_db(
+        tmp_path, filename=path.name,
+    )
+    db.close()
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM recovery_sessions WHERE session_id=?", (scope.session_id,),
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
     before = set(tmp_path.iterdir())
+    original = path.read_bytes()
     assert _recovery_repair_classification(path) == "protected"
-    assert set(tmp_path.iterdir()) == before
+    # SQLite's read-only WAL attach may create empty WAL/SHM bookkeeping.
+    # It must not write a frame, change the main DB, or open a URI-truncated name.
+    created = set(tmp_path.iterdir()) - before
+    assert created <= {path.with_name(path.name + suffix) for suffix in ("-wal", "-shm")}
+    wal = path.with_name(path.name + "-wal")
+    if wal in created:
+        assert wal.read_bytes() == b""
+    assert path.read_bytes() == original
 
 
 def test_bound_permit_guards_old_and_new_session_ids(tmp_path: Path) -> None:

@@ -335,10 +335,9 @@ class TestConnectionLifecycle:
         self, tmp_path
     ):
         """A malformed store makes the RO FTS probe raise DatabaseError.
-        The connection must be closed on that failure path: a leaked tracked
-        connection blocks _backup_db_file's raw-copy for the process
-        lifetime, so the writable heal that follows would repair WITHOUT its
-        forensic backup."""
+        The tracked connection must close on that failure path. The later
+        writable open cannot classify recovery authority, so it must refuse
+        without leaking another connection or starting repair."""
         import sqlite3
 
         from hermes_cli.sqlite_safe_read import has_live_connection
@@ -372,10 +371,16 @@ class TestConnectionLifecycle:
 
         assert has_live_connection(db_path) is False
 
-        # The writable heal must still take its forensic backup.
-        healed = SessionDB(db_path=db_path, read_only=False)
-        healed.close()
-        assert list(tmp_path.glob("*malformed-backup*"))
+        # The malformed catalog cannot prove that no protected authority is
+        # present. A later writable open must refuse before repair or backup.
+        from hermes_state_recovery import RecoveryRefused
+
+        before = db_path.read_bytes()
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            SessionDB(db_path=db_path, read_only=False)
+        assert has_live_connection(db_path) is False
+        assert db_path.read_bytes() == before
+        assert not list(tmp_path.glob("*malformed-backup*"))
 
     def test_read_only_open_retries_transient_wal_ioerr(self, tmp_path, monkeypatch):
         """A transient SQLITE_IOERR on a read-only open must retry, not raise.

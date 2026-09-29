@@ -570,6 +570,10 @@ class TestGetLastInitError:
                 return super().execute(sql, *args, **kwargs)
 
         def gated_connect(*args, **kwargs):
+            # The raw ordinary-session claim opens the same file first. Fault
+            # only the tracked main writer open, not that authority preflight.
+            if "mode=rw" not in str(args[0]):
+                return real_connect(*args, **kwargs)
             # connect_tracked passes a tracking-augmented factory; drop it and
             # substitute the double, which connect_tracked will re-augment.
             kwargs.pop("factory", None)

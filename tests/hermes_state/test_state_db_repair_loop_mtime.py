@@ -39,6 +39,24 @@ def _damaged_db(tmp_path: Path, size: int = 200_000) -> Path:
     return db
 
 
+def _classifiable_damaged_db(tmp_path: Path) -> Path:
+    """A real ordinary store with malformed FTS, leaving authority inspectable."""
+    db = tmp_path / "state.db"
+    hermes_state.SessionDB(db).close()
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type,name,tbl_name,rootpage,sql) "
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master "
+            "WHERE name='messages_fts'"
+        )
+    finally:
+        conn.close()
+    assert hermes_state_repair._recovery_repair_classification(db) == "legacy"
+    return db
+
+
 # ---------------------------------------------------------------------------
 # Fingerprint stability
 # ---------------------------------------------------------------------------
@@ -240,7 +258,8 @@ def test_backup_allowed_with_ample_disk(tmp_path):
 
 def test_repair_aborts_when_backup_refused_for_disk(tmp_path):
     """Refused backup is a HARD STOP — never mutate the only damaged copy."""
-    db = _damaged_db(tmp_path)
+    db = _classifiable_damaged_db(tmp_path)
+    original = db.read_bytes()
     tight = type(
         "Usage", (), {"total": 0, "used": 0, "free": _REPAIR_BACKUP_MIN_FREE_BYTES // 2}
     )()
@@ -248,6 +267,8 @@ def test_repair_aborts_when_backup_refused_for_disk(tmp_path):
         report = hermes_state_repair.repair_state_db_schema(db)
     assert not report.get("repaired")
     assert "free" in (report.get("error") or "").lower()
+    assert db.read_bytes() == original
+    assert not _existing_malformed_backups(db)
 
 
 # ---------------------------------------------------------------------------
