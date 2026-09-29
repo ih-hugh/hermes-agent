@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -75,6 +76,274 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+_SETTLED_INIT_KEY = "ordinary_init_settled_v1"
+_INIT_SOURCE_FILES = (
+    "hermes_state.py", "hermes_state_schema.py", "hermes_state_common.py",
+    "hermes_state_fts.py", "hermes_state_recovery_guard.py",
+    "hermes_state_recovery_exclusions.py",
+)
+
+
+def _read_init_source_epoch() -> str | None:
+    """Digest the bounded installed initializer sources, never their contents in logs."""
+    digest = hashlib.sha256(b"hermes/ordinary-init/v1\n")
+    try:
+        for name in _INIT_SOURCE_FILES:
+            path = Path(__file__).resolve().parent / name
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576:
+                    return None
+                chunks = []
+                remaining = 1_048_577
+                while remaining:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                if len(data) > 1_048_576 or len(data) != info.st_size:
+                    return None
+            finally:
+                os.close(fd)
+            digest.update(name.encode("ascii") + b"\x00" + len(data).to_bytes(8, "big") + data)
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+# Frozen at import: a running older initializer cannot bless a changed install.
+_LOADED_INIT_SOURCE_EPOCH = _read_init_source_epoch()
+
+
+def _current_init_source_epoch() -> str | None:
+    current = _read_init_source_epoch()
+    return current if current is not None and current == _LOADED_INIT_SOURCE_EPOCH else None
+
+
+def _canonical_ordinary_store_ids(store_id: object, generation: object) -> bool:
+    if type(store_id) is not str or type(generation) is not str:
+        return False
+    try:
+        store_uuid = uuid.UUID(store_id)
+        generation_uuid = uuid.UUID(hex=generation)
+    except (ValueError, AttributeError):
+        return False
+    return (
+        store_uuid.version == 4 and str(store_uuid) == store_id
+        and generation_uuid.version == 4 and generation_uuid.hex == generation
+    )
+
+
+def _bounded_ordinary_store_ids(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    store = conn.execute(
+        "SELECT typeof(store_id),substr(CAST(store_id AS BLOB),1,65) "
+        "FROM recovery_store WHERE singleton=1"
+    ).fetchone()
+    generation = conn.execute(
+        "SELECT typeof(value),substr(CAST(value AS BLOB),1,33) "
+        "FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+    ).fetchone()
+    if (store is None or generation is None or store[0] != "text" or generation[0] != "text"
+            or type(store[1]) is not bytes or type(generation[1]) is not bytes):
+        return None
+    try:
+        values = store[1].decode("ascii"), generation[1].decode("ascii")
+    except UnicodeError:
+        return None
+    return values if _canonical_ordinary_store_ids(*values) else None
+
+
+def _fts_trigger_catalog_settled(conn: sqlite3.Connection, *, cjk_loaded: bool) -> bool:
+    from hermes_state_common import _FTS_CJK_TRIGGERS, _FTS_TRIGGERS
+
+    trigram = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_trigram'"
+    ).fetchone() is not None
+    cjk = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_cjk'"
+    ).fetchone() is not None
+    if cjk != cjk_loaded:
+        return False
+    try:
+        if trigram:
+            conn.execute("SELECT rowid FROM messages_fts_trigram LIMIT 0").fetchone()
+        if cjk:
+            conn.execute("SELECT rowid FROM messages_fts_cjk LIMIT 0").fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    expected = set(_FTS_TRIGGERS[:3])
+    if trigram:
+        expected.update(_FTS_TRIGGERS[3:])
+    if cjk:
+        expected.update(_FTS_CJK_TRIGGERS)
+    names = conn.execute(
+        "SELECT typeof(name),substr(CAST(name AS BLOB),1,129) "
+        "FROM sqlite_master WHERE type='trigger' AND name GLOB 'messages_fts_*' LIMIT 10"
+    ).fetchall()
+    return (
+        len(names) == len(expected)
+        and all(row[0] == "text" and type(row[1]) is bytes and len(row[1]) <= 128 for row in names)
+        and {row[1] for row in names} == {name.encode("ascii") for name in expected}
+    )
+
+
+def _ordinary_journal_mode_settled(conn: sqlite3.Connection) -> bool:
+    from hermes_state_wal import resolve_journal_mode
+
+    actual = _on_disk_journal_mode(conn)
+    return actual in {"wal", "delete"} and (actual == "wal" or resolve_journal_mode() == "delete")
+
+
+def _ordinary_reconciliation_complete(conn: sqlite3.Connection) -> bool:
+    """Cheap bounded probes for repairs _init_schema may defer or soft-fail."""
+    from hermes_state_common import FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY
+    from hermes_state_schema import schema_read_probe_statements
+
+    primary_keys = (
+        ("gateway_routing", ("scope", "session_key")),
+        ("session_model_usage", (
+            "session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task",
+        )),
+    )
+    for table, expected in primary_keys:
+        rows = conn.execute(
+            "SELECT typeof(name),substr(CAST(name AS BLOB),1,65),pk "
+            "FROM pragma_table_info(?) WHERE pk>0 ORDER BY pk LIMIT 7", (table,),
+        ).fetchall()
+        if (len(rows) != len(expected)
+                or any(row[0] != "text" or type(row[1]) is not bytes
+                       or row[1] != name.encode("ascii") or row[2] != i
+                       for i, (row, name) in enumerate(zip(rows, expected), 1))):
+            return False
+    for name in ("idx_messages_platform_msg_id", "idx_sessions_title_unique"):
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1", (name,),
+        ).fetchone() is None:
+            return False
+    if conn.execute(
+        "SELECT 1 FROM state_meta WHERE key=? LIMIT 1",
+        (FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY,),
+    ).fetchone() is None:
+        return False
+    if conn.execute("SELECT 1 FROM messages WHERE active IS NULL LIMIT 1").fetchone() is not None:
+        return False
+    if (conn.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
+            and conn.execute("SELECT 1 FROM messages_fts_docsize LIMIT 1").fetchone() is None):
+        return False
+    for statement in schema_read_probe_statements():
+        conn.execute(statement).fetchone()
+    return True
+
+
+def _settled_ordinary_stamp_valid(conn: sqlite3.Connection, *, cjk_loaded: bool) -> bool:
+    """A no-DDL optimization hint, checked again on the actual writer connection."""
+    from hermes_state_common import SCHEMA_VERSION, FTS_STORAGE_VERSION
+    from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+    epoch = _current_init_source_epoch()
+    if (epoch is None or _catalog(conn) != "full" or _protected_exists(conn, "full")
+            or not _ordinary_journal_mode_settled(conn)):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM recovery_exclusions WHERE kind='raw_schema' LIMIT 1"
+    ).fetchone() is not None:
+        return False
+    version = conn.execute(
+        "SELECT typeof(version),substr(CAST(version AS BLOB),1,21) "
+        "FROM schema_version LIMIT 2"
+    ).fetchall()
+    if len(version) != 1 or tuple(version[0]) != ("integer", str(SCHEMA_VERSION).encode("ascii")):
+        return False
+    cookie = conn.execute("PRAGMA schema_version").fetchone()
+    if cookie is None or type(cookie[0]) is not int or cookie[0] < 0:
+        return False
+    # Fetch only a bounded prefix after checking the stored byte size.  A
+    # malformed/unbounded stamp goes through claimed reconciliation.
+    size = conn.execute(
+        "SELECT typeof(value),length(substr(CAST(value AS BLOB),1,129)) "
+        "FROM state_meta WHERE key=?",
+        (_SETTLED_INIT_KEY,),
+    ).fetchone()
+    if size is None or size[0] != "text" or type(size[1]) is not int or size[1] > 128:
+        return False
+    stamp = conn.execute(
+        "SELECT substr(CAST(value AS BLOB),1,129) FROM state_meta WHERE key=?",
+        (_SETTLED_INIT_KEY,),
+    ).fetchone()
+    from hermes_state_common import (
+        FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY,
+    )
+    layout = conn.execute(
+        "SELECT typeof(value),substr(CAST(value AS BLOB),1,9) "
+        "FROM state_meta WHERE key='fts_storage_version'"
+    ).fetchone()
+    if layout is None or tuple(layout) != ("text", str(FTS_STORAGE_VERSION).encode("ascii")):
+        return False
+    expected = f"v1:{epoch}:{SCHEMA_VERSION}:{cookie[0]}:{FTS_STORAGE_VERSION}".encode("ascii")
+    if stamp is None or type(stamp[0]) is not bytes or stamp[0] != expected:
+        return False
+    pending = (
+        FTS_STALE_KEY, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY,
+        "fts_rebuild_high_water", "fts_rebuild_progress",
+        "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
+    )
+    if conn.execute(
+        "SELECT 1 FROM state_meta WHERE key IN (?,?,?,?,?,?,?) LIMIT 1", pending,
+    ).fetchone() is not None:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name GLOB 'fts_v22_trash_*' LIMIT 1"
+    ).fetchone() is not None:
+        return False
+    try:
+        conn.execute("SELECT rowid FROM messages_fts LIMIT 0").fetchone()
+        if not _ordinary_reconciliation_complete(conn):
+            return False
+    except sqlite3.DatabaseError:
+        return False
+    if not _fts_trigger_catalog_settled(conn, cjk_loaded=cjk_loaded):
+        return False
+    return True
+
+
+def _inspect_settled_ordinary_store(path: Path) -> tuple[tuple[int, int], str, str] | None:
+    """Read-only hint.  The writer repeats every check on its opened inode."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+    if _current_init_source_epoch() is None:
+        return None
+    try:
+        identity = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    if not stat.S_ISREG(identity.st_mode) or has_invalid_sqlite_header_preopen(path):
+        raise RecoveryRefused("protected_session_authority_unavailable")
+    try:
+        with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            if _catalog(conn) != "full" or _protected_exists(conn, "full"):
+                return None
+            if not _settled_ordinary_stamp_valid(
+                conn, cjk_loaded=load_fts5_cjk_extension(conn),
+            ):
+                return None
+            values = _bounded_ordinary_store_ids(conn)
+            current = path.lstat()
+            if (values is None
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            return (identity.st_dev, identity.st_ino), *values
+    except (sqlite3.DatabaseError, OSError) as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
 
 _MAX_SAFE_MESSAGES = 20_000  # resume/export guard default
 
@@ -579,9 +848,17 @@ class SessionDB(
             begin_raw_schema_claim, finish_raw_schema_claim, inspect_protected_store,
         )
 
+        # This must precede even the protected/ordinary read-only catalog
+        # probes: a deleted WAL generation is not safe to reopen as a fresh
+        # sidecar pair on the same state.db path.
+        refuse_deleted_wal_generation(self.db_path)
         protected_identity = inspect_protected_store(self.db_path)
         if protected_identity is not None:
             self._open_writer_existing_schema(*protected_identity)
+            return
+        ordinary_identity = _inspect_settled_ordinary_store(self.db_path)
+        if ordinary_identity is not None:
+            self._open_writer_existing_schema(*ordinary_identity, ordinary_settled=True)
             return
         try:
             lease = begin_raw_schema_claim(self.db_path)
@@ -601,8 +878,10 @@ class SessionDB(
         finish_raw_schema_claim(lease, conn=self._conn)
 
     def _open_writer_existing_schema(self, expected_identity: tuple[int, int],
-                                     expected_store_id: str) -> None:
-        """Attach a protected store without schema DDL, reconciliation or repair."""
+                                     expected_store_id: str,
+                                     expected_generation: str | None = None,
+                                     *, ordinary_settled: bool = False) -> None:
+        """Attach a validated existing store without schema DDL or repair."""
         from hermes_recovery_refusal import require_compatible_recovery_connection
         from hermes_state_schema import schema_read_probe_statements
         from hermes_state_recovery import RecoveryRefused
@@ -625,14 +904,26 @@ class SessionDB(
         conn.row_factory = sqlite3.Row
         register_connection_guard(conn, self)
         require_compatible_recovery_connection(conn)
+        if ordinary_settled:
+            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         try:
             observed = self.db_path.lstat()
+            catalog = _catalog(conn)
+            authority_matches = (
+                catalog == "full" and not _protected_exists(conn, catalog)
+                and _settled_ordinary_stamp_valid(conn, cjk_loaded=self._fts_cjk_loaded)
+                if ordinary_settled else _protected_exists(conn, catalog)
+            )
             if ((observed.st_dev, observed.st_ino) != expected_identity
-                    or not _protected_exists(conn, _catalog(conn))):
+                    or not authority_matches):
                 raise RecoveryRefused("protected_session_authority_unavailable")
-            row = conn.execute("SELECT store_id FROM recovery_store WHERE singleton=1").fetchone()
-            if row is None or row[0] != expected_store_id:
-                raise RecoveryRefused("protected_session_authority_unavailable")
+            if ordinary_settled:
+                if _bounded_ordinary_store_ids(conn) != (expected_store_id, expected_generation):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+            else:
+                row = conn.execute("SELECT store_id FROM recovery_store WHERE singleton=1").fetchone()
+                if row is None or row[0] != expected_store_id:
+                    raise RecoveryRefused("protected_session_authority_unavailable")
         except OSError as exc:
             raise RecoveryRefused("protected_session_authority_unavailable") from exc
         try:
@@ -655,14 +946,24 @@ class SessionDB(
             raise RecoveryRefused("protected_session_authority_unavailable") from exc
         if (observed.st_dev, observed.st_ino) != expected_identity:
             raise RecoveryRefused("protected_session_authority_unavailable")
+        self._wal_active = _on_disk_journal_mode(conn) == "wal"
+        if ordinary_settled and self._wal_active:
+            from hermes_state_wal import _apply_wal_companions
+
+            _apply_wal_companions(conn)
         apply_database_pragmas(conn, db_label="state.db")
         conn.execute("PRAGMA foreign_keys=ON")
-        self._wal_active = _on_disk_journal_mode(conn) == "wal"
-        self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+        if not ordinary_settled:
+            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         cursor = conn.cursor()
         self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
         if self._fts_enabled:
             self._trigram_available = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+        if ordinary_settled and self._fts_cjk_loaded:
+            # The fast predicate already proved the CJK family complete and
+            # free of stale/backfill markers. Restore the derived read-route
+            # bit that _ensure_fts_cjk_schema sets on a claimed open.
+            self._fts_cjk_available = self._fts_table_probe(cursor, "messages_fts_cjk") is True
         if self._wal_active:
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
@@ -701,6 +1002,64 @@ class SessionDB(
             # generation: any in-process open()/close() of state.db or -shm cancels SQLite's own
             # (howtocorrupt §2.2); these survive it. Lifted in close().
             self._wal_lock_guard = _lockguard.hold(self.db_path)
+        self._stamp_settled_ordinary_init()
+
+    def _stamp_settled_ordinary_init(self) -> None:
+        """Record successful ordinary reconciliation under its existing raw claim."""
+        from hermes_state_common import SCHEMA_VERSION, FTS_STORAGE_VERSION
+        from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+        conn = self._conn
+        epoch = _current_init_source_epoch()
+        if (conn is None or epoch is None or _catalog(conn) != "full"
+                or not _ordinary_journal_mode_settled(conn)):
+            return
+        if _protected_exists(conn, "full"):
+            return
+        version = conn.execute(
+            "SELECT typeof(version),substr(CAST(version AS BLOB),1,21) "
+            "FROM schema_version LIMIT 2"
+        ).fetchall()
+        if len(version) != 1 or tuple(version[0]) != ("integer", str(SCHEMA_VERSION).encode("ascii")):
+            return
+        from hermes_state_common import FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY
+        pending = (
+            FTS_STALE_KEY, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY,
+            "fts_rebuild_high_water", "fts_rebuild_progress",
+            "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
+        )
+        if conn.execute(
+            "SELECT 1 FROM state_meta WHERE key IN (?,?,?,?,?,?,?) LIMIT 1", pending,
+        ).fetchone() is not None:
+            return
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name GLOB 'fts_v22_trash_*' LIMIT 1"
+        ).fetchone() is not None:
+            return
+        if not self._fts_enabled or not _fts_trigger_catalog_settled(
+            conn, cjk_loaded=self._fts_cjk_loaded,
+        ):
+            return
+        try:
+            if not _ordinary_reconciliation_complete(conn):
+                return
+        except sqlite3.DatabaseError:
+            return
+        cookie = conn.execute("PRAGMA schema_version").fetchone()
+        if cookie is None or type(cookie[0]) is not int or cookie[0] < 0:
+            return
+        layout = conn.execute(
+            "SELECT typeof(value),substr(CAST(value AS BLOB),1,9) "
+            "FROM state_meta WHERE key='fts_storage_version'"
+        ).fetchone()
+        if layout is None or tuple(layout) != ("text", str(FTS_STORAGE_VERSION).encode("ascii")):
+            return
+        stamp = f"v1:{epoch}:{SCHEMA_VERSION}:{cookie[0]}:{FTS_STORAGE_VERSION}"
+        conn.execute(
+            "INSERT INTO state_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_SETTLED_INIT_KEY, stamp),
+        )
 
     def _open_read_only(self) -> None:
         """Read-only attach for cross-profile aggregation: no schema init, NO write
@@ -1245,12 +1604,13 @@ class SessionDB(
         self._db_file_identity = _stat_db_file_identity(self.db_path)
         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
         if not self.read_only and self._conn is not None:
-            store = self._conn.execute(
-                "SELECT store_id FROM recovery_store WHERE singleton=1"
-            ).fetchone()
-            generation = self._conn.execute(
-                "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
-            ).fetchone()
+            with self._lock:
+                store = self._conn.execute(
+                    "SELECT store_id FROM recovery_store WHERE singleton=1"
+                ).fetchone()
+                generation = self._conn.execute(
+                    "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+                ).fetchone()
             self._opened_store_id = str(store[0]) if store and store[0] else None
             self._opened_generation_token = str(generation[0]) if generation and generation[0] else None
         disk_id = _read_sqlite_application_id(self.db_path)

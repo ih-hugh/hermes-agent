@@ -237,6 +237,7 @@ def inspect_protected_store(path: Path) -> tuple[tuple[int, int], str] | None:
 
 def _connect(path: Path) -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files, has_invalid_sqlite_header_preopen
+    from hermes_state_repair import preflight_db_writability
 
     path.parent.mkdir(parents=True, exist_ok=True)
     # O_EXCL distinguishes our new empty inode from a pre-existing zero-byte
@@ -247,6 +248,7 @@ def _connect(path: Path) -> sqlite3.Connection:
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    newly_created = False
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
@@ -258,12 +260,38 @@ def _connect(path: Path) -> sqlite3.Connection:
             raise RecoveryRefused("protected_session_authority_unavailable")
         if has_invalid_sqlite_header_preopen(path):
             raise RecoveryRefused("protected_session_authority_unavailable")
+        # Classify the exact pre-existing inode before any chmod or authority
+        # bootstrap. An unknown/guarded file cannot be made writable by a raw
+        # ordinary claimant. The writer rechecks inside BEGIN IMMEDIATE.
+        try:
+            with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as probe:
+                probe.execute("PRAGMA query_only=ON")
+                catalog = _catalog(probe)
+                ordinary = not _protected_exists(probe, catalog)
+            current = path.lstat()
+            if (not stat.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            if ordinary:
+                # Inside the selected Hermes home the existing permission
+                # preflight may repair a known ordinary file. Outside, it
+                # refuses without changing mode or WAL sidecars.
+                preflight_db_writability(path, db_label="state.db")
+                _secure_state_db_files(path)
+        except sqlite3.OperationalError as exc:
+            if str(exc).startswith("state.db is not writable:"):
+                raise
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
     else:
         try:
             identity = os.fstat(fd)
         finally:
             os.close(fd)
-    _secure_state_db_files(path)
+        newly_created = True
+    if newly_created:
+        _secure_state_db_files(path)
     conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
     try:
         current = path.lstat()
@@ -346,6 +374,10 @@ def _claim(path: Path, kind: Literal["ordinary_session", "unscoped_ordinary", "r
                 raise
     except RecoveryRefused:
         raise
+    except sqlite3.OperationalError as exc:
+        if str(exc).startswith("state.db is not writable:"):
+            raise
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
     except (sqlite3.DatabaseError, OSError) as exc:
         raise RecoveryRefused("protected_session_authority_unavailable") from exc
 

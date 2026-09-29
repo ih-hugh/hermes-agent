@@ -140,7 +140,7 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             # Lifecycle: run before the instance is shared / after readers
             # are drained. Not reachable concurrently with writers.
             "__init__", "_open_writer", "_connect_and_init",
-            "_connect_and_init_with_lock_patience", "close",
+            "_connect_and_init_with_lock_patience", "_open_writer_reconcile", "close",
             # Lost-generation settlement: called only from close()'s
             # `with self._lock` body (locked transitively, not lexically).
             "_settle_lost_generation_locked",
@@ -154,6 +154,15 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                             and ctx.attr == "_lock"
                             and isinstance(ctx.value, ast.Name)
                             and ctx.value.id == "self"):
+                        return True
+                    if (isinstance(ctx, ast.Call)
+                            and isinstance(ctx.func, ast.Name)
+                            and ctx.func.id == "acquire_recovery_lock"
+                            and len(ctx.args) == 1
+                            and isinstance(ctx.args[0], ast.Attribute)
+                            and ctx.args[0].attr == "_lock"
+                            and isinstance(ctx.args[0].value, ast.Name)
+                            and ctx.args[0].value.id == "self"):
                         return True
             return False
 
