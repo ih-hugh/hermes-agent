@@ -18,7 +18,10 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore, RecoveryRefused
 from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, SealRequest
-from gateway.platforms.api_server_recovery_contract import SealResult, SnapshotPage, SnapshotRow
+from gateway.platforms.api_server_recovery_contract import (
+    ArtifactRow, ManifestArtifactPage, SealResult,
+)
+from gateway.platforms.api_server_recovery_artifacts import document_sha256
 from gateway.platforms.api_server_recovery_contract import RecoveryMember, SealReceipt
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.recovery_context import (
@@ -397,9 +400,8 @@ async def test_raw_protected_body_limit_precedes_json_parse():
 def test_wire_rejects_non_json_snapshot_and_inconsistent_result():
     """A pending response cannot carry a receipt; snapshot rows contain JSON only."""
     with pytest.raises(ValueError):
-        SnapshotPage(receipt_sha256="a" * 64, page_index=0,
-                     rows=[{"row_index": 0, "row_sha256": "b" * 64,
-                            "message": {"content": object()}}], next_page=None)
+        ArtifactRow(row_index=0, kind="transcript", row_sha256="b" * 64,
+                    value={"content": object()})
     with pytest.raises(ValueError):
         SealResult(schema="hermes.recovery/v1", state="pending", request_id=str(uuid4()),
                    reasons=[], receipt={})
@@ -411,26 +413,29 @@ def test_shared_wire_fixture_is_strict_and_round_trips():
     fixture = json.loads((Path(__file__).parents[1] / "fixtures" / "recovery_contract_v1.json").read_text())
     for name, model in (("admission", RecoveryAdmission), ("member", RecoveryMember),
                         ("seal_request", SealRequest), ("seal_receipt", SealReceipt),
-                        ("seal_result", SealResult), ("snapshot_page", SnapshotPage)):
+                        ("seal_result", SealResult), ("snapshot_page", ManifestArtifactPage)):
         assert model.model_validate(fixture[name]).model_dump(mode="json", by_alias=True) == fixture[name]
         with pytest.raises(ValueError):
             model.model_validate({**fixture[name], "unexpected": "field"})
     assert isinstance(SealRequest.model_validate(fixture["seal_request"]).run_ids, tuple)
     assert isinstance(SealReceipt.model_validate(fixture["seal_receipt"]).members, tuple)
-    assert isinstance(SnapshotPage.model_validate(fixture["snapshot_page"]).rows, tuple)
-    assert SnapshotPage.model_validate_json(json.dumps(fixture["snapshot_page"])).model_dump(
+    assert isinstance(ManifestArtifactPage.model_validate(fixture["snapshot_page"]).descriptors, tuple)
+    assert ManifestArtifactPage.model_validate_json(json.dumps(fixture["snapshot_page"])).model_dump(
         mode="json", by_alias=True) == fixture["snapshot_page"]
 
 
 def test_snapshot_row_nested_json_is_immutable_and_serializes():
-    row = SnapshotRow(row_index=0, row_sha256="a" * 64,
-                      message={"blocks": [{"text": "hello"}]})
+    value = {"blocks": [{"text": "hello"}]}
+    row = ArtifactRow(row_index=0, kind="transcript",
+                      row_sha256=document_sha256("hermes.recovery.row/transcript/v1",
+                                                  {"row_index": 0, "kind": "transcript", "value": value}),
+                      value=value)
     with pytest.raises(TypeError):
-        row.message["blocks"] = []
-    assert isinstance(row.message["blocks"], tuple)
+        row.value["blocks"] = []
+    assert isinstance(row.value["blocks"], tuple)
     with pytest.raises(TypeError):
-        row.message["blocks"][0]["text"] = "changed"
-    assert row.model_dump(mode="json")["message"] == {"blocks": [{"text": "hello"}]}
+        row.value["blocks"][0]["text"] = "changed"
+    assert row.model_dump(mode="json")["value"] == value
 
 
 @pytest.mark.parametrize(("field", "value"), [
