@@ -380,12 +380,21 @@ a focused green run is not full hosted CI or an installed Factory source-pair pr
   Deterministic disappearance tests failed before the fix. Two independent
   reviews passed all 59 preflight and recovery-store tests without retries. No
   WAL deletion, extra retry or permission-repair scope is introduced.
+- `6559afe5` keeps the real constants module in the slash-worker profile fixture
+  while directing its home lookup to scratch. Its old whole-module mock omitted
+  newly imported recovery helpers. The original subprocess/profile assertion
+  remains; independent review passed all five related tests without retries.
 
 At this pre-merge checkpoint, an immutable 272-file selection at `4453db94`
 passed 4,717 tests, failed those same three macOS binary fixtures and skipped 43,
 without retries. The second full hosted run, at `58686a7b`, had 49,949 passing tests,
 59 failures and 500 skips, including a benchmark timeout; it predates the final
-corrections and remains failed evidence. Fresh full Linux CI on the final PR
+corrections and remains failed evidence. The later full run at `7eafc454` passed
+50,109 Python tests with one failure (the slash-worker fixture above) and 506
+skips. Its JavaScript lane failed TUI unmount and desktop checks; the desktop
+failure output was truncated. The output-drain correction preserves diagnostics
+for the next run, but a passing local desktop rerun does not close that hosted
+gate. Fresh full Linux CI on the final PR
 commit is required before readiness. A mixed-source local
 run, where another worker changed initializer files after import, is invalid
 evidence for the source-epoch checks and was discarded in favor of an immutable
