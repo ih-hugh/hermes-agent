@@ -29,10 +29,50 @@ from agent.recovery_context import (
     validate_producer_permit, validate_write_permit,
 )
 from gateway.platforms import api_server, api_server_runs
+from gateway.platforms.api_server_recovery import RecoveryOwnerContext
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
-from tests.recovery_provider_fixture import provider_admission, selected_provider
+from tests.recovery_provider_fixture import provider_admission
+
+
+_OWNER_KEY = "scratch-recovery-owner-key-12345"
+
+
+def _served_static_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    events: list[str] | None = None,
+    threads: list[int] | None = None,
+) -> tuple[SessionDB, api_server.APIServerAdapter, RecoveryOwnerContext]:
+    """Build the real scratch static-preparation prerequisites without a live provider."""
+    import run_agent  # noqa: F401  # completed ordinary gateway warm-up
+    import hermes_state_recovery_provider
+    from hermes_state_recovery_provider import SelectedProviderCapture
+    from tests.agent.test_recovery_runtime import _admitted, _install_selected_plugin_fixture
+    from tests.gateway.test_api_server_recovery_runtime import _profile
+
+    profile = _profile(tmp_path, monkeypatch)
+    db, _store, _scope, registry = _admitted(profile.home)
+    _install_selected_plugin_fixture(registry, monkeypatch)
+    selected = registry.provider_capture.provider
+
+    def capture(session_id: str, *, deadline: float) -> SelectedProviderCapture:
+        assert isinstance(deadline, float)
+        if events is not None:
+            events.append("capture")
+        if threads is not None:
+            threads.append(threading.get_ident())
+        return SelectedProviderCapture(provider_admission(session_id), selected)
+
+    monkeypatch.setattr(
+        hermes_state_recovery_provider, "capture_selected_provider_admission", capture
+    )
+    monkeypatch.setattr(SelectedProviderCapture, "require_selected", lambda self: selected)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True, extra={"key": _OWNER_KEY}))
+    adapter._session_db = db
+    return db, adapter, profile
 
 
 def _stores(tmp_path: Path) -> tuple[RecoveryStore, RecoveryStore]:
@@ -509,13 +549,12 @@ def test_wire_rejects_unbounded_member_identity_and_revision():
 
 @pytest.mark.asyncio
 async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Path, monkeypatch):
-    """The internal readiness seam uses state.db and replays without dispatching twice."""
-    db = SessionDB(tmp_path / "state.db")
-    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
+    """Static source admission uses state.db and replay works after opt-out."""
     admission_events: list[str] = []
     capture_threads: list[int] = []
-    selected_provider(monkeypatch, events=admission_events, threads=capture_threads)
+    db, adapter, profile = _served_static_route(
+        tmp_path, monkeypatch, events=admission_events, threads=capture_threads
+    )
     original_reserve = RecoveryStore.reserve
 
     def observed_reserve(store, admission, identity):
@@ -529,6 +568,10 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     async def fake_execute(owner, launch, *, _api_server):
         assert launch.recovery_handoff is not None
         dispatched.append(launch.run_id)
+        launch.recovery_execution_settled.set()
+        launch.recovery_registry.request_close()
+        launch.recovery_coroutine_settled.set()
+        api_server_runs._retire_live_run(owner, launch.run_id)
 
     monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
     app = web.Application()
@@ -536,17 +579,20 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     body = {"input": "hello", "session_id": "exact-session",
             "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None}}
-    headers = {"Idempotency-Key": "byf-recovery-v1:one"}
+    headers = {"Authorization": f"Bearer {_OWNER_KEY}",
+               "Idempotency-Key": "byf-recovery-v1:one"}
     try:
         async with TestClient(TestServer(app)) as client:
+            config = profile.home / "config.yaml"
+            enabled_config = config.read_text()
+            config.write_text(enabled_config.replace("enabled: true", "enabled: false", 1))
             unavailable = await client.post("/v1/runs", json=body, headers=headers)
             assert unavailable.status == 503
-            adapter._recovery_runtime_ready = lambda request, body: True
-            from tools import terminal_tool
-            with monkeypatch.context() as temporary:
-                temporary.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
-                wrong_backend = await client.post("/v1/runs", json=body, headers=headers)
+            config.write_text(enabled_config)
+            config.write_text(enabled_config.replace("backend: byf_workspace", "backend: local", 1))
+            wrong_backend = await client.post("/v1/runs", json=body, headers=headers)
             assert wrong_backend.status == 503
+            config.write_text(enabled_config)
             from tools import terminal_tool_config
             with monkeypatch.context() as temporary:
                 temporary.setattr(terminal_tool_config, "_get_plugin_env_provider", lambda _env: (
@@ -560,7 +606,7 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
             assert admission_events == ["capture", "reserve"]
             assert capture_threads and capture_threads[0] != threading.get_ident()
             first_id = (await first.json())["run_id"]
-            adapter._recovery_runtime_ready = lambda request, body: False
+            config.write_text(enabled_config.replace("enabled: true", "enabled: false", 1))
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202
             assert admission_events == ["capture", "reserve"]
@@ -569,10 +615,10 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
             adapter._run_owners.clear()
             adapter._protected_run_ids.clear()
             adapter._protected_run_stores.clear()
-            status = await client.get(f"/v1/runs/{first_id}")
+            status = await client.get(f"/v1/runs/{first_id}", headers=headers)
             assert status.status == 200
             assert (await status.json())["run_id"] == first_id
-            scope = RecoveryScope(RecoveryStore(db).store_id, "default",
+            scope = RecoveryScope(RecoveryStore(db).store_id, profile.profile,
                                   adapter._run_idempotency_scope(type("R", (), {
                                       "path": "/v1/runs", "headers": {}})()), "exact-session")
             assert RecoveryStore(db).owns_run(scope.profile, scope.scope_digest, first_id)
@@ -584,11 +630,7 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Path, monkeypatch):
-    db = SessionDB(tmp_path / "state.db")
-    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
-    adapter._recovery_runtime_ready = lambda request, body: True
-    selected_provider(monkeypatch)
+    db, adapter, _profile = _served_static_route(tmp_path, monkeypatch)
 
     async def fake_execute(owner, launch, *, _api_server):
         return None
@@ -596,7 +638,7 @@ async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Pa
     monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
     app = web.Application()
     app.router.add_post("/v1/runs", adapter._handle_runs)
-    lock_conn = sqlite3.connect(tmp_path / "state.db", check_same_thread=False)
+    lock_conn = sqlite3.connect(db.db_path, check_same_thread=False)
     lock_conn.execute("BEGIN IMMEDIATE")
     released = threading.Event()
 
@@ -611,7 +653,8 @@ async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Pa
             task = asyncio.create_task(client.post("/v1/runs", json={
                 "input": "hello", "session_id": "exact-session",
                 "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None},
-            }, headers={"Idempotency-Key": "byf-recovery-v1:one"}))
+            }, headers={"Authorization": f"Bearer {_OWNER_KEY}",
+                        "Idempotency-Key": "byf-recovery-v1:one"}))
             started = asyncio.get_running_loop().time()
             await asyncio.sleep(0.05)
             assert asyncio.get_running_loop().time() - started < 0.2
@@ -629,12 +672,8 @@ async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Pa
 @pytest.mark.parametrize("second_protected", [False, True])
 async def test_pending_protected_reservation_holds_concurrency_slot(
         tmp_path: Path, monkeypatch, second_protected: bool):
-    db = SessionDB(tmp_path / "state.db")
-    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
+    db, adapter, _profile = _served_static_route(tmp_path, monkeypatch)
     adapter._max_concurrent_runs = 1
-    adapter._recovery_runtime_ready = lambda request, body: True
-    selected_provider(monkeypatch)
     entered = threading.Event()
     release = threading.Event()
     original_reserve = RecoveryStore.reserve
@@ -657,10 +696,14 @@ async def test_pending_protected_reservation_holds_concurrency_slot(
     try:
         async with TestClient(TestServer(app)) as client:
             first = asyncio.create_task(client.post(
-                "/v1/runs", json=body, headers={"Idempotency-Key": "byf-recovery-v1:one"}))
+                "/v1/runs", json=body,
+                headers={"Authorization": f"Bearer {_OWNER_KEY}",
+                         "Idempotency-Key": "byf-recovery-v1:one"}))
             assert await asyncio.to_thread(entered.wait, 2)
             next_body = body if second_protected else {"input": "ordinary"}
-            next_headers = {"Idempotency-Key": "byf-recovery-v1:two"} if second_protected else {}
+            next_headers = {"Authorization": f"Bearer {_OWNER_KEY}"}
+            if second_protected:
+                next_headers["Idempotency-Key"] = "byf-recovery-v1:two"
             second = await client.post("/v1/runs", json=next_body, headers=next_headers)
             assert second.status == 429
             release.set()
@@ -896,11 +939,7 @@ async def test_status_join_waits_for_new_tail_added_during_join(tmp_path: Path, 
 
 @pytest.mark.asyncio
 async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_path: Path, monkeypatch):
-    db = SessionDB(tmp_path / "state.db")
-    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
-    adapter._recovery_runtime_ready = lambda request, body: True
-    selected_provider(monkeypatch)
+    db, adapter, profile = _served_static_route(tmp_path, monkeypatch)
     entered, release = threading.Event(), threading.Event()
     created = threading.Event()
     original_update = RecoveryStore.update_status
@@ -926,7 +965,8 @@ async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_p
             response = await client.post("/v1/runs", json={
                 "input": "hello", "session_id": "exact-session",
                 "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None},
-            }, headers={"Idempotency-Key": "byf-recovery-v1:one"})
+            }, headers={"Authorization": f"Bearer {_OWNER_KEY}",
+                        "Idempotency-Key": "byf-recovery-v1:one"})
             assert response.status == 202
             run_id = (await response.json())["run_id"]
             assert await asyncio.to_thread(entered.wait, 2)
@@ -940,7 +980,7 @@ async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_p
             await adapter._await_protected_run_status(run_id)
             assert adapter._run_statuses[run_id]["status"] == "completed"
             store = RecoveryStore(db)
-            assert store.status_for_run("default", adapter._run_owners[run_id], run_id)["status"] == "completed"
+            assert store.status_for_run(profile.profile, adapter._run_owners[run_id], run_id)["status"] == "completed"
     finally:
         release.set()
         await adapter.disconnect()

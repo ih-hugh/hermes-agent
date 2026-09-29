@@ -63,7 +63,7 @@ async def test_decorated_run_admission_delegates_and_releases_slot(monkeypatch):
     adapter._check_run_auth = MagicMock(return_value=None)
     adapter._draining_response = MagicMock(return_value=None)
     adapter._pending_agent_requests = 0
-    request = SimpleNamespace(path="/v1/runs")
+    request = SimpleNamespace(path="/v1/runs", headers={})
     expected = object()
     implementation = AsyncMock(return_value=expected)
     monkeypatch.setattr(api_server_runs, "_handle_runs", implementation)

@@ -278,6 +278,7 @@ class TestAdapterInit:
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         agent = adapter._create_agent(session_id="api-session")
@@ -2454,17 +2455,19 @@ class TestSessionIdHeader:
                 assert mock_run.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_provided_session_id_loads_history_from_db(self, auth_adapter):
+    async def test_provided_session_id_loads_history_from_db(
+        self, auth_adapter, ordinary_session_db
+    ):
         """When X-Hermes-Session-Id is provided, history comes from SessionDB not request body."""
         mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-        db_history = [
-            {"role": "user", "content": "stored message 1"},
-            {"role": "assistant", "content": "stored reply 1"},
+        ordinary_session_db.create_session("existing-session", source="api_server")
+        ordinary_session_db.append_message("existing-session", "user", "stored message 1")
+        ordinary_session_db.append_message("existing-session", "assistant", "stored reply 1")
+        db_history = ordinary_session_db.get_messages_as_conversation("existing-session")
+        assert [message["content"] for message in db_history] == [
+            "stored message 1", "stored reply 1"
         ]
-        mock_db = MagicMock()
-        mock_db.get_messages_as_conversation.return_value = db_history
-        mock_db.resolve_resume_session_id.side_effect = lambda sid: sid
-        auth_adapter._session_db = mock_db
+        auth_adapter._session_db = ordinary_session_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
@@ -2675,6 +2678,7 @@ class TestModelRoutesAgentCreation:
         adapter = _make_routing_adapter(
             {"alias": {"model": "other/model", "provider": "otherprov"}}
         )
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
@@ -2695,6 +2699,7 @@ class TestModelRoutesAgentCreation:
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
         adapter = _make_routing_adapter({"alias": {"model": "route/model", "api_key": "sk-route"}})
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(
             adapter,
@@ -3037,6 +3042,7 @@ class TestRouteWithoutModelKeepsDefault:
         # _parse_model_routes drops routes without model; simulate a
         # credentials-only route surviving via direct dict (defensive path).
         adapter._model_routes = {"alias": {"api_key": "sk-route"}}
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
@@ -3081,6 +3087,7 @@ class TestCreateAgentModelRecovery:
         )
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         agent = adapter._create_agent(session_id="api-session")
@@ -3103,6 +3110,7 @@ class TestCreateAgentModelRecovery:
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Turn 1: model resolves fine — populates the last-known-good cache
@@ -3137,6 +3145,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         virtual = adapter._model_name
@@ -3165,6 +3174,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Seed the cache with the alias (simulate a prior poisoned turn).
@@ -3197,6 +3207,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._session_db = ordinary_session_db
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Turn 1: legitimate model — must enter the cache.

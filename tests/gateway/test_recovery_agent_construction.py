@@ -16,8 +16,9 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_runs
 from hermes_state_recovery import RecoveryRefused
-from tests.agent.test_recovery_runtime import _admitted
-from tests.recovery_provider_fixture import selected_provider
+from tests.agent.test_recovery_runtime import _admitted, _install_selected_plugin_fixture
+from tests.gateway.test_api_server_recovery_runtime import _profile
+from tests.recovery_provider_fixture import provider_admission
 
 
 def test_protected_agent_construction_requires_exact_registry_and_write_permit(tmp_path):
@@ -62,13 +63,25 @@ def test_unavailable_authority_refuses_before_agent_construction(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_protected_construction_does_not_block_gateway_loop(tmp_path, monkeypatch):
-    from hermes_state import SessionDB
+    import run_agent  # noqa: F401  # completed ordinary gateway warm-up
+    import hermes_state_recovery_provider
+    from hermes_state_recovery_provider import SelectedProviderCapture
 
-    db = SessionDB(tmp_path / "state.db")
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    profile = _profile(tmp_path, monkeypatch)
+    db, _store, _scope, registry = _admitted(profile.home)
+    _install_selected_plugin_fixture(registry, monkeypatch)
+    selected = registry.provider_capture.provider
+    monkeypatch.setattr(
+        hermes_state_recovery_provider,
+        "capture_selected_provider_admission",
+        lambda session_id, *, deadline: SelectedProviderCapture(
+            provider_admission(session_id), selected
+        ),
+    )
+    monkeypatch.setattr(SelectedProviderCapture, "require_selected", lambda self: selected)
+    key = "scratch-recovery-owner-key-12345"
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
     adapter._session_db = db
-    adapter._recovery_runtime_ready = lambda request, body: True
-    selected_provider(monkeypatch)
     entered, release = threading.Event(), threading.Event()
 
     def held_construction(**kwargs):
@@ -87,7 +100,8 @@ async def test_protected_construction_does_not_block_gateway_loop(tmp_path, monk
                 "input": "hello", "session_id": "exact-session",
                 "recovery": {"schema": "hermes.recovery/v1", "generation": 0,
                              "parent_run_id": None},
-            }, headers={"Idempotency-Key": "byf-recovery-v1:construction"})
+            }, headers={"Authorization": f"Bearer {key}",
+                        "Idempotency-Key": "byf-recovery-v1:construction"})
             assert response.status == 202
             run_id = (await response.json())["run_id"]
             assert await asyncio.to_thread(entered.wait, 2)
