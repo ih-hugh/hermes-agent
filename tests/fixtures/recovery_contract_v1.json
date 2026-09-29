@@ -4,6 +4,24 @@
     "parent_run_id": null,
     "schema": "hermes.recovery/v1"
   },
+  "capabilities": {
+    "enabled": true,
+    "limits": {
+      "max_accounting_bytes": 1048576,
+      "max_active_seal_seconds": 5,
+      "max_other_page_rows": 1024,
+      "max_receipt_bytes": 1048576,
+      "max_request_bytes": 16384,
+      "max_response_bytes": 131072,
+      "max_route_pages": 4096,
+      "max_snapshot_bytes": 16777216,
+      "max_transcript_page_rows": 64,
+      "max_transcript_rows": 100000,
+      "max_workers": 2
+    },
+    "ready": false,
+    "schema": "hermes.recovery-capabilities/v1"
+  },
   "member": {
     "generation": 0,
     "parent_run_id": null,
@@ -313,6 +331,8 @@
     "PageDescriptor": "522181c1591733a5af35d3b2824d7cec369697449fd1af4823066c241a3386ed",
     "ProviderBinding": "391cd3baf2d22bf8b642e2138733506d8ee2628a0f9e7fe8e37aa7588d639733",
     "RecoveryAdmission": "fb86afca20442becef999a67d824704668835e57b9f62c0cdae8df682a47ba60",
+    "RecoveryCapabilities": "dd06960f8f758bfb7aeef7b82f48203c640720ba38d4afaf25dda74806bedb72",
+    "RecoveryLimits": "a03832c15edee21579e13f4bfbca75ebeaa6c04f6532ed55597bd1a8b756371b",
     "RecoveryMember": "49ad3c1304a3877837ef0057a41e8a0982baffa83d020c7fce165b47cb863ba9",
     "SealReceipt": "e4f5291afce1148614c10224ba2e28325a04634710d9d019582d289f58bd3d3c",
     "SealRequest": "b9c3208e85b2cd027043777aa9fa70be5435750e9c04a190602a990eb2a1815f",

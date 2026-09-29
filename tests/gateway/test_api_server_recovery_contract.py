@@ -68,6 +68,90 @@ def _pages(fixture: dict):
     ]
 
 
+_CAPABILITY_LIMIT_KEYS = (
+    "max_request_bytes",
+    "max_response_bytes",
+    "max_route_pages",
+    "max_snapshot_bytes",
+    "max_transcript_rows",
+    "max_transcript_page_rows",
+    "max_other_page_rows",
+    "max_receipt_bytes",
+    "max_accounting_bytes",
+    "max_active_seal_seconds",
+    "max_workers",
+)
+
+
+def test_capabilities_fixture_is_strict_bounded_wire():
+    fixture = _fixture()
+    assert {"RecoveryCapabilities", "RecoveryLimits"} <= fixture["schema_sha256"].keys()
+    model = recovery_wire.RecoveryCapabilities.model_validate(fixture["capabilities"])
+    assert model.enabled is True and model.ready is False
+    assert canonical_json_bytes(model) == canonical_json_bytes(fixture["capabilities"])
+    assert len(bounded_response_bytes(model)) <= MAX_RESPONSE_BYTES
+    assert set(model.limits.model_dump()) == set(_CAPABILITY_LIMIT_KEYS)
+    assert (
+        recovery_wire.RecoveryCapabilities.model_validate({
+            **fixture["capabilities"],
+            "ready": True,
+        }).ready
+        is True
+    )
+    assert (
+        recovery_wire.RecoveryCapabilities.model_validate({
+            **fixture["capabilities"],
+            "enabled": False,
+        }).ready
+        is False
+    )
+
+
+def test_capabilities_refuse_nonliteral_schema_and_nonboolean_state():
+    raw = _fixture()["capabilities"]
+    model = recovery_wire.RecoveryCapabilities
+    for changed in (
+        {**raw, "schema": "hermes.recovery-capabilities/v2"},
+        {key: value for key, value in raw.items() if key != "schema"},
+        {**raw, "schema_": raw["schema"]},
+        {
+            "schema_": raw["schema"],
+            "enabled": True,
+            "ready": False,
+            "limits": raw["limits"],
+        },
+        {**raw, "enabled": 1},
+        {**raw, "ready": 1},
+        {**raw, "enabled": False, "ready": True},
+        {**raw, "unexpected": "value"},
+        *(
+            {key: value for key, value in raw.items() if key != missing}
+            for missing in ("enabled", "ready", "limits")
+        ),
+    ):
+        with pytest.raises(ValueError):
+            model.model_validate(changed)
+
+
+def test_capability_limits_require_every_exact_strict_integer():
+    raw = _fixture()["capabilities"]
+    model = recovery_wire.RecoveryCapabilities
+    limits = raw["limits"]
+    assert set(limits) == set(_CAPABILITY_LIMIT_KEYS)
+    for key in _CAPABILITY_LIMIT_KEYS:
+        expected = limits[key]
+        for invalid in (True, float(expected), str(expected), expected + 1):
+            with pytest.raises(ValueError):
+                model.model_validate({**raw, "limits": {**limits, key: invalid}})
+        with pytest.raises(ValueError):
+            model.model_validate({
+                **raw,
+                "limits": {k: v for k, v in limits.items() if k != key},
+            })
+    with pytest.raises(ValueError):
+        model.model_validate({**raw, "limits": {**limits, "extra": 1}})
+
+
 def test_shared_fixture_pins_wire_schemas():
     for name, expected in _fixture()["schema_sha256"].items():
         model = getattr(recovery_wire, name)

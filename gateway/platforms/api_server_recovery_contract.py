@@ -32,6 +32,47 @@ class _Wire(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class RecoveryLimits(_Wire):
+    max_request_bytes: int = Field(strict=True, ge=16_384, le=16_384)
+    max_response_bytes: int = Field(
+        strict=True, ge=MAX_RESPONSE_BYTES, le=MAX_RESPONSE_BYTES
+    )
+    max_route_pages: int = Field(strict=True, ge=MAX_ROUTE_PAGES, le=MAX_ROUTE_PAGES)
+    max_snapshot_bytes: int = Field(
+        strict=True, ge=MAX_SNAPSHOT_BYTES, le=MAX_SNAPSHOT_BYTES
+    )
+    max_transcript_rows: int = Field(
+        strict=True, ge=MAX_TRANSCRIPT_ROWS, le=MAX_TRANSCRIPT_ROWS
+    )
+    max_transcript_page_rows: int = Field(
+        strict=True, ge=MAX_TRANSCRIPT_PAGE_ROWS, le=MAX_TRANSCRIPT_PAGE_ROWS
+    )
+    max_other_page_rows: int = Field(
+        strict=True, ge=MAX_OTHER_PAGE_ROWS, le=MAX_OTHER_PAGE_ROWS
+    )
+    max_receipt_bytes: int = Field(
+        strict=True, ge=MAX_DOCUMENT_BYTES, le=MAX_DOCUMENT_BYTES
+    )
+    max_accounting_bytes: int = Field(
+        strict=True, ge=MAX_ACCOUNTING_BYTES, le=MAX_ACCOUNTING_BYTES
+    )
+    max_active_seal_seconds: int = Field(strict=True, ge=5, le=5)
+    max_workers: int = Field(strict=True, ge=2, le=2)
+
+
+class RecoveryCapabilities(_Wire):
+    schema_: Literal["hermes.recovery-capabilities/v1"] = Field(alias="schema")
+    enabled: bool = Field(strict=True)
+    ready: bool = Field(strict=True)
+    limits: RecoveryLimits
+
+    @model_validator(mode="after")
+    def _ready_requires_enabled(self):
+        if self.ready and not self.enabled:
+            raise ValueError("ready recovery requires enabled route")
+        return self
+
+
 def _immutable_array(value: object) -> tuple[object, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError("expected an array")
