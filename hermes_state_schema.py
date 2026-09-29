@@ -946,7 +946,8 @@ class SessionSchemaMixin:
                 run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
                 kind TEXT NOT NULL CHECK (kind IN ('executor','tool','sdk','callback','usage_write')),
                 state TEXT NOT NULL CHECK (state IN ('queued','running','closed','cancelled')),
-                owner_incarnation TEXT NOT NULL
+                owner_incarnation TEXT NOT NULL,
+                parent_producer_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_recovery_producers_run_state
                 ON recovery_producers(run_id,state);
@@ -972,6 +973,10 @@ class SessionSchemaMixin:
                 ack_revision INTEGER
             );
         """)
+        # Task 2a's first checkout may already have the producer table without parentage.
+        if not any(row[1] == "parent_producer_id" for row in
+                   cursor.execute("PRAGMA table_info(recovery_producers)").fetchall()):
+            cursor.execute("ALTER TABLE recovery_producers ADD COLUMN parent_producer_id TEXT")
         # A settled open must not take the writer lock just to restamp the UUID.
         if cursor.execute("SELECT 1 FROM recovery_store WHERE singleton=1").fetchone() is None:
             cursor.execute("INSERT OR IGNORE INTO recovery_store(singleton, store_id) VALUES (1, ?)",

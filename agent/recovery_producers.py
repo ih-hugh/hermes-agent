@@ -34,6 +34,7 @@ _ACTIVE_LEASE: ContextVar[ProducerLease | None] = ContextVar(
     "recovery_producer_lease", default=None
 )
 _SEND_ISSUER = object()
+_LEASE_ISSUER = object()
 _SEND_LOCK = threading.Lock()
 _SEND_MAP: weakref.WeakKeyDictionary[SendPermit, tuple[ProducerRegistry, str, str]] = (
     weakref.WeakKeyDictionary()
@@ -216,11 +217,16 @@ class ProducerLease:
     __slots__ = ("registry", "producer_id", "kind", "_lock", "_state")
 
     def __init__(
-        self, registry: ProducerRegistry, producer_id: str, kind: ProducerKind
+        self, issuer: object, registry: ProducerRegistry, producer_id: str, kind: ProducerKind
     ):
+        if issuer is not _LEASE_ISSUER:
+            raise TypeError("producer leases are issued internally")
         self.registry, self.producer_id, self.kind = registry, producer_id, kind
         self._lock = threading.Lock()
         self._state = "queued"
+
+    def __reduce_ex__(self, protocol: int):
+        raise TypeError("producer leases cannot be copied or serialized")
 
     def run(self, fn: Callable[[], T]) -> T:
         with self._lock:
@@ -286,19 +292,32 @@ class ProducerRegistry:
         self.sends = SendLedger(self)
         self._lock = threading.Lock()
         self._close_requested = False
+        self._leases: dict[str, ProducerLease] = {}
         self._response_sends: dict[int, tuple[object, SendPermit]] = {}
 
-    def enter(self, parent: ProducerPermit, kind: ProducerKind) -> ProducerLease:
-        if parent is not self.permit or kind not in _KINDS:
+    def enter(self, parent: ProducerPermit | ProducerLease, kind: ProducerKind) -> ProducerLease:
+        if kind not in _KINDS:
             raise RecoveryRefused("invalid_producer_permit")
         with self._lock:
-            if self._close_requested:
-                raise RecoveryRefused("producer_closed")
+            parent_id = None
+            if parent is self.permit:
+                if self._close_requested:
+                    raise RecoveryRefused("producer_closed")
+            elif (type(parent) is ProducerLease and parent.registry is self
+                  and self._leases.get(parent.producer_id) is parent and kind == "callback"):
+                with parent._lock:
+                    if parent._state != "running":
+                        raise RecoveryRefused("invalid_callback_parent")
+                parent_id = parent.producer_id
+            else:
+                raise RecoveryRefused("invalid_callback_parent")
             producer_id = f"producer_{uuid.uuid4().hex}"
             self.store.register_producer(
-                self.scope, self.run_id, parent, producer_id, kind
+                self.scope, self.run_id, self.permit, producer_id, kind, parent_id
             )
-        return ProducerLease(self, producer_id, kind)
+            lease = ProducerLease(_LEASE_ISSUER, self, producer_id, kind)
+            self._leases[producer_id] = lease
+            return lease
 
     def request_close(self) -> None:
         with self._lock:
@@ -321,7 +340,9 @@ class ProducerRegistry:
         with self._lock:
             key = id(response)
             prior = self._response_sends.get(key)
-            if prior is not None and prior[0] is not response:
+            if prior is not None:
+                if prior[0] is response and prior[1] is send:
+                    return
                 raise RecoveryRefused("response_send_collision")
             self._response_sends[key] = (response, send)
 

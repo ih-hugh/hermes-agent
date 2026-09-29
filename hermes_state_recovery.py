@@ -272,8 +272,8 @@ class RecoveryStore:
         return self.db._read_retrying_ioerr(_read)
 
     def close_producer(self, scope: RecoveryScope, run_id: str, permit: object) -> None:
-        """Only the live process that owns an issued permit may close its producer."""
-        from agent.recovery_context import current_incarnation, validate_producer_permit
+        """Complete the root only after all inventoried work has drained."""
+        from agent.recovery_context import validate_producer_permit
 
         self._check_scope(scope)
         row = self.db._read_one(
@@ -283,19 +283,14 @@ class RecoveryStore:
             raise RecoveryRefused("invalid_producer_permit")
 
         def _tx(conn):
-            changed = conn.execute(
-                "UPDATE recovery_members SET producer_state='closed' WHERE run_id=? AND session_id=? "
-                "AND producer_state='open' AND owner_incarnation=?",
-                (run_id, scope.session_id, current_incarnation())).rowcount
-            if changed != 1:
-                raise RecoveryRefused("invalid_producer_permit")
-            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
-                         (scope.session_id,))
+            self._owned_member(conn, scope, run_id)
+            conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
+            self._settle_member(conn, scope, run_id)
 
         self.db._execute_write(_tx)
 
     def mark_incomplete(self, scope: RecoveryScope, run_id: str, permit: object, reason: str) -> None:
-        """Record a sticky, bounded reason from the member's actual owner."""
+        """Record a sticky reason and close only after inventoried work drains."""
         from agent.recovery_context import validate_producer_permit
 
         self._check_scope(scope)
@@ -308,18 +303,13 @@ class RecoveryStore:
             raise RecoveryRefused("invalid_producer_permit")
 
         def _tx(conn):
+            self._owned_member(conn, scope, run_id)
             session = self._session(conn, scope)
             if session is None or session[1] == "sealed":
                 raise RecoveryRefused("session_closed")
-            codes = list(json.loads(session[4]))
-            if reason not in codes:
-                codes.append(reason)
-            conn.execute(
-                "UPDATE recovery_members SET producer_state='incomplete' WHERE run_id=? AND session_id=?",
-                (run_id, scope.session_id))
-            conn.execute(
-                "UPDATE recovery_sessions SET reason_codes_json=?,revision=revision+1 WHERE session_id=?",
-                (json.dumps(codes), scope.session_id))
+            self._add_reason(conn, scope, reason)
+            conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
+            self._settle_member(conn, scope, run_id)
 
         self.db._execute_write(_tx)
 
@@ -372,7 +362,7 @@ class RecoveryStore:
                          (scope.session_id,))
 
     def register_producer(self, scope: RecoveryScope, run_id: str, permit: object,
-                          producer_id: str, kind: str) -> None:
+                          producer_id: str, kind: str, parent_producer_id: str | None = None) -> None:
         from agent.recovery_context import current_incarnation, validate_producer_permit
 
         self._check_scope(scope)
@@ -386,10 +376,27 @@ class RecoveryStore:
         def _tx(conn):
             self._owned_member(conn, scope, run_id)
             session = self._session(conn, scope)
-            if session is None or session[1] != "open":
+            if session is None or session[1] == "sealed":
                 raise RecoveryRefused("session_closing")
-            conn.execute("INSERT INTO recovery_producers(producer_id,run_id,kind,state,owner_incarnation) "
-                         "VALUES(?,?,?,'queued',?)", (producer_id, run_id, kind, current_incarnation()))
+            root_done = conn.execute("SELECT 1 FROM recovery_root_done WHERE run_id=?",
+                                     (run_id,)).fetchone() is not None
+            if parent_producer_id is None:
+                if session[1] != "open" or root_done:
+                    raise RecoveryRefused("session_closing")
+            else:
+                if kind != "callback":
+                    raise RecoveryRefused("invalid_callback_parent")
+                parent = conn.execute(
+                    "SELECT kind,state,owner_incarnation FROM recovery_producers "
+                    "WHERE producer_id=? AND run_id=?",
+                    (parent_producer_id, run_id)).fetchone()
+                if (parent is None or parent[1] != "running" or
+                        parent[2] != current_incarnation() or parent[0] == "usage_write"):
+                    raise RecoveryRefused("invalid_callback_parent")
+            conn.execute("INSERT INTO recovery_producers"
+                         "(producer_id,run_id,kind,state,owner_incarnation,parent_producer_id) "
+                         "VALUES(?,?,?,'queued',?,?)",
+                         (producer_id, run_id, kind, current_incarnation(), parent_producer_id))
             conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
                          (scope.session_id,))
 
@@ -478,6 +485,9 @@ class RecoveryStore:
             self._owned_member(conn, scope, run_id)
             session = self._session(conn, scope)
             if session is None or session[1] != "open":
+                raise RecoveryRefused("session_closing")
+            if conn.execute("SELECT 1 FROM recovery_root_done WHERE run_id=?",
+                            (run_id,)).fetchone() is not None:
                 raise RecoveryRefused("session_closing")
             owner = conn.execute("SELECT kind,state FROM recovery_producers WHERE producer_id=? AND run_id=?",
                                  (producer_id, run_id)).fetchone()

@@ -246,3 +246,116 @@ def test_usage_completion_is_one_use_and_response_binding_is_exact(tmp_path: Pat
         assert _closing(store, scope).state == "unsupported"
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("legacy", ["close", "incomplete"])
+def test_legacy_member_settlement_waits_for_active_child(tmp_path: Path, legacy: str):
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release = Event(), Event()
+    try:
+        child = registry.enter(registry.permit, "tool")
+        worker = Thread(target=lambda: child.run(lambda: (entered.set(), release.wait())))
+        worker.start()
+        assert entered.wait(5)
+        if legacy == "close":
+            store.close_producer(scope, "run_root", registry.permit)
+        else:
+            store.mark_incomplete(scope, "run_root", registry.permit, "untracked_producer")
+        view = _closing(store, scope)
+        assert view.members[0].producer_state == "open"
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        view = store.lookup_root(scope, "run_root")
+        assert view.members[0].producer_state == ("closed" if legacy == "close" else "incomplete")
+    finally:
+        release.set()
+        db.close()
+
+
+def test_active_parent_can_admit_exact_callback_during_closing(tmp_path: Path):
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, proceed, callback_done = Event(), Event(), Event()
+    errors: list[BaseException] = []
+    try:
+        parent = registry.enter(registry.permit, "executor")
+
+        def parent_body():
+            entered.set()
+            assert proceed.wait(5)
+            child = registry.enter(parent, "callback")
+            child.run(callback_done.set)
+
+        def worker_body():
+            try:
+                parent.run(parent_body)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = Thread(target=worker_body)
+        worker.start()
+        assert entered.wait(5)
+        assert _closing(store, scope).members[0].producer_state == "open"
+        for parent_candidate, kind in ((registry.permit, "callback"), (parent, "tool"), (parent, "sdk")):
+            with pytest.raises(RecoveryRefused):
+                registry.enter(parent_candidate, kind)
+        proceed.set()
+        worker.join(5)
+        assert not worker.is_alive() and not errors and callback_done.is_set()
+        rows = db._read_one("SELECT parent_producer_id FROM recovery_producers WHERE kind='callback'")
+        assert rows is not None and rows[0] == parent.producer_id
+        registry.request_close()
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+        with pytest.raises(RecoveryRefused):
+            registry.enter(parent, "callback")
+    finally:
+        proceed.set()
+        db.close()
+
+
+def test_same_response_cannot_rebind_to_second_send(tmp_path: Path):
+    db, store, _scope, registry = _admitted(tmp_path)
+    response = object()
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+
+        def body():
+            first = registry.sends.begin(registry.permit, "first")
+            second = registry.sends.begin(registry.permit, "second")
+            first.invoke(lambda: response)
+            second.invoke(lambda: response)
+            registry.bind_response_send(response, first)
+            registry.bind_response_send(response, first)
+            with pytest.raises(RecoveryRefused):
+                registry.bind_response_send(response, second)
+            assert registry.claim_response_send(response) is first
+            for send in (first, second):
+                send.finish(SendOutcome(kind="unknown", attempt_id=send.attempt_id,
+                                        reason="usage_unavailable"))
+
+        sdk.run(body)
+    finally:
+        db.close()
+
+
+def test_legacy_close_waits_for_preexisting_send_and_usage_slot(tmp_path: Path):
+    db, store, scope, registry = _admitted(tmp_path)
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+        sends = []
+
+        def body():
+            send = registry.sends.begin(registry.permit, "awaiting-usage")
+            send.invoke(lambda: object())
+            sends.append(send)
+
+        sdk.run(body)
+        store.close_producer(scope, "run_root", registry.permit)
+        assert _closing(store, scope).members[0].producer_state == "open"
+        sends[0].finish(SendOutcome(kind="unknown", attempt_id="awaiting-usage",
+                                    reason="usage_unavailable"))
+        view = store.lookup_root(scope, "run_root")
+        assert view.members[0].producer_state == "incomplete"
+        assert view.state == "unsupported"
+    finally:
+        db.close()
