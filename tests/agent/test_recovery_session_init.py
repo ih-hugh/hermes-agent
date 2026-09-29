@@ -92,7 +92,10 @@ def test_actual_agent_first_metadata_is_acknowledged(tmp_path, monkeypatch, prof
         )
         agent._ensure_db_session()
         assert agent._session_db_created is True
-        assert getattr(agent, "provider") == "openai" and getattr(agent, "model") == "gpt-4o"
+        assert (
+            getattr(agent, "provider") == "openai"
+            and getattr(agent, "model") == "gpt-4o"
+        )
         agent._ensure_db_session()
 
     try:
@@ -167,6 +170,7 @@ def test_protected_first_metadata_stable_ack_and_nudge_reuses_root(tmp_path):
             ),
         )
         assert admission.outcome == "created"
+        assert isinstance(admission.handoff, AdmissionHandoff)
         nudge = ProducerRegistry(
             store,
             scope,
@@ -202,6 +206,105 @@ def test_protected_first_metadata_stable_ack_and_nudge_reuses_root(tmp_path):
                 (scope.session_id,),
             )[0]
             == 2
+        )
+    finally:
+        db.close()
+
+
+def test_no_call_root_nudge_executor_performs_first_metadata_fill(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import profiles
+
+    homes = _scratch_profile_homes(tmp_path, monkeypatch)
+    db, store, scope, root_registry = _admitted(tmp_path)
+    try:
+        source_before = tuple(
+            db._read_one(
+                "SELECT id,source,profile_name,started_at FROM sessions WHERE id=?",
+                (scope.session_id,),
+            )
+        )
+        assert (
+            db._read_one(
+                "SELECT count(*) FROM recovery_write_acks WHERE session_id=?",
+                (scope.session_id,),
+            )[0]
+            == 0
+        )
+        root_registry.request_close()  # Queued stop: no root executor or agent ran.
+        admission = store.reserve(
+            RecoveryAdmission(
+                schema="hermes.recovery/v1", generation=1, parent_run_id="run_root"
+            ),
+            AdmissionIdentity(
+                scope,
+                "byf-recovery-v1:nudge-first",
+                "d" * 64,
+                "run_nudge",
+                current_incarnation(),
+                provider_admission(scope.session_id),
+            ),
+        )
+        assert admission.outcome == "created"
+        assert isinstance(admission.handoff, AdmissionHandoff)
+        nudge = ProducerRegistry(
+            store,
+            scope,
+            "run_nudge",
+            1,
+            issue_producer_permit(store, admission.handoff),
+        )
+        writer = issue_write_permit(nudge.permit, store, scope, "run_nudge", 1)
+        executor = nudge.enter(nudge.permit, "executor")
+
+        def initialize_nudge_agent():
+            agent = AIAgent(
+                api_key="scratch-only",
+                base_url="http://127.0.0.1:9/v1",
+                provider="openai",
+                api_mode="chat_completions",
+                model="gpt-4o",
+                enabled_toolsets=[],
+                session_id=scope.session_id,
+                session_db=db,
+                platform="api_server",
+                quiet_mode=True,
+                skip_memory=True,
+                skip_background_review=True,
+                skip_context_files=True,
+            )
+            agent._ensure_db_session()
+            assert agent._session_db_created is True
+
+        with _profile_runtime_scope(homes["factory"], prepared_secret_scope={}):
+            assert profiles.get_active_profile_name() == "factory"
+            with bind_write_permit(writer):
+                executor.run(initialize_nudge_agent)
+        assert (
+            tuple(
+                db._read_one(
+                    "SELECT id,source,profile_name,started_at FROM sessions WHERE id=?",
+                    (scope.session_id,),
+                )
+            )
+            == source_before
+        )
+        assert (
+            db._read_one(
+                "SELECT model FROM sessions WHERE id=?",
+                (scope.session_id,),
+            )[0]
+            == "gpt-4o"
+        )
+        ack = db._read_one(
+            "SELECT run_id,state,result_json FROM recovery_write_acks WHERE session_id=?",
+            (scope.session_id,),
+        )
+        assert ack is not None and tuple(ack) == (
+            "run_nudge",
+            "committed",
+            '{"initialized": true}',
         )
     finally:
         db.close()

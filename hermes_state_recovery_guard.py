@@ -54,6 +54,7 @@ _INITIAL_METADATA_RESTRICTED = tuple(
     column for column in _INITIAL_METADATA_COLUMNS
     if column not in {"model", "model_config", "display_name"}
 )
+_IMMUTABLE_SOURCE_COLUMNS = ("source", "profile_name", "started_at", "system_prompt")
 _INITIAL_METADATA: ContextVar[tuple[int, int, int, str, str, int, int] | None] = ContextVar(
     "recovery_initial_session_metadata", default=None,
 )
@@ -347,6 +348,10 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                     f"OLD.{column} IS NOT NEW.{column}"
                     for column in _INITIAL_METADATA_RESTRICTED
                 )
+                immutable_change = " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}"
+                    for column in _IMMUTABLE_SOURCE_COLUMNS
+                )
                 changed = " OR ".join(
                     f"OLD.{column} IS NOT NEW.{column}"
                     for column in _USAGE_SESSION_COLUMNS
@@ -357,6 +362,7 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                 )
                 checked_mutation = (
                     f"CASE WHEN OLD.id IS NOT NEW.id THEN 'move' "
+                    f"WHEN {immutable_change} THEN 'unsupported' "
                     f"WHEN ({initial_change}) AND ({initial_only}) AND ({null_fills}) "
                     "THEN 'session_init' "
                     f"WHEN {restricted_change} THEN 'unsupported' "

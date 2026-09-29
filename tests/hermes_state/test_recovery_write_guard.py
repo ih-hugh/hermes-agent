@@ -116,6 +116,51 @@ def test_generic_permit_cannot_fill_first_agent_metadata(tmp_path: Path) -> None
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("column", "replacement"),
+    [
+        ("source", "forged-source"),
+        ("profile_name", "forged-profile"),
+        ("started_at", -1.0),
+        ("system_prompt", "forged prompt"),
+    ],
+)
+def test_admitted_source_identity_and_time_are_immutable_with_generic_permit(
+    tmp_path: Path, column: str, replacement: object,
+) -> None:
+    db, store, scope, handoff = _protected_db(tmp_path)
+    producer = issue_producer_permit(store, handoff)
+    writer = issue_write_permit(producer, store, scope, "root", 0)
+    try:
+        before = tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        ))
+        with bind_write_permit(writer):
+            with pytest.raises(sqlite3.DatabaseError):
+                db._execute_write(lambda conn: conn.execute(
+                    f"UPDATE sessions SET {column}=? WHERE id=?",
+                    (replacement, scope.session_id),
+                ))
+        assert tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == before
+        assert db._read_one(
+            "SELECT count(*) FROM recovery_write_acks WHERE session_id=?",
+            (scope.session_id,),
+        )[0] == 0
+
+        db.create_session("ordinary-session", "cli")
+        db._execute_write(lambda conn: conn.execute(
+            f"UPDATE sessions SET {column}=? WHERE id='ordinary-session'",
+            (replacement,),
+        ))
+        assert db._read_one(
+            f"SELECT {column} FROM sessions WHERE id='ordinary-session'",
+        )[0] == replacement
+    finally:
+        db.close()
+
+
 def test_non_opted_profile_has_no_recovery_triggers(tmp_path: Path) -> None:
     db = SessionDB(tmp_path / "ordinary.db")
     try:
@@ -354,6 +399,14 @@ def test_bound_permit_guards_old_and_new_session_ids(tmp_path: Path) -> None:
         writer = issue_write_permit(producer, store, scope, "root", 0)
         with bind_write_permit(writer):
             db.create_session(scope.session_id, "api_server")
+        admitted_row = tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        ))
+        with bind_write_permit(writer), pytest.raises(sqlite3.DatabaseError):
+            db._write_sql("UPDATE sessions SET id=? WHERE id=?", ("renamed", scope.session_id))
+        assert tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == admitted_row
         with bind_write_permit(writer), pytest.raises(sqlite3.DatabaseError):
             db.append_message(scope.session_id, "user", "unacknowledged")
         protected_rows = [{"role": "user", "content": "protected"}]

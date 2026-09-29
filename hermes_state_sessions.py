@@ -9,7 +9,11 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
+
+if TYPE_CHECKING:
+    from agent.recovery_context import WritePermit
+    from hermes_state import SessionDB
 
 from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
@@ -371,7 +375,7 @@ class SessionSessionsMixin:
         return session_id
 
     def initialize_protected_session(
-        self, session_id: str, source: str, *, recovery_permit: object,
+        self, session_id: str, source: str, *, recovery_permit: "WritePermit",
         model: str | None = None, model_config: Dict[str, Any] | None = None,
         system_prompt: str | None = None, user_id: str | None = None,
         session_key: str | None = None, chat_id: str | None = None,
@@ -387,7 +391,8 @@ class SessionSessionsMixin:
         from hermes_state_recovery import RecoveryRefused, RecoveryStore
         from hermes_state_recovery_guard import guarded_write, initial_session_metadata_write
 
-        store = RecoveryStore(self)
+        db = cast("SessionDB", self)
+        store = RecoveryStore(db)
         binding = write_binding(recovery_permit, store)
         if binding is None:
             raise RecoveryRefused("invalid_write_permit")
@@ -396,7 +401,7 @@ class SessionSessionsMixin:
         if (
             scope.session_id != session_id or source != "api_server"
             or profile_name != scope.profile or lease is None or lease.kind != "executor"
-            or lease.registry.store.db is not self or lease.registry.scope != scope
+            or lease.registry.store.db is not db or lease.registry.scope != scope
             or lease.registry.run_id != run_id or lease.registry.generation != generation
         ):
             raise RecoveryRefused("session_init_executor_required")
@@ -450,7 +455,7 @@ class SessionSessionsMixin:
                 return {"initialized": False}
             prompt_hash = row[2]
             if prompt_hash is None and system_prompt is not None:
-                prompt_hash = self._store_system_prompt(conn, system_prompt)
+                prompt_hash = db._store_system_prompt(conn, system_prompt)
             values = (
                 user_id, session_key, chat_id, chat_type, thread_id,
                 display_name, origin_json, model,
@@ -458,7 +463,7 @@ class SessionSessionsMixin:
                 prompt_hash, parent_session_id, cwd, session_id,
             )
             with initial_session_metadata_write(
-                self, conn, recovery_permit, session_id, run_id, generation,
+                db, conn, recovery_permit, session_id, run_id, generation,
             ):
                 conn.execute(
                     "UPDATE sessions SET "
@@ -475,7 +480,7 @@ class SessionSessionsMixin:
             return {"initialized": True}
 
         guarded_write(
-            self, recovery_permit, "session", write_id, payload_sha256, _fill,
+            db, recovery_permit, "session", write_id, payload_sha256, _fill,
         )
         return session_id
 
