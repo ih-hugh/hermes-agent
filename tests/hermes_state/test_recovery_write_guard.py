@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 import sqlite3
 import hashlib
 import json
@@ -35,7 +37,7 @@ def _protected_db(
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:one", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:one", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     assert admitted.outcome == "created"

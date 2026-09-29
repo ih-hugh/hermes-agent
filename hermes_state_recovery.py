@@ -19,6 +19,7 @@ from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, Re
 if TYPE_CHECKING:
     from hermes_state import SessionDB
     from hermes_state_usage import RetainedUsagePayload
+    from hermes_state_recovery_provider import ProviderAdmissionValue
 
 
 RESERVED_KEY_PREFIX = "byf-recovery-v1:"
@@ -52,6 +53,7 @@ class AdmissionIdentity:
     request_sha256: str
     run_id: str
     owner_incarnation: str
+    provider_admission: ProviderAdmissionValue
     initial_status: dict | None = None
 
 
@@ -129,11 +131,20 @@ class RecoveryStore:
             (scope.session_id, scope.profile, scope.scope_digest)).fetchone()
 
     def reserve(self, admission: RecoveryAdmission, identity: AdmissionIdentity) -> AdmissionResult:
+        from hermes_state_recovery_provider import ProviderAdmissionValue, insert_admission, read_admission
+
         self._check_scope(identity.scope)
         if not identity.idempotency_key.startswith(RESERVED_KEY_PREFIX):
             return AdmissionResult("refused", None, "reserved_key_required")
         if not identity.owner_incarnation or not identity.run_id or len(identity.request_sha256) != 64:
             return AdmissionResult("refused", None, "invalid_identity")
+        if (type(identity.provider_admission) is not ProviderAdmissionValue
+                or identity.provider_admission.session_id != identity.scope.session_id):
+            return AdmissionResult("refused", None, "provider_admission_invalid")
+        try:
+            admission_bytes = identity.provider_admission.canonical_bytes()
+        except RecoveryRefused as exc:
+            return AdmissionResult("refused", None, exc.code)
         scope = identity.scope
 
         def _tx(conn):
@@ -162,6 +173,7 @@ class RecoveryStore:
                     "INSERT INTO recovery_sessions(session_id,profile,scope_digest,phase,revision,root_run_id) "
                     "VALUES(?,?,?,'open',1,?)",
                     (scope.session_id, scope.profile, scope.scope_digest, identity.run_id))
+                insert_admission(conn, identity.provider_admission)
             else:
                 if row is None or row[1] != "open":
                     return AdmissionResult("refused", None, "not_open")
@@ -172,6 +184,8 @@ class RecoveryStore:
                         conn.execute("SELECT 1 FROM recovery_members WHERE session_id=? AND generation=1",
                                      (scope.session_id,)).fetchone()):
                     return AdmissionResult("refused", None, "nudge_unavailable")
+                if read_admission(conn, scope.session_id).canonical_bytes() != admission_bytes:
+                    return AdmissionResult("refused", None, "provider_admission_mismatch")
                 conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
                              (scope.session_id,))
             conn.execute(
@@ -584,6 +598,9 @@ class RecoveryStore:
             return
         if conn.execute("SELECT 1 FROM recovery_write_acks WHERE run_id=? AND state='pending' LIMIT 1",
                         (run_id,)).fetchone() is not None:
+            return
+        if conn.execute("SELECT 1 FROM recovery_provider_invocations WHERE run_id=? "
+                        "AND state='invoking' LIMIT 1", (run_id,)).fetchone() is not None:
             return
         reasons = conn.execute("SELECT reason_codes_json FROM recovery_sessions WHERE session_id=?",
                                (scope.session_id,)).fetchone()

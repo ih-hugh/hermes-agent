@@ -426,6 +426,7 @@ class _RunLaunch:
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     tool_observer: Any = None
     recovery_handoff: object | None = None  # one-use, process-local authority from committed admission
+    recovery_provider_capture: object | None = None  # selected source-bound plugin object and attestation
     recovery_registry: Any = None
     recovery_write_permit: Any = None
     recovery_status_barrier: Any = None
@@ -663,6 +664,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if error is not None:
             self._run_owners.pop(run_id, None)
             return error
+    provider_capture = None
+    if recovery_admission is not None:
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery_provider import capture_selected_provider_admission
+
+        try:
+            provider_capture = await asyncio.to_thread(
+                capture_selected_provider_admission, session_id)
+        except RecoveryRefused as exc:
+            self._run_owners.pop(run_id, None)
+            return _json_error(_openai_error, "Protected provider admission refused",
+                               code=exc.code, status=503)
     tool_observer = (_tool_diag.create(
         self, run_id, _api_server._api_request_profile.get() or "default",
         self._run_owners[run_id]) if diagnostic_requested else None)
@@ -676,7 +689,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         from hermes_state_recovery import AdmissionIdentity
         result = await asyncio.to_thread(protected_store.reserve, recovery_admission, AdmissionIdentity(
             protected_scope, idempotency_key, idempotency_fingerprint, run_id,
-            current_incarnation(), initial_status))
+            current_incarnation(), provider_capture.admission, initial_status))
         if result.outcome != "created":
             self._run_tool_diagnostics.pop(run_id, None)
             _forget_run(self, run_id, self._run_streams, self._run_streams_created,
@@ -727,6 +740,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         turn_author=turn_author,
         tool_observer=tool_observer,
         recovery_handoff=recovery_handoff,
+        recovery_provider_capture=provider_capture,
         recovery_registry=recovery_registry,
         recovery_write_permit=recovery_write_permit,
         recovery_status_barrier=recovery_status_barrier,

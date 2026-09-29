@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 import hashlib
 import json
 import subprocess
@@ -37,7 +39,7 @@ def _pending_send(tmp_path: Path):
     scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
     admitted = store.reserve(
         RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
-        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()),
+        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)),
     )
     registry = ProducerRegistry(
         store, scope, "root", 0, issue_producer_permit(store, admitted.handoff)

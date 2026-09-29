@@ -17,6 +17,7 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_runs
 from hermes_state_recovery import RecoveryRefused
 from tests.agent.test_recovery_runtime import _admitted
+from tests.recovery_provider_fixture import selected_provider
 
 
 def test_protected_agent_construction_requires_exact_registry_and_write_permit(tmp_path):
@@ -60,6 +61,7 @@ async def test_protected_construction_does_not_block_gateway_loop(tmp_path, monk
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = db
     adapter._recovery_runtime_ready = lambda request, body: True
+    selected_provider(monkeypatch)
     entered, release = threading.Event(), threading.Event()
 
     def held_construction(**kwargs):

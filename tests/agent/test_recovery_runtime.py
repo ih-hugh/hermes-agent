@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 import asyncio
 from contextlib import nullcontext
 from pathlib import Path
@@ -33,7 +35,7 @@ def _admitted(tmp_path: Path):
     scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
     result = store.reserve(
         RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
-        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "run_root", current_incarnation()),
+        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "run_root", current_incarnation(), provider_admission(scope.session_id)),
     )
     registry = ProducerRegistry(
         store, scope, "run_root", 0, issue_producer_permit(store, result.handoff))

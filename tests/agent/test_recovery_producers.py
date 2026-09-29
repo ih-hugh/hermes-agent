@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Thread
@@ -39,7 +41,7 @@ def _admitted(tmp_path: Path):
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "run_root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "run_root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     assert admitted.outcome == "created"

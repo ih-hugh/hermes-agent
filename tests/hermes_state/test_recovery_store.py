@@ -32,6 +32,7 @@ from gateway.platforms import api_server, api_server_runs
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
+from tests.recovery_provider_fixture import provider_admission, selected_provider
 
 
 def _stores(tmp_path: Path) -> tuple[RecoveryStore, RecoveryStore]:
@@ -40,11 +41,12 @@ def _stores(tmp_path: Path) -> tuple[RecoveryStore, RecoveryStore]:
 
 
 def _identity(store: RecoveryStore, *, session: str = "exact-session", key: str = "byf-recovery-v1:one",
-              run: str = "run_root", fingerprint: str = "a" * 64, owner: str = "gateway:one") -> AdmissionIdentity:
+              run: str = "run_root", fingerprint: str = "a" * 64, owner: str = "gateway:one",
+              provider=None) -> AdmissionIdentity:
     return AdmissionIdentity(
         scope=RecoveryScope(store.store_id, "factory", "b" * 64, session),
         idempotency_key=key, request_sha256=fingerprint, run_id=run,
-        owner_incarnation=owner)
+        owner_incarnation=owner, provider_admission=provider or provider_admission(session))
 
 
 def _root() -> RecoveryAdmission:
@@ -481,6 +483,17 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     db = SessionDB(tmp_path / "state.db")
     adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = db
+    admission_events: list[str] = []
+    capture_threads: list[int] = []
+    selected_provider(monkeypatch, events=admission_events, threads=capture_threads)
+    original_reserve = RecoveryStore.reserve
+
+    def observed_reserve(store, admission, identity):
+        admission_events.append("reserve")
+        assert identity.provider_admission == provider_admission("exact-session")
+        return original_reserve(store, admission, identity)
+
+    monkeypatch.setattr(RecoveryStore, "reserve", observed_reserve)
     dispatched: list[str] = []
 
     async def fake_execute(owner, launch, *, _api_server):
@@ -499,12 +512,28 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
             unavailable = await client.post("/v1/runs", json=body, headers=headers)
             assert unavailable.status == 503
             adapter._recovery_runtime_ready = lambda request, body: True
+            from tools import terminal_tool
+            with monkeypatch.context() as temporary:
+                temporary.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+                wrong_backend = await client.post("/v1/runs", json=body, headers=headers)
+            assert wrong_backend.status == 503
+            from tools import terminal_tool_config
+            with monkeypatch.context() as temporary:
+                temporary.setattr(terminal_tool_config, "_get_plugin_env_provider", lambda _env: (
+                    SimpleNamespace(name="byf_workspace", capture_recovery_admission=lambda _sid: (
+                        provider_admission("exact-session")))))
+                wrong_plugin = await client.post("/v1/runs", json=body, headers=headers)
+            assert wrong_plugin.status == 503
+            assert admission_events == []
             first = await client.post("/v1/runs", json=body, headers=headers)
             assert first.status == 202
+            assert admission_events == ["capture", "reserve"]
+            assert capture_threads and capture_threads[0] != threading.get_ident()
             first_id = (await first.json())["run_id"]
             adapter._recovery_runtime_ready = lambda request, body: False
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202
+            assert admission_events == ["capture", "reserve"]
             assert (await replay.json())["run_id"] == first_id
             adapter._run_statuses.clear()
             adapter._run_owners.clear()
@@ -529,6 +558,7 @@ async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Pa
     adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = db
     adapter._recovery_runtime_ready = lambda request, body: True
+    selected_provider(monkeypatch)
 
     async def fake_execute(owner, launch, *, _api_server):
         return None
@@ -574,6 +604,7 @@ async def test_pending_protected_reservation_holds_concurrency_slot(
     adapter._session_db = db
     adapter._max_concurrent_runs = 1
     adapter._recovery_runtime_ready = lambda request, body: True
+    selected_provider(monkeypatch)
     entered = threading.Event()
     release = threading.Event()
     original_reserve = RecoveryStore.reserve
@@ -839,6 +870,7 @@ async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_p
     adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = db
     adapter._recovery_runtime_ready = lambda request, body: True
+    selected_provider(monkeypatch)
     entered, release = threading.Event(), threading.Event()
     created = threading.Event()
     original_update = RecoveryStore.update_status

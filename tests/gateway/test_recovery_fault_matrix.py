@@ -8,6 +8,8 @@ Later recovery tasks extend this file for usage acknowledgement and sealing.
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -42,7 +44,7 @@ def _scope(store: RecoveryStore) -> RecoveryScope:
 
 
 def _identity(store: RecoveryStore) -> AdmissionIdentity:
-    return AdmissionIdentity(_scope(store), _KEY, _FINGERPRINT, _RUN, current_incarnation())
+    return AdmissionIdentity(_scope(store), _KEY, _FINGERPRINT, _RUN, current_incarnation(), provider_admission(_SESSION))
 
 
 def _close_request() -> SealRequest:

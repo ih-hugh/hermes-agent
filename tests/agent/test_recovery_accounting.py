@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.recovery_provider_fixture import provider_admission
+
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
@@ -45,7 +47,7 @@ def test_queued_usage_applies_once_and_ack_survives_reopen(tmp_path: Path) -> No
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     registry = ProducerRegistry(
@@ -134,7 +136,7 @@ def test_failed_protected_apply_stays_failed_after_legacy_flush(tmp_path: Path) 
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     registry = ProducerRegistry(
@@ -193,7 +195,7 @@ def test_rejected_response_consumes_exact_send_before_retry(tmp_path: Path) -> N
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     registry = ProducerRegistry(
@@ -231,7 +233,7 @@ def test_queued_usage_finishes_after_sdk_worker_and_close_request(
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     registry = ProducerRegistry(
@@ -298,7 +300,7 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
             schema="hermes.recovery/v1", generation=0, parent_run_id=None
         ),
         AdmissionIdentity(
-            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation()
+            scope, "byf-recovery-v1:root", "a" * 64, "root", current_incarnation(), provider_admission(scope.session_id)
         ),
     )
     registry = ProducerRegistry(
