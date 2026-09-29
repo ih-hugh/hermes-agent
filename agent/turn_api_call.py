@@ -65,6 +65,9 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    from agent.recovery_producers import require_supported_chat_agent, require_unmanaged_dispatch
+    require_supported_chat_agent(agent)
+    require_unmanaged_dispatch()
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:
@@ -90,27 +93,54 @@ def perform_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
         from agent import relay_llm
+        from agent.recovery_producers import current_registry, finish_unknown_if_active
+        from hermes_state_recovery import RecoveryRefused
 
-        return relay_llm.execute(
-            next_api_kwargs,
-            agent._interruptible_api_call,
-            session_id=str(agent.session_id or ""),
-            name=str(agent.provider or "provider"),
-            model_name=str(agent.model or ""),
-            metadata={
-                "api_mode": agent.api_mode,
-                "api_request_id": api_request_id,
-                "call_role": (
-                    "delegated"
-                    if getattr(agent, "is_subagent", False)
-                    else "fallback"
-                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                    else "primary"
-                ),
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+        registry = current_registry()
+        last_send = None
+
+        def _invoke_and_claim_raw(request):
+            nonlocal last_send
+            raw = agent._interruptible_api_call(request)
+            if registry is not None:
+                send = registry.claim_response_send(raw)
+                if send is None:
+                    registry.mark_unsupported("untracked_producer")
+                    raise RecoveryRefused("untracked_producer")
+                finish_unknown_if_active(last_send, "relay_superseded")
+                last_send = send
+            return raw
+
+        try:
+            logical = relay_llm.execute(
+                next_api_kwargs,
+                agent._interruptible_api_call if registry is None else _invoke_and_claim_raw,
+                session_id=str(agent.session_id or ""),
+                name=str(agent.provider or "provider"),
+                model_name=str(agent.model or ""),
+                metadata={
+                    "api_mode": agent.api_mode,
+                    "api_request_id": api_request_id,
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": retry_count,
+                },
+                defer_logical_completion=True,
+            )
+        except BaseException:
+            finish_unknown_if_active(last_send, "relay_incomplete")
+            raise
+        if registry is not None:
+            if last_send is None:
+                registry.mark_unsupported("untracked_producer")
+                raise RecoveryRefused("untracked_producer")
+            registry.bind_response_send(logical, last_send)
+        return logical
 
     from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -210,6 +240,9 @@ def nous_rate_limit_guard(
 ) -> NousRateGuardVerdict:
     """Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
     SDK retries) counts against RPH. Never lets the guard itself break the agent loop."""
+    from agent.recovery_producers import current_registry, refuse_untracked_work
+    if current_registry() is not None and agent.provider == "nous":
+        refuse_untracked_work()
     from agent.conversation_loop import _arm_fallback_restart
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> NousRateGuardVerdict:

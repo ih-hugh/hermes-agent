@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -96,6 +97,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_idempotency_ids: set[str] = set()
     self._protected_run_ids: set[str] = set()
     self._protected_run_stores: dict[str, Any] = {}
+    self._protected_run_registries: dict[str, Any] = {}
     self._protected_status_tasks: dict[str, asyncio.Task[None]] = {}
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
@@ -200,6 +202,23 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     return current
 
 
+def _schedule_run_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", callback) -> None:
+    """Inventory a callback before enqueue, including during active-parent closing."""
+    registry = self._protected_run_registries.get(run_id)
+    if registry is None:
+        with suppress(Exception):
+            loop.call_soon_threadsafe(callback)
+        return
+    from agent.recovery_producers import current_lease
+    parent = current_lease() or registry.permit
+    lease = registry.enter(parent, "callback")
+    try:
+        loop.call_soon_threadsafe(lambda: lease.run(callback))
+    except BaseException:
+        lease.cancel_before_start()
+        raise
+
+
 def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
@@ -214,8 +233,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                 with suppress(Exception):
                     q.put_nowait(event)
 
-        with suppress(Exception):
-            loop.call_soon_threadsafe(_publish)
+        _schedule_run_callback(self, run_id, loop, _publish)
 
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
@@ -408,6 +426,11 @@ class _RunLaunch:
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     tool_observer: Any = None
     recovery_handoff: object | None = None  # one-use, process-local authority from committed admission
+    recovery_registry: Any = None
+    recovery_write_permit: Any = None
+    recovery_status_barrier: Any = None
+    recovery_execution_settled: Any = None
+    recovery_coroutine_settled: Any = None
 
     @property
     def approval_session_key(self) -> str:
@@ -557,6 +580,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
     protected_store = protected_scope = None
     recovery_handoff = None
+    recovery_registry = recovery_status_barrier = None
+    recovery_write_permit = None
     if recovery_admission is not None:
         from hermes_state_recovery import RecoveryStore, RecoveryScope, RecoveryRefused
         if await asyncio.to_thread(self._run_idempotency_store.has_key, idempotency_scope, idempotency_key):
@@ -667,6 +692,16 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._protected_run_ids.add(run_id)
         self._protected_run_stores[run_id] = protected_store
         recovery_handoff = result.handoff
+        from agent.recovery_context import issue_producer_permit, issue_write_permit
+        from agent.recovery_producers import ProducerRegistry
+        recovery_registry = ProducerRegistry(
+            protected_store, protected_scope, run_id, recovery_admission.generation,
+            issue_producer_permit(protected_store, recovery_handoff))
+        recovery_status_barrier = recovery_registry.enter(recovery_registry.permit, "callback")
+        recovery_write_permit = issue_write_permit(
+            recovery_registry.permit, protected_store, protected_scope, run_id,
+            recovery_admission.generation)
+        self._protected_run_registries[run_id] = recovery_registry
     elif idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
@@ -691,9 +726,18 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author,
         tool_observer=tool_observer,
-        recovery_handoff=recovery_handoff)
+        recovery_handoff=recovery_handoff,
+        recovery_registry=recovery_registry,
+        recovery_write_permit=recovery_write_permit,
+        recovery_status_barrier=recovery_status_barrier,
+        recovery_execution_settled=threading.Event() if recovery_registry is not None else None,
+        recovery_coroutine_settled=asyncio.Event() if recovery_registry is not None else None)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    if recovery_registry is not None:
+        observer = asyncio.create_task(_finalize_protected_producers(self, launch))
+        self._background_tasks.add(observer)
+        observer.add_done_callback(self._background_tasks.discard)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
@@ -774,9 +818,16 @@ def _run_agent_sync_body(self, run: _RunLaunch, agent, approval_notify, *, _api_
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+            if run.recovery_write_permit is None:
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id, **author_kwargs)
+            else:
+                from agent.recovery_context import bind_write_permit
+                with bind_write_permit(run.recovery_write_permit):
+                    r = agent.run_conversation(
+                        user_message=run.user_message, conversation_history=run.conversation_history,
+                        task_id=effective_task_id, **author_kwargs)
         finally:
             try:
                 # Clear ownership now so a later stop can't reap work this run left running.
@@ -837,9 +888,11 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
         request_id = approval_data.get("request_id")
 
         def _settled(_reason: str) -> None:
-            with suppress(Exception):
-                loop.call_soon_threadsafe(
-                    lambda: _project_run_approval(self, run_id, _api_server=_api_server))
+            if run.recovery_registry is not None and run.recovery_coroutine_settled.is_set():
+                return
+            _schedule_run_callback(
+                self, run_id, loop,
+                lambda: _project_run_approval(self, run_id, _api_server=_api_server))
 
         from tools.approval import register_gateway_settle
         registered = bool(request_id) and register_gateway_settle(
@@ -853,10 +906,24 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
                             list_gateway_approvals(run.approval_session_key))):
                 q.put_nowait(_approval_run_event(run_id, approval_data, _api_server=_api_server))
 
-        with suppress(Exception):
-            loop.call_soon_threadsafe(_publish)
+        _schedule_run_callback(self, run_id, loop, _publish)
 
     return _approval_notify
+
+
+async def _finalize_protected_producers(self, run: _RunLaunch) -> None:
+    """Retain closure authority after a cancelled HTTP/executor waiter."""
+    registry = run.recovery_registry
+    try:
+        await run.recovery_coroutine_settled.wait()
+        await asyncio.to_thread(run.recovery_execution_settled.wait)
+        await asyncio.to_thread(
+            registry.wait_until_quiescent, excluding=run.recovery_status_barrier)
+        await _await_protected_status(self, run.run_id)
+        run.recovery_status_barrier.run(lambda: None)
+    except BaseException:
+        logger.exception("[api_server] protected producer finalization failed for %s", run.run_id)
+        raise
 
 
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
@@ -867,8 +934,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
             return
-        with suppress(Exception):
-            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=delta))
+        _schedule_run_callback(
+            self, run_id, loop,
+            lambda: run.put_event(_run_event(run_id, "message.delta", delta=delta)))
 
     async def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
@@ -889,18 +957,67 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         observer_token = current_tool_send_observer.set(run.tool_observer) if run.tool_observer else None
         try:
             with self._profile_scope(run.request_profile):
-                agent = self._create_agent(
-                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                    **run.agent_kwargs)
+                if run.recovery_write_permit is None:
+                    agent = self._create_agent(
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                        **run.agent_kwargs)
+                else:
+                    from agent.recovery_context import bind_write_permit
+                    from agent.recovery_producers import bind_registry
+                    registry = run.recovery_registry
+                    construction_lease = registry.enter(registry.permit, "executor")
+                    def _construct_agent():
+                        token = _api_server._recovery_construction_lease.set(construction_lease)
+                        try:
+                            with bind_registry(registry), bind_write_permit(run.recovery_write_permit):
+                                return construction_lease.run(lambda: self._create_agent(
+                                    stream_delta_callback=_text_cb,
+                                    tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                                    **run.agent_kwargs))
+                        finally:
+                            _api_server._recovery_construction_lease.reset(token)
+                    try:
+                        agent = await asyncio.to_thread(_construct_agent)
+                    except BaseException:
+                        # Cancellation can detach the awaiter while the worker is
+                        # constructing; its durable lease remains open until it exits.
+                        from hermes_state_recovery import RecoveryRefused
+                        with suppress(RecoveryRefused):
+                            construction_lease.cancel_before_start()
+                        raise
         finally:
             if observer_token is not None:
                 current_tool_send_observer.reset(observer_token)
         self._active_run_agents[run_id] = agent
+        if run.recovery_registry is not None:
+            registry = run.recovery_registry
+            agent._recovery_registry = registry
+            agent._recovery_write_permit = run.recovery_write_permit
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        executor_future = loop.run_in_executor(
-            None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        if run.recovery_registry is None:
+            executor_future = loop.run_in_executor(
+                None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        else:
+            registry = run.recovery_registry
+            lease = registry.enter(registry.permit, "executor")
+            def _protected_worker():
+                try:
+                    return lease.run(
+                        lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+                finally:
+                    run.recovery_execution_settled.set()
+            try:
+                executor_future = loop.run_in_executor(None, _protected_worker)
+            except BaseException:
+                lease.cancel_before_start()
+                run.recovery_execution_settled.set()
+                raise
         producer_dispatched = True
-        result, usage = await executor_future
+        # A cancelled protected waiter cannot cancel the underlying queued
+        # worker: its registered lease must settle from the actual thread.
+        result, usage = await (asyncio.shield(executor_future)
+                               if run.recovery_registry is not None else executor_future)
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
@@ -923,6 +1040,11 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         logger.exception("[api_server] run %s failed", run_id)
         await _finish("failed", error=_redact_api_error_text(exc))
     finally:
+        if run.recovery_registry is not None:
+            if not producer_dispatched:
+                run.recovery_execution_settled.set()
+            run.recovery_registry.request_close()
+            run.recovery_coroutine_settled.set()
         if run.tool_observer is not None and not producer_dispatched:
             run.tool_observer.mark_incomplete("unclosed_producer")
             run.tool_observer.close_producer()

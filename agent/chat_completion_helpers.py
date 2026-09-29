@@ -686,6 +686,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    from agent.recovery_producers import begin_chat_send, current_registry, require_supported_chat_agent
+    require_supported_chat_agent(agent)
     if agent.api_mode == "codex_responses":
         from agent.tool_diagnostic_transport import mark_unsupported_send
         mark_unsupported_send(agent, api_kwargs)
@@ -717,7 +719,12 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     request_client = make_client("chat_completion_request")
     from agent.tool_diagnostic_transport import observe_sdk_send
     observe_sdk_send(agent, api_kwargs)
-    return request_client.chat.completions.create(**api_kwargs)
+    send = begin_chat_send(request_client)
+    response = (send.invoke(lambda: request_client.chat.completions.create(**api_kwargs))
+                if send is not None else request_client.chat.completions.create(**api_kwargs))
+    if send is not None:
+        current_registry().bind_response_send(response, send)
+    return response
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -826,8 +833,18 @@ class _InlineRequest:
         self.lock = threading.Lock()
         self.abort_hook = self.abort  # single bound object: identity-checked on cleanup
         self._hb_stop = threading.Event()
-        self._hb = threading.Thread(target=self._activity_heartbeat, name="direct-api-activity-hb", daemon=True)
+        from agent.recovery_producers import current_lease, current_registry
+        parent = current_lease()
+        if current_registry() is not None and parent is None:
+            from agent.recovery_producers import refuse_untracked_work
+            refuse_untracked_work()
+        self._hb_parent = parent
+        self._hb_lease = parent.registry.enter(parent, "callback") if parent is not None else None
+        heartbeat = (self._activity_heartbeat if self._hb_lease is None else
+                     lambda: self._hb_lease.run(self._activity_heartbeat))
+        self._hb = threading.Thread(target=heartbeat, name="direct-api-activity-hb", daemon=True)
         self._watchdog = None
+        self._watchdog_stop = threading.Event()
 
     def _activity_heartbeat(self) -> None:
         # Never put the API call itself on another worker thread — that is the nested-pool
@@ -847,16 +864,43 @@ class _InlineRequest:
 
     def start_watchdogs(self) -> None:
         """Start the activity heartbeat and (for a finite budget) the stale timer."""
-        self._hb.start()
-        if math.isfinite(self.stale_timeout) and self.stale_timeout > 0:
-            self._watchdog = threading.Timer(self.stale_timeout, self._on_stale)
-            self._watchdog.name = "direct-api-stale-watchdog"
-            self._watchdog.daemon = True
-            self._watchdog.start()
+        try:
+            self._hb.start()
+        except BaseException:
+            if self._hb_lease is not None:
+                self._hb_lease.cancel_before_start()
+            raise
+        lease = None
+        try:
+            if math.isfinite(self.stale_timeout) and self.stale_timeout > 0:
+                if self._hb_lease is None:
+                    self._watchdog = threading.Timer(self.stale_timeout, self._on_stale)
+                    self._watchdog.name = "direct-api-stale-watchdog"
+                    self._watchdog.daemon = True
+                else:
+                    registry = self._hb_lease.registry
+                    lease = registry.enter(self._hb_parent, "callback")
+                    def _watchdog_body():
+                        if not self._watchdog_stop.wait(self.stale_timeout):
+                            self._on_stale()
+                    self._watchdog = threading.Thread(
+                        target=lambda: lease.run(_watchdog_body),
+                        name="direct-api-stale-watchdog", daemon=True)
+                self._watchdog.start()
+        except BaseException:
+            if lease is not None:
+                lease.cancel_before_start()
+            self._hb_stop.set()
+            self._hb.join(timeout=2.0)
+            raise
 
     def stop_watchdogs(self) -> None:
         if self._watchdog is not None:
-            self._watchdog.cancel()
+            if self._hb_lease is None:
+                self._watchdog.cancel()
+            else:
+                self._watchdog_stop.set()
+                self._watchdog.join(timeout=2.0)
         self.mark_done()
         self._hb_stop.set()
         self._hb.join(timeout=2.0)
@@ -950,7 +994,14 @@ def direct_api_call(agent, api_kwargs: dict):
     # close the client so the retry builds a fresh pool.
     succeeded = False
     try:
-        response = _dispatch_nonstreaming_api_request(agent, api_kwargs, make_client=request.make_client)
+        from agent.recovery_producers import current_registry
+        registry = current_registry()
+        if registry is None:
+            response = _dispatch_nonstreaming_api_request(agent, api_kwargs, make_client=request.make_client)
+        else:
+            sdk_lease = registry.enter(registry.permit, "sdk")
+            response = sdk_lease.run(
+                lambda: _dispatch_nonstreaming_api_request(agent, api_kwargs, make_client=request.make_client))
     except Exception:
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
@@ -1843,6 +1894,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    from agent.recovery_producers import current_registry
+    from hermes_state_recovery import RecoveryRefused
+    registry = current_registry()
+    if registry is not None:
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     while True:
@@ -2084,6 +2141,12 @@ _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthrop
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    from agent.recovery_producers import current_registry
+    from hermes_state_recovery import RecoveryRefused
+    registry = current_registry()
+    if registry is not None:
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
@@ -2696,7 +2759,12 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._touch_activity("waiting for provider response (streaming)")
         from agent.tool_diagnostic_transport import observe_sdk_send
         observe_sdk_send(self.agent, stream_kwargs)
-        return request_client.chat.completions.create(**stream_kwargs)
+        from agent.recovery_producers import begin_chat_send, finish_unknown_if_active
+        finish_unknown_if_active(getattr(self, "_recovery_send", None), "superseded_send")
+        self._recovery_send = begin_chat_send(request_client)
+        send = self._recovery_send
+        return (send.invoke(lambda: request_client.chat.completions.create(**stream_kwargs))
+                if send is not None else request_client.chat.completions.create(**stream_kwargs))
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
@@ -3181,6 +3249,8 @@ class _StreamingCall(StreamingWaitMonitor):
         return self._call_anthropic(request_client)
 
     def _call(self):
+        from agent.recovery_producers import current_registry, finish_unknown_if_active, require_supported_chat_agent
+        require_supported_chat_agent(self.agent)
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
         # The one stream_options compatibility retry (#9705) is not a network retry and must not
         # consume the transient budget: on the last attempt (or HERMES_STREAM_RETRIES=0) the
@@ -3199,8 +3269,12 @@ class _StreamingCall(StreamingWaitMonitor):
                 try:
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
+                    send = getattr(self, "_recovery_send", None)
+                    if send is not None:
+                        current_registry().bind_response_send(self.result["response"], send)
                     return  # success
                 except Exception as e:
+                    finish_unknown_if_active(getattr(self, "_recovery_send", None), "stream_incomplete")
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
@@ -3209,6 +3283,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.result["error"] = e
             return
         finally:
+            if self.result["response"] is None:
+                finish_unknown_if_active(getattr(self, "_recovery_send", None), "stream_incomplete")
             self._close_managed_stream()
             # Reuse only after a clean stream; otherwise really close (fresh pool next).
             self.clients.close_once(
@@ -3347,7 +3423,10 @@ class _StreamingCall(StreamingWaitMonitor):
     def run(self):
         """Resolve the stale timeout, run the request (worker thread or inline),
         drive the heartbeat/stale/interrupt monitor, then translate the outcome."""
+        from agent.recovery_producers import current_registry
+        registry = current_registry()
         self._resolve_stale_timeout()
+        sdk_lease = registry.enter(registry.permit, "sdk") if registry is not None else None
         # Delegated children and cron turns run the request INLINE (a worker inside
         # their nested pools wedges before the socket opens) but must still STREAM
         # (edge proxies kill silent POSTs). Only the poll loop moves to a monitor
@@ -3356,22 +3435,44 @@ class _StreamingCall(StreamingWaitMonitor):
         self._monitor_interrupted = {"yes": False}
         if should_use_direct_api_call(self.agent):
             self.worker = None
+            from agent.recovery_producers import current_lease, refuse_untracked_work
+            parent = current_lease()
+            if registry is not None and parent is None:
+                sdk_lease.cancel_before_start()
+                refuse_untracked_work()
+            monitor_lease = parent.registry.enter(parent, "callback") if parent is not None else None
+            monitor_target = (self._monitor_loop if monitor_lease is None else
+                              lambda: monitor_lease.run(self._monitor_loop))
             monitor = threading.Thread(
-                target=_context_thread_target(self._monitor_loop), name="stream-inline-monitor", daemon=True)
-            monitor.start()
+                target=_context_thread_target(monitor_target), name="stream-inline-monitor", daemon=True)
             try:
-                self._run_call()
+                monitor.start()
+            except BaseException:
+                if monitor_lease is not None:
+                    monitor_lease.cancel_before_start()
+                if sdk_lease is not None:
+                    sdk_lease.cancel_before_start()
+                raise
+            try:
+                if sdk_lease is None:
+                    self._run_call()
+                else:
+                    sdk_lease.run(self._run_call)
             finally:
                 monitor.join(timeout=2.0)
         else:
-            self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
-            observer = getattr(self.agent, "_tool_send_observer", None)
-            self._tool_diagnostic_worker_registered = observer is not None
-            if observer is not None:
-                observer.register_worker()
+            worker_target = self._run_call if sdk_lease is None else lambda: sdk_lease.run(self._run_call)
+            observer = None
             try:
+                self.worker = threading.Thread(target=_context_thread_target(worker_target), daemon=True)
+                observer = getattr(self.agent, "_tool_send_observer", None)
+                self._tool_diagnostic_worker_registered = observer is not None
+                if observer is not None:
+                    observer.register_worker()
                 self.worker.start()
             except BaseException:
+                if sdk_lease is not None:
+                    sdk_lease.cancel_before_start()
                 if observer is not None:
                     observer.close_worker()
                 raise

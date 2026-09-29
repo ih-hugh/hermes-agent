@@ -1394,6 +1394,9 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
     while s.retry_count < s.max_retries:
+        from agent.recovery_producers import require_supported_chat_agent, require_unmanaged_dispatch
+        require_supported_chat_agent(agent)
+        require_unmanaged_dispatch()
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result

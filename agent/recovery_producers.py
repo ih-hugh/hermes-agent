@@ -49,6 +49,82 @@ def current_lease() -> ProducerLease | None:
     return _ACTIVE_LEASE.get()
 
 
+def refuse_untracked_work() -> None:
+    """Reject an unsupported protected dispatch before its first side effect."""
+    registry = current_registry()
+    if registry is not None:
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
+
+
+def require_unmanaged_dispatch() -> None:
+    """Only the direct Hermes call chain has a complete producer inventory."""
+    if current_registry() is None:
+        return
+    from agent import relay_runtime
+    from hermes_cli.middleware import (
+        LLM_EXECUTION_MIDDLEWARE,
+        LLM_REQUEST_MIDDLEWARE,
+        TOOL_EXECUTION_MIDDLEWARE,
+        TOOL_REQUEST_MIDDLEWARE,
+    )
+    from hermes_cli.plugins import has_middleware
+
+    runtime = relay_runtime.get_runtime(create=False)
+    if ((runtime is not None and runtime.managed_execution_enabled())
+            or any(has_middleware(kind) for kind in (
+                LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
+                TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE))):
+        refuse_untracked_work()
+
+
+def require_supported_chat_agent(agent: object) -> None:
+    """Refuse a protected turn before an uninventoryable provider path can run."""
+    registry = current_registry()
+    if registry is None:
+        return
+    toolsets = getattr(agent, "enabled_toolsets", None)
+    if (getattr(agent, "api_mode", None) != "chat_completions"
+            or getattr(agent, "provider", None) == "moa"
+            or bool(getattr(agent, "is_subagent", False))
+            or bool(getattr(agent, "_fallback_index", 0))
+            or not isinstance(toolsets, (list, tuple, set, frozenset))
+            or not set(toolsets) <= {"terminal"}):
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
+
+
+def begin_chat_send(client: object) -> SendPermit | None:
+    """Inventory one physical OpenAI SDK invocation, refusing hidden retries."""
+    registry = current_registry()
+    if registry is None:
+        return None
+    from openai import OpenAI
+    from openai._base_client import SyncHttpxClientWrapper
+    from httpx import HTTPTransport
+
+    http_client = getattr(client, "_client", None)
+    if (type(client) is not OpenAI
+            or type(getattr(client, "max_retries", None)) is not int
+            or client.max_retries != 0
+            or type(http_client) is not SyncHttpxClientWrapper
+            or type(getattr(http_client, "_transport", None)) is not HTTPTransport
+            or bool(getattr(http_client, "_mounts", None))):
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
+    return registry.sends.begin(registry.permit, f"send_{uuid.uuid4().hex}")
+
+
+def finish_unknown_if_active(send: SendPermit | None, reason: str) -> None:
+    """Retain uncertainty for a started send with no committed usage acknowledgement."""
+    if send is None:
+        return
+    with _SEND_LOCK:
+        record = _SEND_MAP.get(send)
+    if record is not None:
+        send.finish(SendOutcome(kind="unknown", attempt_id=send.attempt_id, reason=reason))
+
+
 @dataclass(frozen=True, slots=True)
 class SendOutcome:
     kind: SendOutcomeKind
@@ -254,6 +330,7 @@ class ProducerLease:
             )
             with self._lock:
                 self._state = "closed"
+            self.registry._notify_lease_settled()
 
     def cancel_before_start(self) -> None:
         """Caller may use this only after proving submission never began (e.g. Future.cancel true)."""
@@ -267,6 +344,7 @@ class ProducerLease:
                 self.producer_id,
             )
             self._state = "cancelled"
+        self.registry._notify_lease_settled()
 
 
 class ProducerRegistry:
@@ -291,6 +369,7 @@ class ProducerRegistry:
         )
         self.sends = SendLedger(self)
         self._lock = threading.Lock()
+        self._settled = threading.Condition(self._lock)
         self._close_requested = False
         self._leases: dict[str, ProducerLease] = {}
         self._response_sends: dict[int, tuple[object, SendPermit]] = {}
@@ -318,6 +397,19 @@ class ProducerRegistry:
             lease = ProducerLease(_LEASE_ISSUER, self, producer_id, kind)
             self._leases[producer_id] = lease
             return lease
+
+    def _notify_lease_settled(self) -> None:
+        with self._settled:
+            self._settled.notify_all()
+
+    def wait_until_quiescent(self, *, excluding: ProducerLease) -> None:
+        """Join actual child completion before an ordered status-write barrier."""
+        if excluding.registry is not self:
+            raise RecoveryRefused("invalid_callback_parent")
+        with self._settled:
+            self._settled.wait_for(lambda: all(
+                lease is excluding or lease._state in {"closed", "cancelled"}
+                for lease in self._leases.values()))
 
     def request_close(self) -> None:
         with self._lock:

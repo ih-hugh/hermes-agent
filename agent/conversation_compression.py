@@ -3588,6 +3588,8 @@ def compress_context(
     cooperative fence for executor callers that may time out. It prevents a late worker from mutating
     session state after its caller has moved on.
     """
+    from agent.recovery_producers import refuse_untracked_work
+    refuse_untracked_work()
     attempt = _begin_compression_attempt(agent, force=force, defer_notification=defer_context_engine_notification)
 
     # Codex owns the real thread; route compaction to its own compact (config

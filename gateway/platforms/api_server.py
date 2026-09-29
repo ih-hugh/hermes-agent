@@ -49,6 +49,8 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
     "api_server_browser_control_principal", default="")
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default="")
+_recovery_construction_lease: ContextVar[object | None] = ContextVar(
+    "api_server_recovery_construction_lease", default=None)
 
 class _ArtifactScopeFacade:
     """Minimal scope for ``artifact_scope_key``: server-derived principal + session + transport family."""
@@ -2114,6 +2116,45 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model = self._recover_or_record_model(model, runtime_kwargs, gateway_session_key)
         return model, session_override, request_model, request_provider
 
+    def _assert_recovery_agent_construction(self, session_id: Optional[str]) -> None:
+        """Refuse alternate agent dispatch into a persisted protected session."""
+        if not session_id:
+            return
+        from hermes_state_recovery import RecoveryRefused, RecoveryScope, RecoveryStore
+
+        db = self._ensure_session_db()
+        if db is None:
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        if db._read_one(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_members'") is None:
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        members = db._read_all(
+            "SELECT run_id,generation,profile,scope_digest,producer_state "
+            "FROM recovery_members WHERE session_id=?", (session_id,))
+        if not members:
+            return
+        from agent.recovery_context import current_write_permit, validate_write_permit
+        from agent.recovery_producers import current_lease, current_registry
+
+        permit = current_write_permit()
+        registry = current_registry()
+        store = RecoveryStore(db)
+        for member in members:
+            if member[4] != "open":
+                continue
+            scope = RecoveryScope(store.store_id, member[2], member[3], session_id)
+            lease = current_lease()
+            construction_lease = _recovery_construction_lease.get()
+            if (registry is not None
+                    and (lease is None or (lease is construction_lease
+                                           and lease.registry is registry and lease.kind == "executor"))
+                    and registry.store.db is db and registry.scope == scope
+                    and registry.run_id == member[0] and registry.generation == member[1]
+                    and validate_write_permit(
+                        permit, store, scope, member[0], member[1], mutation="session")):
+                return
+        raise RecoveryRefused("protected_session_dispatch")
+
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
@@ -2127,6 +2168,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
+        self._assert_recovery_agent_construction(session_id)
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
