@@ -29,6 +29,8 @@ _REQUIRED_COLUMNS = {
     "recovery_sends": {"attempt_id", "run_id", "producer_id", "sequence", "state", "delta_id"},
     "recovery_usage_slots": {"delta_id", "attempt_id", "state"},
     "recovery_write_acks": {"write_id", "session_id", "run_id", "generation", "mutation", "state"},
+    "recovery_provider_admissions": {"session_id", "provider", "hermes_revision", "source_sha256", "provider_sha256", "lease_id", "grant_sha256", "admission_json", "admission_sha256"},
+    "recovery_provider_invocations": {"invocation_id", "session_id", "run_id", "generation", "producer_id", "sequence", "kind", "state", "create_invocation_id", "container_id", "container_attestation_sha256", "exit_code", "outcome_reason"},
 }
 
 

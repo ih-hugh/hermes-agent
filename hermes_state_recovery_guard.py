@@ -36,6 +36,8 @@ _LEDGER = (
     "recovery_sends",
     "recovery_usage_slots",
     "recovery_write_acks",
+    "recovery_provider_admissions",
+    "recovery_provider_invocations",
 )
 T = TypeVar("T")
 

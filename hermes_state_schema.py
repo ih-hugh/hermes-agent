@@ -984,6 +984,30 @@ class SessionSchemaMixin:
                 ack_revision INTEGER,
                 result_json TEXT
             );
+            CREATE TABLE IF NOT EXISTS recovery_provider_admissions (
+                session_id TEXT PRIMARY KEY REFERENCES recovery_sessions(session_id),
+                provider TEXT NOT NULL CHECK (provider='byf_workspace'),
+                hermes_revision TEXT NOT NULL, source_sha256 TEXT NOT NULL,
+                provider_sha256 TEXT NOT NULL, lease_id TEXT NOT NULL,
+                grant_sha256 TEXT NOT NULL, admission_json BLOB NOT NULL,
+                admission_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_provider_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES recovery_provider_admissions(session_id),
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                generation INTEGER NOT NULL CHECK (generation IN (0,1)),
+                producer_id TEXT NOT NULL REFERENCES recovery_producers(producer_id),
+                sequence INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('create_environment','execute')),
+                state TEXT NOT NULL CHECK (state IN ('invoking','returned','unknown')),
+                create_invocation_id TEXT REFERENCES recovery_provider_invocations(invocation_id),
+                container_id TEXT, container_attestation_sha256 TEXT,
+                exit_code INTEGER, outcome_reason TEXT,
+                UNIQUE (session_id, sequence)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_recovery_provider_create_per_session
+                ON recovery_provider_invocations(session_id) WHERE kind='create_environment';
         """)
         # Task 2a's first checkout may already have the producer table without parentage.
         if not any(row[1] == "parent_producer_id" for row in
