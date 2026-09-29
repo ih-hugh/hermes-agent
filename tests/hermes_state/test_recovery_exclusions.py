@@ -62,6 +62,23 @@ def test_absent_store_bootstrap_exact_claim_and_reuse(tmp_path: Path):
         db.close()
 
 
+def test_claims_do_not_recreate_missing_named_profile(tmp_path: Path):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    profile = root / "profiles" / "archived"
+    path = profile / "state.db"
+
+    for claim in (lambda: claim_ordinary_sessions(path, ("ordinary",)),
+                  lambda: begin_raw_schema_claim(path)):
+        with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+            claim()
+        assert not profile.exists()
+
+    profile.mkdir(parents=True)
+    assert claim_ordinary_sessions(path, ("ordinary",)).session_ids == ("ordinary",)
+
+
 @pytest.mark.parametrize("content", [b"", bytes(4096), b"not sqlite"])
 def test_preexisting_unclassifiable_store_is_unchanged(tmp_path: Path, content: bytes):
     path = tmp_path / "state.db"

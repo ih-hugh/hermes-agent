@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Never, SupportsIndex
 
+from hermes_constants import assert_named_profile_home_live, mkdir_under_hermes_home
 from hermes_state_recovery import RecoveryRefused
 
 if TYPE_CHECKING:
@@ -239,7 +240,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files, has_invalid_sqlite_header_preopen
     from hermes_state_repair import preflight_db_writability
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_under_hermes_home(path.parent)
     # O_EXCL distinguishes our new empty inode from a pre-existing zero-byte
     # state.db. SQLite accepts the latter as an empty catalog, but its previous
     # authority is unknowable and must not be replaced by bootstrap DDL.
@@ -322,6 +323,7 @@ def _authorize_one(conn: sqlite3.Connection, operation: str, claim_id: str,
 
 def _claim(path: Path, kind: Literal["ordinary_session", "unscoped_ordinary", "raw_schema"],
            session_ids: tuple[str, ...] = ()) -> str | None:
+    assert_named_profile_home_live(path.parent)
     try:
         with closing(_connect(path)) as conn:
             conn.execute("BEGIN IMMEDIATE")
