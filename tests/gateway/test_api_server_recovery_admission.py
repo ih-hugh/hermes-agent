@@ -606,9 +606,11 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(
         "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+        "database:\n  journal_mode: delete\n"
     )
     selected = type("Selected", (), {})()
     calls: list[str] = []
+    dispatched = asyncio.Event()
 
     def prepare(owner, *, session_id):
         calls.append("prepare")
@@ -632,6 +634,7 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
         run.recovery_registry.request_close()
         run.recovery_coroutine_settled.set()
         api_server_runs._retire_live_run(adapter, run.run_id)
+        dispatched.set()
 
     monkeypatch.setattr(
         api_server_recovery_runtime, "prepare_static_chat_runtime", prepare
@@ -673,6 +676,19 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
                     (first["run_id"],),
                 )
             ) == ("protected",)
+            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            await asyncio.wait_for(dispatched.wait(), timeout=5)
+            await api_server_runs._await_protected_status(adapter, first["run_id"])
+
+            async def quiesced() -> None:
+                while first["run_id"] in adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(quiesced(), timeout=5)
+            original_members = db._read_one(
+                "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                ("protected",),
+            )[0]
 
             def retired(_session_id, *, deadline):
                 raise AssertionError("committed retry recaptured retired provider")
@@ -681,6 +697,26 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
                 hermes_state_recovery_provider,
                 "capture_selected_provider_admission",
                 retired,
+            )
+            blocker = sqlite3.connect(
+                home / "state.db", isolation_level=None, timeout=0
+            )
+            try:
+                blocker.execute("BEGIN EXCLUSIVE")
+                blocked = await client.post("/v1/runs", json=body, headers=headers)
+                assert blocked.status == 503, await blocked.text()
+                assert (await blocked.json())["error"][
+                    "code"
+                ] == "recovery_store_unavailable"
+            finally:
+                blocker.rollback()
+                blocker.close()
+            assert (
+                db._read_one(
+                    "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                    ("protected",),
+                )[0]
+                == original_members
             )
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202, await replay.text()
@@ -978,6 +1014,12 @@ async def test_late_committed_reserve_dispatches_after_http_timeout_and_replays(
                     await asyncio.sleep(0.001)
 
             await asyncio.wait_for(settled(), timeout=1)
+
+            async def quiesced() -> None:
+                while adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(quiesced(), timeout=5)
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202, await replay.text()
             assert (await replay.json())["replayed"] is True
