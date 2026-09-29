@@ -552,8 +552,25 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
         home = Path(get_hermes_home()).resolve()
     # SQLite needs a writable directory in every journal mode (WAL/SHM sidecars, or the DELETE-mode journal).
     sidecars = (db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm"))
+
+    def _sidecar_disappeared(path: Path) -> bool:
+        if path not in sidecars:
+            return False
+        try:
+            path.lstat()  # A dangling symlink is still present and must not be skipped.
+        except FileNotFoundError:
+            return path.parent.is_dir()  # A missing parent is not SQLite sidecar cleanup.
+        except OSError:
+            pass  # A present but unreadable path keeps the normal refusal.
+        return False
+
     for p, is_dir in [(db_path.parent, True), *((p, False) for p in (db_path, *sidecars) if p.is_file())]:
         if (is_dir and not p.is_dir()) or os.access(p, os.R_OK | os.W_OK):
+            continue
+        # SQLite can remove its last -shm (or checkpointed -wal) between the
+        # candidate list and access check. ENOENT for that exact sidecar is not
+        # a read-only file; the main DB and directory still fail closed.
+        if _sidecar_disappeared(p):
             continue
         x = "x" if is_dir else ""
         in_scope = False
@@ -563,6 +580,8 @@ def preflight_db_writability(db_path: Path, *, db_label: str = "state.db") -> No
                 os.chmod(p, p.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | (stat.S_IXUSR if is_dir else 0))
         if in_scope and os.access(p, os.R_OK | os.W_OK):
             logger.info("%s preflight: repaired read-only %s (chmod u+rw%s)", db_label, p, x)
+            continue
+        if _sidecar_disappeared(p):
             continue
         wal_note = (" Do NOT delete the -wal file — it contains committed data that "
                     "will be merged into the database once it is writable." if p.name.endswith("-wal") else "")
