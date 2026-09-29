@@ -167,6 +167,39 @@ def _transaction():
     return transaction(_connect())
 
 
+def _exact_exclusion_only_catalog(conn: sqlite3.Connection) -> bool:
+    """Recognize only the complete ordinary-claim bootstrap, on this read snapshot."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import EXCLUSION_NAMES, _canonical_exclusion_shape
+
+    limit = len(EXCLUSION_NAMES) + 1
+    metadata = conn.execute(
+        "SELECT length(CAST(type AS BLOB)),length(CAST(name AS BLOB)) "
+        "FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' LIMIT ?", (limit,)
+    ).fetchall()
+    if len(metadata) != len(EXCLUSION_NAMES) or any(
+        type(type_size) is not int or not 0 < type_size <= 8
+        or type(name_size) is not int or not 0 < name_size <= 128
+        for type_size, name_size in metadata
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT substr(CAST(type AS BLOB),1,9),substr(CAST(name AS BLOB),1,129) "
+        "FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' LIMIT ?", (limit,)
+    ).fetchall()
+    if len(rows) != len(EXCLUSION_NAMES):
+        return False
+    try:
+        actual = {(raw_type.decode("utf-8"), raw_name.decode("utf-8"))
+                  for raw_type, raw_name in rows
+                  if type(raw_type) is bytes and type(raw_name) is bytes}
+    except UnicodeError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    expected = {("table" if name == "recovery_exclusions" else "trigger", name)
+                for name in EXCLUSION_NAMES}
+    return actual == expected and _canonical_exclusion_shape(conn)
+
+
 def _read_durable_identities(where: str, params: tuple = ()) -> dict[str, tuple[str, str]]:
     """Read persisted origins without opening a writable/reconciling SessionDB."""
     from hermes_state_recovery import RecoveryRefused
@@ -177,6 +210,16 @@ def _read_durable_identities(where: str, params: tuple = ()) -> dict[str, tuple[
     try:
         with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.execute("PRAGMA query_only=ON")
+            # sqlite3's implicit transactions do not cover SELECT statements.
+            # Hold one read snapshot across the ledger and full-catalog probes.
+            conn.execute("BEGIN")
+            ledger = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name='async_delegations' LIMIT 2"
+            ).fetchall()
+            if ledger != [("table",)]:
+                if not ledger and _exact_exclusion_only_catalog(conn):
+                    return {}
+                raise RecoveryRefused("protected_session_authority_unavailable")
             rows = conn.execute(
                 "SELECT delegation_id, parent_session_id, origin_session_id "
                 f"FROM async_delegations WHERE {where} ORDER BY delegation_id LIMIT ?",

@@ -411,6 +411,12 @@ def test_completion_arriving_during_batch_delivery_schedules_next_flush():
 
 
 def test_completion_batches_do_not_cross_conversation_routes():
+    from hermes_constants import get_hermes_home
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    # Route isolation is the assertion here; finish first-store bootstrap
+    # before the two concurrent ordinary claims below.
+    claim_unscoped_ordinary(get_hermes_home() / "state.db")
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
 

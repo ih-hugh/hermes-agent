@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import queue
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,6 +71,103 @@ def test_raw_connect_creates_only_genuinely_absent_ordinary_store(tmp_path, monk
     finally:
         conn.close()
     assert path.exists()
+
+
+def test_legacy_completion_survives_exact_exclusion_only_claim(tmp_path, monkeypatch):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    claim_unscoped_ordinary(path)
+    assert ad.claim_completion_delivery("legacy-event", "claim-a") is True
+    assert ad.complete_completion_delivery("legacy-event", "claim-a") is False
+    assert ad.claim_completion_delivery("legacy-event", "claim-b") is True
+
+
+def test_bootstrap_catalog_reads_one_sqlite_snapshot(tmp_path, monkeypatch):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = tmp_path / "state.db"
+    claim_unscoped_ordinary(path)
+    with sqlite3.connect(path) as setup:
+        assert setup.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    original_connect = sqlite3.connect
+    changed = threading.Event()
+    errors = []
+
+    def add_extra_table():
+        try:
+            with original_connect(path) as writer:
+                writer.execute("CREATE TABLE later_ordinary_table(value TEXT)")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            changed.set()
+
+    class CursorSnapshot:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class ReadConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, params=()):
+            cursor = self.inner.execute(sql, params)
+            if "length(CAST(type AS BLOB))" in sql:
+                rows = cursor.fetchall()
+                worker = threading.Thread(target=add_extra_table)
+                worker.start()
+                assert changed.wait(5), "second connection could not commit in WAL mode"
+                worker.join(5)
+                assert not errors
+                return CursorSnapshot(rows)
+            return cursor
+
+        def close(self):
+            self.inner.close()
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(ad, "sqlite3", SimpleNamespace(
+        connect=lambda *a, **k: ReadConnection(original_connect(*a, **k)),
+        DatabaseError=sqlite3.DatabaseError,
+    ))
+    # The first metadata read saw the exact bootstrap. The later catalog read
+    # must see that same snapshot, not the writer's newly committed table.
+    assert ad.claim_completion_delivery("legacy-event", "claim-a") is True
+    assert changed.is_set()
+
+
+@pytest.mark.parametrize("damage", ["extra", "missing", "altered", "full_missing_ledger"])
+def test_legacy_completion_refuses_nonexact_bootstrap_catalog(tmp_path, monkeypatch, damage):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    if damage == "full_missing_ledger":
+        db = SessionDB(path)
+        db.close()
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP TABLE async_delegations")
+    else:
+        claim_unscoped_ordinary(path)
+        with sqlite3.connect(path) as conn:
+            if damage == "extra":
+                conn.execute("CREATE TABLE ordinary_extra(value TEXT)")
+            elif damage == "missing":
+                conn.execute("DROP TRIGGER recovery_guard_recovery_exclusions_update")
+            else:
+                conn.execute("DROP TRIGGER recovery_guard_recovery_exclusions_update")
+                conn.execute(
+                    "CREATE TRIGGER recovery_guard_recovery_exclusions_update "
+                    "BEFORE UPDATE ON recovery_exclusions BEGIN SELECT 1; END"
+                )
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        ad.claim_completion_delivery("legacy-event", "claim-a")
 
 
 def test_raw_connect_leaves_unreadable_existing_store_untouched(tmp_path, monkeypatch):
