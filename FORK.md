@@ -230,9 +230,9 @@ At the pre-merge 2026-09-29 source refresh, fork main remained
   unrelated workflows, the repository Actions permissions update enabled the
   fork. The UI and REST state were checked: CI and its selected reusable workflow
   files are present, while publishing, automatic source edits and unrelated workflows
-  remain disabled. Scheduled OSV retains GitHub's `disabled_fork` state; its use
-  as a reusable CI workflow still needs a run. Activation did not produce a
-  retrospective PR #4 run. Actual exact-source CI qualification remains open.
+  remain disabled. Scheduled OSV retains GitHub's `disabled_fork` state; its reusable CI
+  scan and result jobs passed in the first manual run. Activation did not produce
+  a retrospective PR #4 run. Actual exact-source aggregate CI qualification remains open.
 - `95b88e67b06e28725f9395597bba9a102517d468` makes the existing CI usable on
   forks with standard hosted runners: upstream retains its larger runner labels;
   fork Linux tests use four workers with a bounded 60-minute full-suite job, and
@@ -241,6 +241,32 @@ At the pre-merge 2026-09-29 source refresh, fork main remained
   exact-main qualification. Independent structural review passed; a hosted run
   is still required. Retire these repository conditions if upstream CI becomes
   portable across forks without changing test coverage.
+
+
+- `d3ed01fee8785a1d23da4a9cb1ef7b19822f02f5` makes the late SQLite contention
+  tests deterministic: controlled elapsed time reaches the real blocked commit,
+  its trace and rollback assertions, instead of consuming almost the entire
+  deadline in a deliberate sleep. Product deadlines are unchanged. Independent
+  canonical qualification passed all 14 tests in that file without retries.
+- `e37c999ab82b065f2943e77fb1728bef1cfcc78e` corrects five inherited test fixtures:
+  existing route enumeration, canonical temporary pathname, Linux-only detection,
+  macOS durability floor and tracing of the actual pooled FTS reader. Independent
+  canonical qualification passed all 452 tests across the five files without
+  retries. No production safety condition was relaxed.
+- The contributor check correctly refused the initial qualification branch because
+  its commit author lacked an existing-format mapping. `2022bc1fc1b2044e475ceeafe5d069c2c76e09f5`
+  adds the verified `ih-hugh` mapping without changing the gate. The adjacent
+  case-collision fixture now asserts exact stored spelling and unchanged contents;
+  a differently cased pathname can resolve to the original on macOS. All 11
+  contributor tests passed in independent canonical qualification without retries.
+- The first PR-triggered run failed before allocating any jobs with a GitHub
+  internal error. Manual run
+  [36590035558](https://github.com/ih-hugh/hermes-agent/actions/runs/36590035558)
+  at `9cadc68d5b2f8682f115439025d254e5455aedaa` proved standard runner allocation
+  and reusable security scanning, but it predates the fixture and mapping fixes
+  and is not a passing exact-source qualification. The qualification branch contains these follow-ups;
+  [PR #5](https://github.com/ih-hugh/hermes-agent/pull/5) tracks its review. The aggregate CI, installed source-pair, Factory pin
+  and deployment gates remain separate.
 
 ## Upstream maintenance plan
 
