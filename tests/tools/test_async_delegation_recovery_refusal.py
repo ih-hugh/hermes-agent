@@ -181,6 +181,35 @@ def test_raw_connect_leaves_unreadable_existing_store_untouched(tmp_path, monkey
     assert set(tmp_path.iterdir()) == before
 
 
+def test_public_durable_read_does_not_recreate_deleted_named_profile(tmp_path):
+    from hermes_constants import (
+        mark_named_profile_deleted,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes-root"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    profile = root / "profiles" / "archived"
+    profile.mkdir(parents=True)
+    mark_named_profile_deleted(profile)
+    profile.rmdir()
+    token = set_hermes_home_override(profile)
+    refused = False
+    try:
+        try:
+            ad.get_durable_delegation("no-such-delegation")
+        except FileNotFoundError as exc:
+            assert "Named profile home does not exist" in str(exc)
+            refused = True
+    finally:
+        reset_hermes_home_override(token)
+    assert not profile.exists()
+    assert not (profile / "state.db").exists()
+    assert refused
+
+
 def test_ordinary_delegation_uses_existing_schema_in_mixed_store(tmp_path, monkeypatch):
     db, _store, _scope, _registry = _admitted(tmp_path)
     monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
