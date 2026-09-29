@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
 _PROCESS_NONCE = uuid.uuid4().hex
 _ISSUER = object()
 _REGISTRY: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
+_CLAIMED: set[tuple] = set()
+_CLAIM_LOCK = threading.Lock()
 _ACTIVE_WRITE: ContextVar[WritePermit | None] = ContextVar("recovery_write_permit", default=None)
 
 
@@ -56,9 +59,15 @@ def issue_producer_permit(store: RecoveryStore, identity: AdmissionIdentity) -> 
         (identity.run_id, identity.scope.session_id, identity.scope.profile, identity.scope.scope_digest))
     if row is None or row[1] != current_incarnation() or row[2] != "open":
         raise RecoveryRefused("producer_unavailable")
-    permit = ProducerPermit(_ISSUER)
-    _REGISTRY[permit] = (os.getpid(), _PROCESS_NONCE, id(store.db), identity.scope,
-                         identity.run_id, int(row[0]))
+    claim = (os.getpid(), _PROCESS_NONCE, store.store_id, identity.scope,
+             identity.run_id, int(row[0]))
+    with _CLAIM_LOCK:
+        if claim in _CLAIMED:
+            raise RecoveryRefused("producer_already_claimed")
+        permit = ProducerPermit(_ISSUER)
+        _CLAIMED.add(claim)
+        _REGISTRY[permit] = (os.getpid(), _PROCESS_NONCE, id(store.db), identity.scope,
+                             identity.run_id, int(row[0]))
     return permit
 
 

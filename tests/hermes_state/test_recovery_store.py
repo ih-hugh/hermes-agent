@@ -217,6 +217,9 @@ def test_permit_is_process_owned_and_cannot_be_copied(tmp_path: Path):
         assert first.reserve(_root(), identity).outcome == "created"
         permit = issue_producer_permit(first, identity)
         assert validate_producer_permit(permit, first, identity.scope, "run_root", 0)
+        with pytest.raises(RecoveryRefused) as repeated:
+            issue_producer_permit(first, identity)
+        assert repeated.value.code == "producer_already_claimed"
         assert not validate_producer_permit(permit, second, identity.scope, "run_root", 0)
         with pytest.raises(TypeError):
             copy(permit)
