@@ -9,7 +9,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from hermes_state import SessionDB
+import hermes_state_wal
+from hermes_state import SessionCompressionInProgressError, SessionDB
 from hermes_state_recovery_deadline import RecoveryDeadlineExceeded, recovery_deadline
 
 
@@ -68,7 +69,7 @@ def test_recovery_read_serializes_on_timed_writer_lock(db: SessionDB) -> None:
     assert row is not None and row[0] == 1
 
 
-def test_recovery_sqlite_busy_wait_uses_remaining_budget_and_restores(
+def test_recovery_begin_busy_retries_within_budget_and_restores_timeout(
     db: SessionDB,
 ) -> None:
     with db._lock:
@@ -88,6 +89,29 @@ def test_recovery_sqlite_busy_wait_uses_remaining_budget_and_restores(
     with db._lock:
         assert db._conn is not None
         assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_busy_ms
+
+
+def test_prebegin_sqlite_busy_with_shorter_patience_preserves_busy_error(
+    db: SessionDB,
+) -> None:
+    blocker = sqlite3.connect(db.db_path, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    calls = 0
+
+    def callback(conn: sqlite3.Connection) -> None:
+        nonlocal calls
+        calls += 1
+
+    began = time.monotonic()
+    try:
+        with recovery_deadline(began + 1.0):
+            with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+                db._execute_write(callback, patience_s=0.02)
+        assert time.monotonic() - began < 0.30
+        assert calls == 0
+    finally:
+        blocker.rollback()
+        blocker.close()
 
 
 def test_recovery_ioerr_retry_sleep_cannot_extend_deadline(
@@ -135,3 +159,84 @@ def test_recovery_write_skips_postcommit_maintenance_lock_waits(
         result = db._execute_write(lambda conn: "committed", patience_s=1.0)
     assert result == "committed"
     assert time.monotonic() - began < 0.1
+
+
+def test_late_commit_busy_refuses_before_shared_deadline(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "delete")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    blocker = None
+    try:
+        with db._lock:
+            assert db._conn is not None
+            db._conn.execute("CREATE TABLE deadline_probe(value INTEGER)")
+            db._conn.commit()
+            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        blocker = sqlite3.connect(db.db_path, isolation_level=None)
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT * FROM deadline_probe").fetchall()
+        began = time.monotonic()
+        with recovery_deadline(began + 0.20):
+            with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+                db._execute_write(
+                    lambda conn: (
+                        time.sleep(0.16),
+                        conn.execute("INSERT INTO deadline_probe VALUES (1)"),
+                    ),
+                    patience_s=1.0,
+                )
+        assert time.monotonic() - began < 0.30
+    finally:
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        db.close()
+
+
+def test_late_read_sql_busy_refuses_before_shared_deadline(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "delete")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    blocker = None
+    try:
+        db._execute_write(
+            lambda conn: conn.execute("CREATE TABLE deadline_probe(value INTEGER)")
+        )
+        blocker = sqlite3.connect(db.db_path, isolation_level=None)
+        blocker.execute("BEGIN EXCLUSIVE")
+        began = time.monotonic()
+        with recovery_deadline(began + 0.20):
+            with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+                db._read_retrying_ioerr(
+                    lambda conn: (
+                        time.sleep(0.16),
+                        conn.execute("SELECT value FROM deadline_probe"),
+                    )[1]
+                )
+        assert time.monotonic() - began < 0.30
+    finally:
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        db.close()
+
+
+def test_expired_compression_retry_reports_shared_deadline(db: SessionDB) -> None:
+    def transient(conn: sqlite3.Connection) -> None:
+        time.sleep(0.04)
+        raise SessionCompressionInProgressError("foreign compression")
+
+    with recovery_deadline(time.monotonic() + 0.02):
+        with pytest.raises(RecoveryDeadlineExceeded):
+            db._execute_write(transient, patience_s=1.0)
+
+
+def test_shorter_compression_budget_preserves_compression_error(db: SessionDB) -> None:
+    db._COMPRESSION_BUSY_WAIT_S = 0.02
+
+    def transient(conn: sqlite3.Connection) -> None:
+        raise SessionCompressionInProgressError("foreign compression")
+
+    with recovery_deadline(time.monotonic() + 1.0):
+        with pytest.raises(SessionCompressionInProgressError):
+            db._execute_write(transient, patience_s=1.0)

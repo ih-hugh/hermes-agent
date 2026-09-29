@@ -71,14 +71,13 @@ def acquire_recovery_lock(lock: _Lock) -> Iterator[None]:
 
 @contextmanager
 def bounded_sqlite_busy(conn: sqlite3.Connection) -> Iterator[None]:
-    """Temporarily clamp one exclusively held connection's SQLite busy wait."""
-    remaining = require_time()
-    if remaining is None:
+    """Disable hidden SQLite waits on one exclusively held recovery connection."""
+    if current_deadline() is None:
         yield
         return
+    require_time()
     original = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
-    timeout_ms = min(original, max(1, int(remaining * 1000)))
-    conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    conn.execute("PRAGMA busy_timeout=0")
     try:
         require_time()
         yield

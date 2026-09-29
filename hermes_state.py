@@ -1018,7 +1018,8 @@ class SessionDB(
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        Recovery work does not retry locked/busy after *fn* starts."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -1094,6 +1095,7 @@ class SessionDB(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
                     continue
+                require_time()
                 raise
             except sqlite3.Error as exc:
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
@@ -1104,6 +1106,11 @@ class SessionDB(
                 err_msg = str(exc).lower()
                 if isinstance(exc, sqlite3.OperationalError):
                     if "locked" in err_msg or "busy" in err_msg:
+                        if current_deadline() is not None and fn_started:
+                            # The callback may have non-idempotent effects outside
+                            # SQLite. Rollback already ran; let its caller decide
+                            # whether to retry the durable recovery request.
+                            raise
                         if self._sleep_before_write_retry(deadline, patience_s):
                             continue
                         # Say what actually happened, not disk/permission damage.

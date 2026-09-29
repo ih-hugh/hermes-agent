@@ -55,7 +55,9 @@ def test_sqlite_busy_timeout_is_restored_after_failed_recovery_work() -> None:
         with recovery_deadline(time.monotonic() + 0.05):
             with pytest.raises(RuntimeError, match="sentinel"):
                 with bounded_sqlite_busy(conn):
-                    assert 0 < conn.execute("PRAGMA busy_timeout").fetchone()[0] < 1000
+                    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 0
+                    time.sleep(0.01)
+                    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 0
                     raise RuntimeError("sentinel")
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1000
     finally:
