@@ -89,9 +89,22 @@ def install_exclusion_schema(conn: sqlite3.Connection) -> None:
 
 
 def _canonical_exclusion_shape(conn: sqlite3.Connection) -> bool:
+    names = tuple(EXCLUSION_NAMES)
+    max_sql = max(len(statement.encode("utf-8")) for statement in EXCLUSION_SQL)
+    metadata = conn.execute(
+        "SELECT length(CAST(name AS BLOB)),length(CAST(sql AS BLOB)) "
+        "FROM sqlite_master WHERE name IN (?,?,?,?) LIMIT 5",
+        names,
+    ).fetchall()
+    if (len(metadata) != len(EXCLUSION_SQL)
+            or any(type(name_size) is not int or not 0 < name_size <= 128
+                   or type(sql_size) is not int or not 0 < sql_size <= max_sql
+                   for name_size, sql_size in metadata)):
+        return False
     rows = conn.execute(
-        "SELECT name,sql FROM sqlite_master WHERE name IN (?,?,?,?)",
-        tuple(EXCLUSION_NAMES),
+        "SELECT name,substr(CAST(sql AS BLOB),1,?) "
+        "FROM sqlite_master WHERE name IN (?,?,?,?) LIMIT 5",
+        (max_sql + 1, *names),
     ).fetchall()
     if len(rows) != len(EXCLUSION_SQL):
         return False
@@ -101,14 +114,40 @@ def _canonical_exclusion_shape(conn: sqlite3.Connection) -> bool:
         "recovery_guard_recovery_exclusions_update": EXCLUSION_SQL[2].replace(" IF NOT EXISTS", "", 1),
         "recovery_guard_recovery_exclusions_delete": EXCLUSION_SQL[3].replace(" IF NOT EXISTS", "", 1),
     }
-    return all(expected.get(name) == sql for name, sql in rows)
+    return all(type(sql) is bytes and expected.get(name, "").encode("utf-8") == sql
+               for name, sql in rows)
 
 
 def _catalog(conn: sqlite3.Connection) -> Literal["absent", "bootstrap", "old_ordinary", "full"]:
     """Classify only recognized authority shapes; never infer absence on error."""
-    rows = conn.execute(
-        "SELECT type,name FROM sqlite_master WHERE name GLOB 'recovery_*'"
+    from hermes_state_recovery_guard import _LEDGER, _ROWS
+
+    max_entries = len(_LEDGER) + 3 * (len(_ROWS) + len(_LEDGER))
+    metadata = conn.execute(
+        "SELECT length(CAST(type AS BLOB)),length(CAST(name AS BLOB)) "
+        "FROM sqlite_master WHERE name GLOB 'recovery_*' LIMIT ?",
+        (max_entries + 1,),
     ).fetchall()
+    if (len(metadata) > max_entries or any(
+        type(type_size) is not int or not 0 < type_size <= 8
+        or type(name_size) is not int or not 0 < name_size <= 128
+        for type_size, name_size in metadata
+    )):
+        raise RecoveryRefused("protected_session_authority_unavailable")
+    raw_rows = conn.execute(
+        "SELECT type,substr(CAST(name AS BLOB),1,129) "
+        "FROM sqlite_master WHERE name GLOB 'recovery_*' LIMIT ?",
+        (max_entries + 1,),
+    ).fetchall()
+    if len(raw_rows) != len(metadata):
+        raise RecoveryRefused("protected_session_authority_unavailable")
+    try:
+        rows = [(kind, raw_name.decode("utf-8")) for kind, raw_name in raw_rows
+                if type(raw_name) is bytes and len(raw_name) <= 128]
+    except UnicodeError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    if len(rows) != len(raw_rows):
+        raise RecoveryRefused("protected_session_authority_unavailable")
     names = {name for _kind, name in rows}
     if not names:
         return "absent"
@@ -116,8 +155,6 @@ def _catalog(conn: sqlite3.Connection) -> Literal["absent", "bootstrap", "old_or
         if not _canonical_exclusion_shape(conn):
             raise RecoveryRefused("protected_session_authority_unavailable")
         return "bootstrap"
-    from hermes_state_recovery_guard import _LEDGER
-
     table_names = {name for kind, name in rows if kind == "table"}
     non_tables = {name for kind, name in rows if kind != "table"}
     old_tables = set(_LEDGER) - {EXCLUSION_TABLE}
@@ -138,8 +175,10 @@ def _catalog(conn: sqlite3.Connection) -> Literal["absent", "bootstrap", "old_or
     if EXCLUSION_TABLE not in table_names or not _canonical_exclusion_shape(conn):
         raise RecoveryRefused("protected_session_authority_unavailable")
     from hermes_recovery_refusal import require_compatible_recovery_connection
+    from hermes_state_recovery_guard import require_current_recovery_guards
 
     require_compatible_recovery_connection(conn)
+    require_current_recovery_guards(conn)
     return "full"
 
 

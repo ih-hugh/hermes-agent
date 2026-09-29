@@ -13,36 +13,27 @@ from hermes_recovery_refusal import (
     require_unprotected_store,
 )
 from hermes_state_recovery import RecoveryRefused
-from hermes_state_recovery_exclusions import install_exclusion_schema
+from tests.hermes_state.test_recovery_write_guard import _protected_db
 
 
 def _catalog(path, *, phase="open", member_state="open"):
-    with sqlite3.connect(path) as conn:
-        conn.executescript("""
-            CREATE TABLE recovery_store(singleton INTEGER, store_id TEXT);
-            CREATE TABLE recovery_sessions(session_id TEXT PRIMARY KEY, profile TEXT,
-                scope_digest TEXT, phase TEXT, revision INTEGER, root_run_id TEXT);
-            CREATE TABLE recovery_members(run_id TEXT PRIMARY KEY, session_id TEXT,
-                generation INTEGER, producer_state TEXT);
-            CREATE TABLE recovery_producers(producer_id TEXT, run_id TEXT, kind TEXT,
-                state TEXT, parent_producer_id TEXT);
-            CREATE TABLE recovery_root_done(run_id TEXT);
-            CREATE TABLE recovery_sends(attempt_id TEXT, run_id TEXT, producer_id TEXT,
-                sequence INTEGER, state TEXT, delta_id TEXT);
-            CREATE TABLE recovery_usage_slots(delta_id TEXT, attempt_id TEXT, state TEXT);
-            CREATE TABLE recovery_write_acks(write_id TEXT, session_id TEXT, run_id TEXT,
-                generation INTEGER, mutation TEXT, state TEXT);
-            CREATE TABLE recovery_provider_admissions(session_id TEXT, provider TEXT,
-                hermes_revision TEXT, source_sha256 TEXT, provider_sha256 TEXT,
-                lease_id TEXT, grant_sha256 TEXT, admission_json TEXT, admission_sha256 TEXT);
-            CREATE TABLE recovery_provider_invocations(invocation_id TEXT, session_id TEXT,
-                run_id TEXT, generation INTEGER, producer_id TEXT, sequence INTEGER,
-                kind TEXT, state TEXT, create_invocation_id TEXT, container_id TEXT,
-                container_attestation_sha256 TEXT, exit_code INTEGER, outcome_reason TEXT);
-        """)
-        install_exclusion_schema(conn)
-        conn.execute("INSERT INTO recovery_sessions VALUES('protected', '', '', ?, 0, 'run')", (phase,))
-        conn.execute("INSERT INTO recovery_members VALUES('run', 'protected', 0, ?)", (member_state,))
+    db, store, scope, _ = _protected_db(path.parent)
+    try:
+        def _set_state(conn):
+            conn.execute(
+                "UPDATE recovery_sessions SET phase=? WHERE session_id=?",
+                (phase, scope.session_id),
+            )
+            conn.execute(
+                "UPDATE recovery_members SET producer_state=? WHERE run_id='root'",
+                (member_state,),
+            )
+
+        store._write(_set_state)
+    finally:
+        db.close()
+    if path.name != "state.db":
+        (path.parent / "state.db").rename(path)
 
 
 @pytest.mark.parametrize("phase", ["open", "closing", "sealed"])
@@ -51,7 +42,7 @@ def test_exact_durable_identity_refuses_in_every_phase(tmp_path, phase, member_s
     path = tmp_path / "state.db"
     _catalog(path, phase=phase, member_state=member_state)
     with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
-        require_unprotected_session("protected", db_path=path)
+        require_unprotected_session("protected-session", db_path=path)
     require_unprotected_session("ordinary", db_path=path)
     with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
         require_unprotected_store(db_path=path)
@@ -61,7 +52,7 @@ def test_readonly_probe_uses_escaped_exact_path_and_never_creates_store(tmp_path
     path = tmp_path / "state?#%.db"
     _catalog(path)
     with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
-        require_unprotected_session("protected", db_path=path)
+        require_unprotected_session("protected-session", db_path=path)
     absent = tmp_path / "absent?#%.db"
     require_unprotected_session("ordinary", db_path=absent)
     assert not absent.exists()
@@ -112,9 +103,12 @@ def test_orphan_member_and_surviving_usage_ledger_are_not_ordinary(tmp_path):
     path = tmp_path / "state.db"
     _catalog(path)
     with sqlite3.connect(path) as conn:
-        conn.execute("DELETE FROM recovery_sessions WHERE session_id='protected'")
+        # Deliberately forge an orphan through the exact ledger guard. This
+        # simulates corrupt historical authority, not a normal state transition.
+        conn.create_function("recovery_store_guard", 0, lambda: 1)
+        conn.execute("DELETE FROM recovery_sessions WHERE session_id='protected-session'")
     with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
-        require_unprotected_session("protected", db_path=path)
+        require_unprotected_session("protected-session", db_path=path)
     with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
         require_unprotected_store(db_path=path)
 
@@ -149,8 +143,7 @@ def test_partial_guard_trigger_inventory_is_unknown(tmp_path):
     path = tmp_path / "state.db"
     _catalog(path)
     with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TRIGGER recovery_guard_recovery_sessions_insert "
-                     "BEFORE INSERT ON recovery_sessions BEGIN SELECT 1; END")
+        conn.execute("DROP TRIGGER recovery_guard_recovery_sessions_insert")
     with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
         require_unprotected_session("ordinary", db_path=path)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 import weakref
 import json
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -55,6 +56,9 @@ _INITIAL_METADATA_RESTRICTED = tuple(
     if column not in {"model", "model_config", "display_name"}
 )
 _IMMUTABLE_SOURCE_COLUMNS = ("source", "profile_name", "started_at", "system_prompt")
+_MAX_GUARD_NAME_BYTES = 128
+_MAX_GUARD_SQL_BYTES = 16 * 1024
+_MAX_SESSION_GUARD_COLUMNS = 128
 _INITIAL_METADATA: ContextVar[tuple[int, int, int, str, str, int, int] | None] = ContextVar(
     "recovery_initial_session_metadata", default=None,
 )
@@ -309,8 +313,22 @@ def register_connection_guard(conn: sqlite3.Connection, db: SessionDB) -> None:
     )
 
 
-def install_recovery_guards(conn: sqlite3.Connection) -> None:
-    """Create opted-in triggers inside the admission transaction."""
+def _guard_statements(conn: sqlite3.Connection) -> Iterator[tuple[str, str]]:
+    """One canonical source for guard installation and installed-body validation."""
+    from hermes_state_recovery import RecoveryRefused
+
+    columns_rows = conn.execute(
+        "SELECT substr(name,1,129),length(CAST(name AS BLOB)) "
+        "FROM pragma_table_info('sessions') LIMIT ?",
+        (_MAX_SESSION_GUARD_COLUMNS + 1,),
+    ).fetchall()
+    if (not columns_rows or len(columns_rows) > _MAX_SESSION_GUARD_COLUMNS
+            or any(type(name) is not str or type(size) is not int
+                   or size > _MAX_GUARD_NAME_BYTES
+                   or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+                   for name, size in columns_rows)):
+        raise RecoveryRefused("protected_session_authority_unavailable")
+    columns = [name for name, _size in columns_rows]
     for table, id_col in _ROWS.items():
         mutation = _MUTATION[table]
         for operation, identities in (
@@ -331,7 +349,6 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                     f"CASE WHEN {nonzero} THEN 'usage' ELSE 'session' END"
                 )
             if table == "sessions" and operation == "UPDATE":
-                columns = [str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")]
                 allowed = set(_INITIAL_METADATA_COLUMNS)
                 initial_only = " AND ".join(
                     f"OLD.{column} IS NEW.{column}" for column in columns if column not in allowed
@@ -378,7 +395,7 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                 f"recovery_row_guard({identity}, {checked_mutation}) = 1"
                 for identity in identities
             )
-            conn.execute(
+            yield name, (
                 f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
                 f"BEGIN SELECT CASE WHEN NOT ({checks}) THEN RAISE(ABORT, 'recovery_write_refused') END; END"
             )
@@ -399,7 +416,7 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                         "WHERE session_id=NEW.session_id) "
                         if table == "recovery_sealed_pages" else ""
                     )
-                    conn.execute(
+                    yield name, (
                         f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE INSERT ON {table} "
                         "BEGIN SELECT CASE WHEN recovery_store_guard() != 1 "
                         "OR NOT EXISTS(SELECT 1 FROM recovery_sessions "
@@ -410,14 +427,101 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                     )
                 else:
                     # No holder, including the private writer, may mutate a seal.
-                    conn.execute(
+                    yield name, (
                         f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
                         "BEGIN SELECT RAISE(ABORT, 'recovery_immutable_seal'); END"
                     )
                 continue
             name = f"recovery_guard_{table}_{operation.lower()}"
-            conn.execute(
+            yield name, (
                 f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
                 "BEGIN SELECT CASE WHEN recovery_store_guard() != 1 "
                 "THEN RAISE(ABORT, 'recovery_store_refused') END; END"
             )
+
+
+def install_recovery_guards(conn: sqlite3.Connection) -> None:
+    """Create opted-in triggers inside the admission transaction."""
+    for _name, statement in _guard_statements(conn):
+        conn.execute(statement)
+
+
+def require_current_recovery_guards(conn: sqlite3.Connection) -> None:
+    """Refuse stale, partial, or unrecognized installed recovery authority."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import EXCLUSION_NAMES, EXCLUSION_SQL
+
+    exclusion_guards = EXCLUSION_NAMES - {"recovery_exclusions"}
+    expected_count = 3 * (len(_ROWS) + len(_LEDGER) - 1) + len(exclusion_guards)
+    try:
+        # SQLite computes lengths without transferring an arbitrary trigger body
+        # into Python. The +1 row detects any extra catalog entry.
+        metadata = conn.execute(
+            "SELECT length(CAST(type AS BLOB)),length(CAST(name AS BLOB)),"
+            "length(CAST(sql AS BLOB)) FROM sqlite_master "
+            "WHERE name GLOB 'recovery_guard_*' LIMIT ?",
+            (expected_count + 1,),
+        ).fetchall()
+        if (len(metadata) > expected_count or any(
+            type(type_size) is not int or not 0 < type_size <= 8
+            or type(name_size) is not int or not 0 < name_size <= _MAX_GUARD_NAME_BYTES
+            or type(sql_size) is not int or not 0 < sql_size <= _MAX_GUARD_SQL_BYTES
+            for type_size, name_size, sql_size in metadata
+        )):
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        # Both fields are truncated at a fixed byte bound even if another
+        # connection changes schema between the metadata and body queries.
+        rows = conn.execute(
+            "SELECT type,substr(CAST(name AS BLOB),1,?),"
+            "substr(CAST(sql AS BLOB),1,?) FROM sqlite_master "
+            "WHERE name GLOB 'recovery_guard_*' LIMIT ?",
+            (_MAX_GUARD_NAME_BYTES + 1, _MAX_GUARD_SQL_BYTES + 1, expected_count + 1),
+        ).fetchall()
+        if len(rows) != len(metadata):
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        actual: dict[str, bytes] = {}
+        for kind, raw_name, raw_sql in rows:
+            if (kind != "trigger" or type(raw_name) is not bytes
+                    or type(raw_sql) is not bytes
+                    or len(raw_name) > _MAX_GUARD_NAME_BYTES
+                    or len(raw_sql) > _MAX_GUARD_SQL_BYTES):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            try:
+                name = raw_name.decode("utf-8")
+            except UnicodeError as exc:
+                raise RecoveryRefused("protected_session_authority_unavailable") from exc
+            if name in actual:
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            actual[name] = raw_sql
+
+        expected_exclusions = {
+            statement.split(" ", 6)[5]: statement.replace(" IF NOT EXISTS", "", 1).encode("utf-8")
+            for statement in EXCLUSION_SQL[1:]
+        }
+        if set(expected_exclusions) != exclusion_guards or any(
+            actual.get(name) != sql for name, sql in expected_exclusions.items()
+        ):
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        installed = set(actual) - exclusion_guards
+        if not installed:
+            # Full tables are installed on ordinary stores before any recovery
+            # admission. Only positively empty authority tables may omit guards.
+            if any(conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                   for table in _LEDGER
+                   if table not in {"recovery_store", "recovery_exclusions"}):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            return
+
+        expected = {
+            name: statement.replace(" IF NOT EXISTS", "", 1).encode("utf-8")
+            for name, statement in _guard_statements(conn)
+        }
+        if (len(expected) != expected_count - len(exclusion_guards)
+                or any(len(name.encode("utf-8")) > _MAX_GUARD_NAME_BYTES
+                       or len(sql) > _MAX_GUARD_SQL_BYTES
+                       for name, sql in expected.items())
+                or installed != set(expected)
+                or any(actual[name] != sql for name, sql in expected.items())):
+            raise RecoveryRefused("protected_session_authority_unavailable")
+    except sqlite3.DatabaseError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc

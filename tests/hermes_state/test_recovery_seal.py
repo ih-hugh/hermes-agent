@@ -467,10 +467,13 @@ def test_guarded_transcript_preserves_inactive_blob_and_json_looking_text(
             == "blob"
         )
         # Scratch state models a guarded row later made inactive by transcript maintenance.
+        from hermes_state_recovery_guard import install_recovery_guards
+
         store._write(
             lambda conn: (
                 conn.execute("DROP TRIGGER recovery_guard_messages_update"),
                 conn.execute("UPDATE messages SET active=0 WHERE id=?", (message_id,)),
+                install_recovery_guards(conn),
             )
         )
         request = _close(store, scope, producer)

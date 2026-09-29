@@ -175,6 +175,10 @@ class RecoveryStore:
                             and existing[2] == admission.parent_run_id and
                             hmac.compare_digest(existing[3], identity.request_sha256))
                 return AdmissionResult("replayed" if matching else "conflict", member)
+            from hermes_state_recovery_exclusions import _catalog
+
+            if _catalog(conn) != "full":
+                raise RecoveryRefused("protected_session_authority_unavailable")
             # The old transport store is a different DB. Protected keys are never written
             # there, and a collision found by the API adapter is refused before this call.
             row = self._session(conn, scope)
@@ -190,6 +194,8 @@ class RecoveryStore:
                     return AdmissionResult("refused", None, "existing_session")
                 from hermes_state_recovery_guard import install_recovery_guards
                 install_recovery_guards(conn)
+                if _catalog(conn) != "full":
+                    raise RecoveryRefused("protected_session_authority_unavailable")
                 # A stopped queued run still has a real source row. Insert it
                 # before the recovery identity in this same transaction: the
                 # row trigger sees no protected identity yet, while commit

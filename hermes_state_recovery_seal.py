@@ -1234,6 +1234,10 @@ def finalize(
                     conn, scope, request.run_ids[0], request
                 )
                 return document[0]
+            from hermes_state_recovery_exclusions import _catalog
+
+            if _catalog(conn) != "full":
+                raise RecoveryRefused("protected_session_authority_unavailable")
             revision, members = _member_preflight(conn, store, scope, request, budget)
             acks, lineage = _ack_values(conn, scope, budget)
             transcript, accounting = _source_values(conn, scope, budget, lineage)
