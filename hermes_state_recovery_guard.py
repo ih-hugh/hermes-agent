@@ -297,14 +297,32 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
             # operation; a general store guard would grant broader authority.
             continue
         for operation in ("INSERT", "UPDATE", "DELETE"):
-            if table in {"recovery_seal_documents", "recovery_sealed_pages"} and operation != "INSERT":
-                # Immutable rows have unconditional triggers, including for
-                # a process holding the private store-writer authority.
+            if table in {"recovery_seal_documents", "recovery_sealed_pages"}:
                 name = f"recovery_guard_{table}_{operation.lower()}"
-                conn.execute(
-                    f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
-                    "BEGIN SELECT RAISE(ABORT, 'recovery_immutable_seal'); END"
-                )
+                if operation == "INSERT":
+                    # BEFORE INSERT also runs for INSERT OR REPLACE, whose implicit
+                    # DELETE does not run DELETE triggers by default in SQLite.
+                    key = " AND route_page=NEW.route_page" if table == "recovery_sealed_pages" else ""
+                    missing_document = (
+                        "OR NOT EXISTS(SELECT 1 FROM recovery_seal_documents "
+                        "WHERE session_id=NEW.session_id) "
+                        if table == "recovery_sealed_pages" else ""
+                    )
+                    conn.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE INSERT ON {table} "
+                        "BEGIN SELECT CASE WHEN recovery_store_guard() != 1 "
+                        "OR NOT EXISTS(SELECT 1 FROM recovery_sessions "
+                        "WHERE session_id=NEW.session_id AND phase='closing') "
+                        f"OR EXISTS(SELECT 1 FROM {table} WHERE session_id=NEW.session_id{key}) "
+                        f"{missing_document}"
+                        "THEN RAISE(ABORT, 'recovery_immutable_seal') END; END"
+                    )
+                else:
+                    # No holder, including the private writer, may mutate a seal.
+                    conn.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
+                        "BEGIN SELECT RAISE(ABORT, 'recovery_immutable_seal'); END"
+                    )
                 continue
             name = f"recovery_guard_{table}_{operation.lower()}"
             conn.execute(
