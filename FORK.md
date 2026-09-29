@@ -102,12 +102,13 @@ is not a builder-only action. No runtime update or restart accompanied this reco
   interrupt, HTTP 409, keyed persistence, redaction, and stopping/terminal race
   regressions, followed by exact-source scratch gateway qualification.
 
-## Unmerged candidate: R0 producer finalization
+## PR #4 — R0 producer finalization, qualification continuing
 
-This candidate is under implementation and review on `codex/recovery-session-seal`.
-It is not on fork main, in the BytFactory vendor pin, or deployed. The reviewed
+[PR #4](https://github.com/ih-hugh/hermes-agent/pull/4) was merged by the owner on
+2026-09-29 as `47e1cea164cf6abbef881bc7c3c470cdbd870c6a`. The merge does not clear
+the qualification items below. R0 is not in the BytFactory vendor pin or deployed. The reviewed
 BytFactory plan is `docs/superpowers/plans/2026-09-28-supported-recovery.md`.
-At the 2026-09-29 source refresh, fork main remained
+At the pre-merge 2026-09-29 source refresh, fork main remained
 `c8cc4723244cea6b994dab5974fcb11d7615f671` and BytFactory main remained
 `11414a16930c90de04b320bce2550c8746ed8018`, with vendor pin
 `2be8441ba14eb9cf5809d7f3084663066692206f`.
@@ -209,6 +210,38 @@ At the 2026-09-29 source refresh, fork main remained
   and disposable served-runtime qualification. A terminal status or dead PID is never
   sufficient replacement evidence.
 
+### R0 qualification follow-up — macOS WAL detector and fork CI
+
+- `85b32502f2fe046f40007bdbee56650bdda1af95` rechecks the same macOS process and
+  descriptor before using an enumerated WAL/SHM holder. A scratch real-libproc
+  barrier reproduced a false refusal after that descriptor closed. A live stale
+  descriptor still refuses; fd reuse is judged by its fresh identity. Only
+  `EBADF`/`ESRCH` clear a vanished candidate. Short, empty or otherwise ambiguous
+  results retain the earlier observation. This closes the reproduced race class;
+  it does not establish the cause of the earlier uninstrumented failure or make
+  the two observations atomic. Main seams are `hermes_state_dbfile.py` and
+  `tests/hermes_state/test_deleted_wal_generation_guard.py`. Independent focused
+  qualification passed 61 tests with 11 Linux-only skips on macOS. No upstream
+  submission is recorded; retain the real close/reuse/live/ambiguous regressions
+  when assessing an upstream equivalent.
+- On 2026-09-29 the fork's Actions tab still showed inherited workflows disabled
+  despite REST reporting Actions enabled and CI active. Enabling CI alone did not
+  clear that repository latch. After recording the prior state and disabling
+  unrelated workflows, the repository Actions permissions update enabled the
+  fork. The UI and REST state were checked: CI and its selected reusable workflow
+  files are present, while publishing, automatic source edits and unrelated workflows
+  remain disabled. Scheduled OSV retains GitHub's `disabled_fork` state; its use
+  as a reusable CI workflow still needs a run. Activation did not produce a
+  retrospective PR #4 run. Actual exact-source CI qualification remains open.
+- `95b88e67b06e28725f9395597bba9a102517d468` makes the existing CI usable on
+  forks with standard hosted runners: upstream retains its larger runner labels;
+  fork Linux tests use four workers with a bounded 60-minute full-suite job, and
+  fork Windows, JS and Rust lanes use standard labels. The selected tests, steps
+  and aggregate gate are unchanged. CI also accepts manual dispatch for future
+  exact-main qualification. Independent structural review passed; a hosted run
+  is still required. Retire these repository conditions if upstream CI becomes
+  portable across forks without changing test coverage.
+
 ## Upstream maintenance plan
 
 This is the proposed operating cadence; no recurring job or automatic update has
@@ -252,6 +285,7 @@ been installed.
 PR #2 was the next deployment candidate at the early 2026-09-28 checkpoint.
 [BytFactory PR #68](https://github.com/ih-hugh/BytFactory/pull/68) subsequently pinned
 it; the integration contract records the later dated deployment and bounded trials.
-This register does not freshly attest the running gateway. R0 requires a separate
-reviewed fork merge, Factory pin, release and deployment qualification. The much
+This register does not freshly attest the running gateway. R0's fork merge is
+recorded above; it still requires qualification of its follow-up fixes, the separate
+Factory pin, release and deployment. The much
 larger upstream catch-up remains a separate reviewed compatibility scope.
