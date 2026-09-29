@@ -47,6 +47,13 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # re-run as a full-context turn; 48h keeps weekend results deliverable.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_ASYNC_DELEGATION_COLUMNS = frozenset({
+    "delegation_id", "origin_session", "origin_ui_session_id", "parent_session_id",
+    "state", "dispatched_at", "completed_at", "updated_at", "event_json",
+    "result_json", "delivery_state", "delivery_attempts", "delivered_at",
+    "owner_pid", "owner_started_at", "task_json", "delivery_claim",
+    "delivery_claimed_at", "origin_session_id",
+})
 
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
 # A runner wedged before returning never reaches its finalizer, so it would show
@@ -83,10 +90,17 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     from hermes_recovery_refusal import require_unprotected_store
+    from hermes_state_recovery import RecoveryRefused
 
     # A raw opener must not repair/reconcile an opted store, even before its
     # own ledger write. This probe does not instantiate SessionDB or create a DB.
-    require_unprotected_store(db_path=_db_path())
+    protected_store = False
+    try:
+        require_unprotected_store(db_path=_db_path())
+    except RecoveryRefused as exc:
+        if exc.code != "protected_session_dispatch":
+            raise
+        protected_store = True
     from hermes_cli.sqlite_util import open_db
     # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
     # hardening so this writer doesn't create/leave the file (and its WAL
@@ -98,7 +112,8 @@ def _connect() -> sqlite3.Connection:
     _secure_state_db_files(path, create_main=True)
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
     conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
+                   wal=False, row_factory=None,
+                   initialize=_initialize_existing_schema if protected_store else _initialize_schema)
     _secure_state_db_files(path)
     return conn
 
@@ -123,6 +138,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # nullability/defaults depending on which authority touched the database
     # first (#94691).
     reconcile_state_schema(conn)
+
+
+def _initialize_existing_schema(conn: sqlite3.Connection) -> None:
+    """Use a healthy opted store without schema DDL or reconciliation."""
+    from hermes_recovery_refusal import require_compatible_recovery_connection
+    from hermes_state_recovery import RecoveryRefused
+
+    conn.create_function("recovery_row_guard", 2, lambda _sid, _mutation: 0)
+    conn.create_function("recovery_store_guard", 0, lambda: 0)
+    require_compatible_recovery_connection(conn)
+    row = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name='async_delegations'"
+    ).fetchone()
+    columns = conn.execute("PRAGMA table_info(async_delegations)").fetchall()
+    by_name = {entry[1]: entry for entry in columns}
+    if (row is None or row[0] != "table"
+            or not _ASYNC_DELEGATION_COLUMNS <= by_name.keys()
+            or by_name["delegation_id"][5] != 1):
+        raise RecoveryRefused("protected_session_authority_unavailable")
 
 
 def _transaction():
@@ -163,7 +197,11 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
              record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
              json.dumps(task_payload), record.get("origin_session_id", "")))
-    _prune_durable_records()
+    try:
+        _prune_durable_records()
+    except Exception:
+        # Dispatch has already committed; retention maintenance cannot undo it.
+        logger.warning("Async delegation retention prune failed after dispatch", exc_info=True)
 
 
 def _prune_durable_records() -> None:
@@ -559,7 +597,7 @@ def _dispatch(
         else:
             require_unprotected_store(db_path=_db_path())
     except RecoveryRefused as exc:
-        return {"status": "rejected", "error": exc.code}
+        return {"status": "rejected", "code": exc.code, "error": exc.code}
     is_batch = goals is not None
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
@@ -581,10 +619,21 @@ def _dispatch(
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
-            return {"status": "rejected", "error": capacity_error}
+            return {"status": "rejected", "code": "capacity", "error": capacity_error}
+        try:
+            _persist_dispatch(record)
+        except RecoveryRefused as exc:
+            return {"status": "rejected", "code": exc.code, "error": exc.code}
+        except Exception:
+            # The write may have committed before the exception. No worker starts;
+            # the caller gets the exact ID for readback/repair, not a false refusal.
+            logger.warning("Async delegation persistence outcome unknown for %s", delegation_id,
+                           exc_info=True)
+            return {"status": "unknown", "code": "delegation_persistence_unknown",
+                    "error": "delegation_persistence_unknown",
+                    "delegation_id": delegation_id}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    _persist_dispatch(record)
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
     executor = _get_executor(max(max_async_children, live_units))
@@ -614,7 +663,8 @@ def _dispatch(
             _records.pop(delegation_id, None)
         with _DB_LOCK, _transaction() as conn:
             conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+        return {"status": "rejected", "code": "scheduling_failed",
+                "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}
@@ -630,7 +680,7 @@ def dispatch_async_delegation(
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
     no contextvars) and route the completion back to the spawning session.
     ``progress_fn() -> (token, in_tool)`` enables stale monitoring; omitted = unmonitored.
-    Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
+    Returns dispatched, typed rejection, or unknown persistence with an ID for repair."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
         delegation_id=delegation_id, goal=goal, goals=None, context=context,

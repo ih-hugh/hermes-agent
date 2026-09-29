@@ -648,7 +648,7 @@ class SessionDB(
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
         are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
         conn = _connect_tracked_db(
-            f"file:{self.db_path}?mode=ro", tracking_path=self.db_path, uri=True,
+            self.db_path.absolute().as_uri() + "?mode=ro", tracking_path=self.db_path, uri=True,
             check_same_thread=False, timeout=timeout, isolation_level=None,
         )
         conn.row_factory = sqlite3.Row

@@ -6,7 +6,12 @@ import sqlite3
 
 import pytest
 
-from hermes_recovery_refusal import require_unprotected_session, require_unprotected_store
+from hermes_recovery_refusal import (
+    readonly_declared_session,
+    readonly_resume_session,
+    require_unprotected_session,
+    require_unprotected_store,
+)
 from hermes_state_recovery import RecoveryRefused
 
 
@@ -51,6 +56,21 @@ def test_readonly_probe_uses_escaped_exact_path_and_never_creates_store(tmp_path
     absent = tmp_path / "absent?#%.db"
     require_unprotected_session("ordinary", db_path=absent)
     assert not absent.exists()
+
+
+def test_readonly_alias_resolution_uses_escaped_exact_path(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state?#%.db"
+    db = SessionDB(path)
+    try:
+        db.create_session("exact", source="api_server", session_key="route-key")
+    finally:
+        db.close()
+
+    assert readonly_declared_session("route-key", db_path=path) == "exact"
+    assert readonly_resume_session("exact", db_path=path) == "exact"
+    assert not (tmp_path / "state").exists()
 
 
 @pytest.mark.parametrize("shape", ["corrupt", "partial", "directory"])
@@ -124,3 +144,18 @@ def test_partial_guard_trigger_inventory_is_unknown(tmp_path):
                      "BEFORE INSERT ON recovery_sessions BEGIN SELECT 1; END")
     with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
         require_unprotected_session("ordinary", db_path=path)
+
+
+@pytest.mark.parametrize("kind", ["view", "index"])
+def test_unknown_recovery_catalog_object_is_not_legacy(tmp_path, kind):
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        if kind == "view":
+            conn.execute("CREATE VIEW recovery_future_authority AS SELECT 1 AS protected")
+        else:
+            conn.execute("CREATE TABLE ordinary(id TEXT)")
+            conn.execute("CREATE INDEX recovery_future_authority ON ordinary(id)")
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        require_unprotected_session("ordinary", db_path=path)
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        require_unprotected_store(db_path=path)

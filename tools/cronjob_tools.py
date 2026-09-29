@@ -535,9 +535,18 @@ def _try_dispatch_background_run(
     if dispatch.get("status") == "dispatched":
         return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
 
-    # Pool at capacity (or submit failure): the claim is already taken and must not be stranded.
+    if dispatch.get("status") != "rejected" or dispatch.get("code") != "capacity":
+        # Persistence may have committed and protected refusal is authoritative.
+        # Neither outcome authorizes a second, inline execution.
+        return {"claimed": True, "dispatched": False, "success": False,
+                "error": dispatch.get("error") or "background dispatch unavailable",
+                "code": dispatch.get("code") or "background_dispatch_unavailable",
+                "delegation_id": dispatch.get("delegation_id"),
+                "dispatch_status": dispatch.get("status", "unknown")}
+
+    # Only a proved capacity rejection permits the existing inline fallback.
     logger.info(
-        "cronjob run: background pool unavailable (%s); running job '%s' inline.",
+        "cronjob run: background pool at capacity (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
     result = _run_claimed_job(job, extra_prompt=extra_prompt)
     result["dispatched"] = False

@@ -35,6 +35,17 @@ async def _refuse_recovery_session(adapter, *session_ids: str) -> None:
         db_path = None
     await asyncio.to_thread(require_unprotected_session, *session_ids, db_path=db_path)
 
+
+async def _readonly_recovery_identity(adapter, value: str, *, declared: bool = False) -> str | None:
+    from hermes_recovery_refusal import readonly_declared_session, readonly_resume_session
+
+    db_path = getattr(getattr(adapter, "_session_db", None), "db_path", None)
+    if not isinstance(db_path, (str, Path)):
+        db_path = None
+    resolver = readonly_declared_session if declared else readonly_resume_session
+    return await asyncio.to_thread(resolver, value, db_path=db_path)
+
+
 async def _iter_stream_items(stream_q, agent_task, response):
     """Yield agent stream items until EOS, writing SSE keepalives while idle.
 
@@ -487,6 +498,8 @@ class OpenAICompatRoutesMixin:
             session_id = provided_session_id
             try:
                 await _refuse_recovery_session(self, provided_session_id)
+                session_id = await _readonly_recovery_identity(self, provided_session_id)
+                await _refuse_recovery_session(self, provided_session_id, session_id)
             except Exception:
                 return _error_response("Protected session cannot use chat completions", 409)
             try:
@@ -495,13 +508,8 @@ class OpenAICompatRoutesMixin:
                     # #98619/#13437: a client-addressed id from before a compression rotation
                     # must adopt the live continuation tip — history loads from it, the turn and
                     # the wake target bind it, and a detached delegation delivery row persisted
-                    # on the tip is what this continuation consumes. Same canonical resolution
-                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
-                    resolver = getattr(db, "resolve_resume_session_id", None)
-                    if callable(resolver):
-                        resolved = await asyncio.to_thread(resolver, provided_session_id)
-                        session_id = str(resolved) if resolved else provided_session_id
-                    await _refuse_recovery_session(self, provided_session_id, session_id)
+                    # on the tip is what this continuation consumes. The read-only resolver
+                    # above checked both identities before this writable DB acquisition.
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
             except RecoveryRefused:
                 return _error_response("Protected session cannot use chat completions", 409)
@@ -873,11 +881,11 @@ class OpenAICompatRoutesMixin:
         # id. Binding the declared key follows the same precedence: a chain-selected session must
         # not have its routing key rewritten to this header.
         _declared_selected = not stored_session_id and bool(gateway_session_key)
-        session_id = (
-            stored_session_id
-            or self._declared_conversation_session(gateway_session_key)
-            or str(uuid.uuid4()))
         try:
+            declared_session_id = (
+                await _readonly_recovery_identity(self, gateway_session_key, declared=True)
+                if _declared_selected else None)
+            session_id = stored_session_id or declared_session_id or str(uuid.uuid4())
             await _refuse_recovery_session(self, stored_session_id, session_id)
         except Exception:
             return _error_response("Protected session cannot use responses", 409)

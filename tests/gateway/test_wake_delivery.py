@@ -9,6 +9,7 @@ Two strategies:
 """
 
 import asyncio
+import sqlite3
 
 import pytest
 
@@ -75,9 +76,16 @@ async def test_delegation_delivery_checks_original_and_resolved_before_append(tm
     from gateway.wake import persist_delegation_delivery
     from tests.agent.test_recovery_runtime import _admitted
 
-    db, _store, scope, _registry = _admitted(tmp_path)
+    db, store, scope, registry = _admitted(tmp_path)
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
-    db.resolve_resume_session_id = lambda sid: scope.session_id
+    from agent.recovery_context import bind_write_permit, issue_write_permit
+
+    db.create_session("ordinary", "api_server")
+    db.end_session("ordinary", "compression")
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    with bind_write_permit(writer):
+        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
     db.append_delegation_delivery = lambda *a, **kw: pytest.fail("delivery row appended")
     adapter = SimpleNamespace(_ensure_session_db=lambda: db)
     try:
@@ -87,6 +95,31 @@ async def test_delegation_delivery_checks_original_and_resolved_before_append(tm
             await persist_delegation_delivery(adapter, text="complete", session_id=scope.session_id)
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_tip_refuses_before_writable_session_db_init(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agent.recovery_context import bind_write_permit, issue_write_permit
+    from gateway.wake import persist_delegation_delivery
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, store, scope, registry = _admitted(tmp_path)
+    db.create_session("ordinary", "api_server")
+    db.end_session("ordinary", "compression")
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    with bind_write_permit(writer):
+        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+    db.close()
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("DROP TABLE async_delegations")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter = SimpleNamespace(_ensure_session_db=lambda: pytest.fail("writable SessionDB opened"))
+    with pytest.raises(ValueError, match="protected_session_dispatch"):
+        await persist_delegation_delivery(adapter, text="complete", session_id="ordinary")
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is None
 
 
 async def _serve(handler):
@@ -216,4 +249,3 @@ def test_persist_delegation_delivery_raises_without_db():
         asyncio.run(persist_delegation_delivery(
             NoDbAdapter(), text="x", session_id="sid",
         ))
-

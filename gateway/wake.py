@@ -117,29 +117,19 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
     await _require_unprotected_wake(session_id)
+    from hermes_recovery_refusal import readonly_resume_session
+
+    db_path = getattr(getattr(adapter, "_session_db", None), "db_path", None)
+    resolved = await asyncio.to_thread(readonly_resume_session, session_id, db_path=db_path)
+    await _require_unprotected_wake(session_id, resolved, db_path=db_path)
+    session_id = resolved
     ensure = getattr(adapter, "_ensure_session_db", None)
     db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
-    db_path = getattr(db, "db_path", None)
-    # #98619: the parent run may have compressed/rotated between dispatch and this detached
-    # completion — the captured origin id is then a closed parent and the append below is
-    # rejected with CompressionSessionClosedError forever (the watcher retries the same stale
-    # id). Adopt the live continuation tip first, the same canonical resolution
-    # /api/sessions/{id}/messages reads use, so the delivery row lands where the next run and
-    # the messages endpoint both resolve. Fails open to the original id.
-    resolver = getattr(db, "resolve_resume_session_id", None)
-    if callable(resolver):
-        try:
-            resolved = await asyncio.to_thread(resolver, session_id)
-        except Exception as exc:
-            from hermes_state_recovery import RecoveryRefused
-            raise RecoveryRefused("protected_session_authority_unavailable") from exc
-        else:
-            if resolved:
-                await _require_unprotected_wake(session_id, str(resolved), db_path=db_path)
-                session_id = str(resolved)
+    # The original and live tip were resolved with a read-only handle before this
+    # writable SessionDB acquisition. The later append is still row-guarded.
     await asyncio.to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
