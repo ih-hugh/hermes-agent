@@ -212,6 +212,30 @@ def test_missing_recovery_session_catalog_entry_is_unknown(tmp_path):
     assert not list(tmp_path.glob("state.db.repair-scratch*"))
 
 
+@pytest.mark.parametrize(
+    "tables",
+    [
+        ("recovery_store", "recovery_sessions", "recovery_future_authority"),
+        ("recovery_sessions",),
+    ],
+)
+def test_partial_or_unknown_empty_recovery_catalog_refuses_repair(tmp_path, tables):
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        for table in tables:
+            conn.execute(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY)')
+    original = db_path.read_bytes()
+
+    assert _recovery_repair_classification(db_path) == "unknown"
+    report = repair_state_db_schema(db_path)
+    assert report["repaired"] is False
+    assert "unclassifiable" in report["error"]
+    assert report["backup_path"] is None
+    assert db_path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+
+
 def test_repair_classification_reads_literal_sqlite_filename(tmp_path):
     db_path = tmp_path / "state?name#percent%.db"
     _build_healthy_db(db_path)

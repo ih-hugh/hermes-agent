@@ -620,7 +620,13 @@ def _recovery_repair_classification(
                 if not objects:
                     return "legacy"
                 tables = [name for kind, name in objects if kind == "table"]
-                if len(tables) != len(objects) or tables.count("recovery_sessions") != 1:
+                from hermes_state_recovery_guard import _LEDGER
+
+                # A nonempty recovery catalog is legacy only when every known
+                # authority table is present exactly once and no unknown object
+                # survives. Keep this inventory shared with the trigger installer.
+                if (len(tables) != len(objects) or len(tables) != len(_LEDGER)
+                        or set(tables) != set(_LEDGER)):
                     return "unknown"
                 for table in tables:
                     try:
