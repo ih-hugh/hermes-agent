@@ -686,7 +686,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
-    from agent.recovery_producers import begin_chat_send, current_registry, require_supported_chat_agent
+    from agent.recovery_producers import (
+        begin_chat_send, current_registry, require_effective_chat_request,
+        require_supported_chat_agent,
+    )
     require_supported_chat_agent(agent)
     if agent.api_mode == "codex_responses":
         from agent.tool_diagnostic_transport import mark_unsupported_send
@@ -716,6 +719,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
+    require_effective_chat_request(agent, api_kwargs)
     request_client = make_client("chat_completion_request")
     from agent.tool_diagnostic_transport import observe_sdk_send
     observe_sdk_send(agent, api_kwargs)
@@ -2753,6 +2757,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # already 4xx'd on it this session (``_stream_options_unsupported``, see #9705).
         if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
             stream_kwargs["stream_options"] = {"include_usage": True}
+        from agent.recovery_producers import require_effective_chat_request
+        require_effective_chat_request(self.agent, stream_kwargs)
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()

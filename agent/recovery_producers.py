@@ -10,6 +10,9 @@ from __future__ import annotations
 import threading
 import uuid
 import weakref
+import sys
+import math
+from pathlib import Path
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -62,36 +65,159 @@ def require_unmanaged_dispatch() -> None:
     if current_registry() is None:
         return
     from agent import relay_runtime
-    from hermes_cli.middleware import (
-        LLM_EXECUTION_MIDDLEWARE,
-        LLM_REQUEST_MIDDLEWARE,
-        TOOL_EXECUTION_MIDDLEWARE,
-        TOOL_REQUEST_MIDDLEWARE,
-    )
-    from hermes_cli.plugins import has_middleware
+    from hermes_cli.plugins import get_plugin_manager
 
     runtime = relay_runtime.get_runtime(create=False)
     if ((runtime is not None and runtime.managed_execution_enabled())
-            or any(has_middleware(kind) for kind in (
-                LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
-                TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE))):
+            or any(get_plugin_manager()._middleware.values())):
         refuse_untracked_work()
 
 
-def require_supported_chat_agent(agent: object) -> None:
+def _selected_provider_and_callbacks_supported(registry: ProducerRegistry) -> bool:
+    """Inspect existing registration state without discovering or invoking plugins."""
+    from hermes_cli.plugins import get_plugin_manager
+    from hermes_cli.plugins_manifest import manifest_key
+    from hermes_state_recovery_provider import SelectedProviderCapture
+    from agent.tool_diagnostic_transport import (
+        _BUNDLED_PLUGIN_ROOT,
+        _UNOBSERVED_CALLBACK_REGISTRIES,
+        _only_stock_gateway_injector,
+        _only_stock_raft_hooks,
+    )
+
+    capture = getattr(registry, "provider_capture", None)
+    if (type(capture) is not SelectedProviderCapture
+            or capture.admission.session_id != registry.scope.session_id):
+        return False
+    provider = capture.require_selected()
+    manager = get_plugin_manager()
+    hooks = {kind: callbacks for kind, callbacks in manager._hooks.items() if callbacks}
+    if (not manager._discovered
+            or any(manager._middleware.values())
+            or (hooks and not _only_stock_raft_hooks(hooks))
+            or manager._aux_tasks
+            or manager._context_engine is not None
+            or manager._subscriptions
+            or manager._persistent_carryover
+            or not _only_stock_gateway_injector(manager._gateway_message_injector)
+            or any(getattr(manager, name, None) for name in _UNOBSERVED_CALLBACK_REGISTRIES)):
+        return False
+    selected_plugin_seen = False
+    for loaded in manager._plugins.values():
+        if not loaded.enabled:
+            continue
+        manifest = loaded.manifest
+        source = getattr(manifest, "path", None)
+        bundled = (getattr(manifest, "source", None) == "bundled"
+                   and isinstance(source, str)
+                   and Path(source).resolve().is_relative_to(_BUNDLED_PLUGIN_ROOT))
+        if bundled:
+            continue
+        if (selected_plugin_seen
+                or manifest.name != "byf_workspace"
+                or loaded.module is not sys.modules.get(type(provider).__module__)):
+            return False
+        owned = [r for r in manager._ownership_ledger.get(manifest_key(manifest), ()) if r.active]
+        if len(owned) != 1 or (owned[0].kind, owned[0].key) != (
+            "terminal_environment_provider", "byf_workspace"
+        ):
+            return False
+        selected_plugin_seen = True
+    return selected_plugin_seen
+
+
+def _exact_terminal_schema(agent: object) -> bool:
+    from tools.registry import registry as tool_registry
+    from tools.terminal_tool import TERMINAL_SCHEMA, _handle_terminal
+
+    entry = tool_registry.get_entry("terminal")
+    tools = getattr(agent, "tools", None)
+    names = getattr(agent, "valid_tool_names", None)
+    if (entry is None
+            or entry.toolset != "terminal"
+            or entry.schema is not TERMINAL_SCHEMA
+            or entry.handler is not _handle_terminal
+            or entry.dynamic_schema_overrides is not None
+            or entry.is_async
+            or type(tools) is not list
+            or len(tools) != 1
+            or type(names) is not set
+            or names != {"terminal"}
+            or getattr(agent, "_tool_snapshot_generation", None) != tool_registry._generation):
+        return False
+    schema = tools[0]
+    return (type(schema) is dict
+            and schema == {"type": "function", "function": TERMINAL_SCHEMA})
+
+
+def require_supported_chat_agent(agent: object, *, moa_config: object = None) -> None:
     """Refuse a protected turn before an uninventoryable provider path can run."""
     registry = current_registry()
     if registry is None:
         return
     toolsets = getattr(agent, "enabled_toolsets", None)
-    if (getattr(agent, "api_mode", None) != "chat_completions"
-            or getattr(agent, "provider", None) == "moa"
-            or bool(getattr(agent, "is_subagent", False))
-            or bool(getattr(agent, "_fallback_index", 0))
-            or not isinstance(toolsets, (list, tuple, set, frozenset))
-            or not set(toolsets) <= {"terminal"}):
+    try:
+        from agent.context_compressor import ContextCompressor
+        supported = (
+            getattr(agent, "api_mode", None) == "chat_completions"
+            and getattr(agent, "provider", None) != "moa"
+            and moa_config is None
+            and not bool(getattr(agent, "is_subagent", False))
+            and not bool(getattr(agent, "_fallback_index", 0))
+            and not bool(getattr(agent, "_fallback_activated", False))
+            and not bool(getattr(agent, "_fallback_chain", None))
+            and isinstance(toolsets, (list, tuple, set, frozenset))
+            and len(toolsets) == 1
+            and set(toolsets) == {"terminal_only"}
+            and type(getattr(agent, "context_compressor", None)) is ContextCompressor
+            and getattr(agent, "_memory_manager", None) is None
+            and getattr(agent, "_memory_store", None) is None
+            and bool(getattr(agent, "skip_background_review", False))
+            and _exact_terminal_schema(agent)
+            and _selected_provider_and_callbacks_supported(registry)
+        )
+    except Exception:
+        supported = False
+    if not supported:
         registry.mark_unsupported("unsupported_configuration")
         raise RecoveryRefused("unsupported_configuration")
+
+
+def require_effective_chat_request(agent: object, kwargs: object) -> None:
+    """Validate the final kwargs that this physical SDK call will receive."""
+    if current_registry() is None:
+        return
+    require_supported_chat_agent(agent)
+    allowed = frozenset({
+        "model", "messages", "tools", "timeout", "temperature", "max_tokens",
+        "max_completion_tokens", "reasoning_effort", "prompt_cache_key", "stream",
+        "stream_options",
+    })
+    def valid_timeout(value: object) -> bool:
+        import httpx
+
+        if type(value) in (int, float):
+            return math.isfinite(value) and value > 0
+        if type(value) is httpx.Timeout:
+            parts = (value.connect, value.read, value.write, value.pool)
+            return all(type(part) in (int, float) and math.isfinite(part) and part > 0
+                       for part in parts)
+        return False
+
+    if (type(kwargs) is not dict
+            or not set(kwargs).issubset(allowed)
+            or type(kwargs.get("model")) is not str
+            or kwargs["model"] != getattr(agent, "model", None)
+            or type(kwargs.get("messages")) is not list
+            or type(kwargs.get("tools")) is not list
+            or kwargs.get("tools") != agent.tools
+            or ("timeout" in kwargs and not valid_timeout(kwargs["timeout"]))
+            or ("stream" in kwargs and type(kwargs["stream"]) is not bool)
+            or ("stream_options" in kwargs and kwargs["stream_options"] != {"include_usage": True})
+            or (kwargs.get("stream") is True and kwargs.get("stream_options") != {"include_usage": True})
+            or ("stream_options" in kwargs and kwargs.get("stream") is not True)
+            or (kwargs.get("stream") is True and bool(getattr(agent, "_stream_options_unsupported", False)))):
+        refuse_untracked_work()
 
 
 def begin_chat_send(client: object) -> SendPermit | None:

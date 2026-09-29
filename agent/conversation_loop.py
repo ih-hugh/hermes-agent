@@ -1449,6 +1449,12 @@ def _run_conversation_turn(
             user_message, persist_user_message
         )
 
+    # Protected work must refuse unsupported callbacks and MoA before turn context,
+    # prompt construction, MCP refresh, or request assembly can invoke them.
+    from agent.recovery_producers import require_supported_chat_agent, require_unmanaged_dispatch
+    require_supported_chat_agent(agent, moa_config=moa_config)
+    require_unmanaged_dispatch()
+
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
