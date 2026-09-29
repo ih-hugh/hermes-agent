@@ -172,9 +172,7 @@ def _validate_fixed_cells(
 
 
 class _Value(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid", strict=True, frozen=True, populate_by_name=True
-    )
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     schema_: Literal["hermes.recovery.artifact-value/v1"] = Field(alias="schema")
 
@@ -288,10 +286,10 @@ class InvocationValue(_Value):
     sequence: int = Field(ge=0, lt=16384)
     kind: Literal["create_environment", "execute"]
     state: Literal["returned"]
-    create_invocation_id: str | None = None
-    container_id: str | None = None
-    container_attestation_sha256: str | None = None
-    exit_code: int | None = None
+    create_invocation_id: str | None
+    container_id: str | None
+    container_attestation_sha256: str | None
+    exit_code: int | None
     outcome_reason: None
 
     @model_validator(mode="after")

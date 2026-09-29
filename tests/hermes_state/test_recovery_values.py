@@ -255,6 +255,48 @@ def test_included_semantic_crosslinks_are_bounded_and_explicitly_partial():
             verify_artifact_crosslinks(changed, context)
 
 
+def test_wire_schema_key_and_complete_nullable_invocation_fields_are_required():
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1] / "fixtures" / "recovery_artifact_values_v1.json"
+        ).read_text()
+    )
+    context = SemanticContext.model_validate({
+        **fixture["context"],
+        "members": (("root", 0),),
+    })
+    assert verify_artifact_crosslinks(
+        fixture["sections"], context
+    ).route_replay_complete
+    changed = deepcopy(fixture["sections"])
+    changed["accounting"][0]["schema_"] = changed["accounting"][0].pop("schema")
+    with pytest.raises(ValueError):
+        verify_artifact_crosslinks(changed, context)
+    changed = deepcopy(fixture["sections"])
+    changed["accounting"][0]["schema_"] = changed["accounting"][0]["schema"]
+    with pytest.raises(ValueError):
+        verify_artifact_crosslinks(changed, context)
+    for index, field in (
+        (0, "create_invocation_id"),
+        (0, "exit_code"),
+        (1, "container_id"),
+        (1, "container_attestation_sha256"),
+    ):
+        changed = deepcopy(fixture["sections"])
+        changed["provider_invocations"][index].pop(field)
+        with pytest.raises(ValueError):
+            verify_artifact_crosslinks(changed, context)
+    assert (
+        fixture["sections"]["provider_invocations"][0]["create_invocation_id"] is None
+    )
+    assert fixture["sections"]["provider_invocations"][0]["exit_code"] is None
+    assert fixture["sections"]["provider_invocations"][1]["container_id"] is None
+    assert (
+        fixture["sections"]["provider_invocations"][1]["container_attestation_sha256"]
+        is None
+    )
+
+
 def test_unused_provider_and_no_calls_have_empty_independent_ledgers():
     fixture = json.loads(
         (
