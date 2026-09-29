@@ -183,8 +183,10 @@ def require_supported_chat_agent(agent: object, *, moa_config: object = None) ->
         raise RecoveryRefused("unsupported_configuration")
 
 
-def require_effective_chat_request(agent: object, kwargs: object) -> None:
-    """Validate the final kwargs that this physical SDK call will receive."""
+def require_effective_chat_request(
+    agent: object, kwargs: object, *, expected_stream: bool
+) -> None:
+    """Validate the final kwargs against this physical SDK dispatch mode."""
     if current_registry() is None:
         return
     require_supported_chat_agent(agent)
@@ -212,11 +214,11 @@ def require_effective_chat_request(agent: object, kwargs: object) -> None:
             or type(kwargs.get("tools")) is not list
             or kwargs.get("tools") != agent.tools
             or ("timeout" in kwargs and not valid_timeout(kwargs["timeout"]))
-            or ("stream" in kwargs and type(kwargs["stream"]) is not bool)
-            or ("stream_options" in kwargs and kwargs["stream_options"] != {"include_usage": True})
-            or (kwargs.get("stream") is True and kwargs.get("stream_options") != {"include_usage": True})
-            or ("stream_options" in kwargs and kwargs.get("stream") is not True)
-            or (kwargs.get("stream") is True and bool(getattr(agent, "_stream_options_unsupported", False)))):
+            or (expected_stream and kwargs.get("stream") is not True)
+            or (expected_stream and kwargs.get("stream_options") != {"include_usage": True})
+            or (expected_stream and bool(getattr(agent, "_stream_options_unsupported", False)))
+            or (not expected_stream and "stream" in kwargs and kwargs["stream"] is not False)
+            or (not expected_stream and "stream_options" in kwargs)):
         refuse_untracked_work()
 
 

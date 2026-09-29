@@ -124,7 +124,7 @@ def test_actual_protected_agent_and_request_are_qualified(tmp_path: Path, monkey
     def check(agent: AIAgent) -> None:
         require_supported_chat_agent(agent)
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "scratch"}])
-        require_effective_chat_request(agent, kwargs)
+        require_effective_chat_request(agent, kwargs, expected_stream=False)
 
     _with_protected_agent(tmp_path, monkeypatch, check)
 
@@ -260,7 +260,7 @@ def test_actual_protected_agent_or_request_drift_refuses(
             }:
                 require_supported_chat_agent(agent)
             else:
-                require_effective_chat_request(agent, kwargs)
+                require_effective_chat_request(agent, kwargs, expected_stream=False)
 
     _with_protected_agent(tmp_path, monkeypatch, check)
 

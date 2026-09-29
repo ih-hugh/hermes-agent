@@ -124,8 +124,10 @@ def test_nonstream_create_records_exact_send_and_response(tmp_path: Path, monkey
     monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
     try:
         sdk = registry.enter(registry.permit, "sdk")
+        nonstream_kwargs = _request_kwargs(agent)
+        nonstream_kwargs["stream"] = False
         sdk.run(lambda: helpers._dispatch_nonstreaming_api_request(
-            agent, _request_kwargs(agent), make_client=lambda *_: client))
+            agent, nonstream_kwargs, make_client=lambda *_: client))
         assert len(store.send_inventory(scope, "run_root")) == 1
         send = registry.claim_response_send(response)
         assert send is not None and registry.claim_response_send(response) is None
@@ -248,7 +250,7 @@ def test_stream_reopen_inventories_both_physical_sends(tmp_path: Path, monkeypat
 @pytest.mark.parametrize("change", [
     "extra_body_tools", "extra_body_model", "legacy_functions",
     "legacy_function_call", "web_search_options", "extra_headers", "extra_query",
-    "unknown_kwarg", "wrong_tools", "wrong_model",
+    "unknown_kwarg", "wrong_tools", "wrong_model", "mode_mismatch",
 ])
 def test_effective_request_refuses_before_any_physical_create(
     tmp_path: Path, monkeypatch, streaming: bool, change: str
@@ -260,7 +262,9 @@ def test_effective_request_refuses_before_any_physical_create(
     db, store, scope, registry = _admitted(tmp_path)
     client = OpenAI(api_key="test", max_retries=0)
     create_calls, client_calls = [], []
-    monkeypatch.setattr(client.chat.completions, "create", lambda **kw: create_calls.append(kw))
+    monkeypatch.setattr(
+        client.chat.completions, "create", lambda **kw: create_calls.append(kw) or object()
+    )
     monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
     agent = _supported_send_stub(
         registry, monkeypatch,
@@ -287,6 +291,12 @@ def test_effective_request_refuses_before_any_physical_create(
         kwargs["unreviewed_extension"] = {"tools": []}
     elif change == "wrong_tools":
         kwargs["tools"] = []
+    elif change == "mode_mismatch":
+        if streaming:
+            kwargs["stream"] = False
+        else:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
     else:
         kwargs["model"] = "other"
 
