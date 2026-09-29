@@ -384,6 +384,13 @@ a focused green run is not full hosted CI or an installed Factory source-pair pr
   while directing its home lookup to scratch. Its old whole-module mock omitted
   newly imported recovery helpers. The original subprocess/profile assertion
   remains; independent review passed all five related tests without retries.
+- `12131a09` makes the hosted-room page-budget fixture use fixed per-row times.
+  The first event's serialized length cannot bound later independently sampled
+  floating-point timestamps: a deterministic reproduction produced singleton
+  pages of 512 and 520 bytes against a 513-byte fixture budget. The reader's
+  refusal was correct. The fixture now checks all four pages, their byte bounds,
+  advancing cursors and final `has_more`, without changing product limits or
+  retry policy. Two canonical runs passed all 45 tests without retries.
 
 At this pre-merge checkpoint, an immutable 272-file selection at `4453db94`
 passed 4,717 tests, failed those same three macOS binary fixtures and skipped 43,
@@ -393,9 +400,12 @@ corrections and remains failed evidence. The later full run at `7eafc454` passed
 50,109 Python tests with one failure (the slash-worker fixture above) and 506
 skips. Its JavaScript lane failed TUI unmount and desktop checks; the desktop
 failure output was truncated. The output-drain correction preserves diagnostics
-for the next run, but a passing local desktop rerun does not close that hosted
-gate. Fresh full Linux CI on the final PR
-commit is required before readiness. A mixed-source local
+for the next run. Full hosted CI at `0206efd4` passed every selected lane,
+including JavaScript/desktop and Python's 50,125 tests with 501 skips, in
+[run 36607723776](https://github.com/ih-hugh/hermes-agent/actions/runs/36607723776).
+That Python result includes one retried hosted-room fixture, corrected above;
+it is not a retry-free result. Fresh full CI on the final fixture-corrected PR
+commit remains required before readiness. A mixed-source local
 run, where another worker changed initializer files after import, is invalid
 evidence for the source-epoch checks and was discarded in favor of an immutable
 checkout. No upstream submission is recorded for these follow-ups. Preserve their
