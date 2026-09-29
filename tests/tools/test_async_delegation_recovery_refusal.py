@@ -68,6 +68,9 @@ def test_raw_connect_creates_only_genuinely_absent_ordinary_store(tmp_path, monk
     try:
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() is None
     finally:
         conn.close()
     assert path.exists()
@@ -208,6 +211,198 @@ def test_public_durable_read_does_not_recreate_deleted_named_profile(tmp_path):
     assert not profile.exists()
     assert not (profile / "state.db").exists()
     assert refused
+
+
+def test_raw_schema_claim_blocks_protected_reserve_after_connection_precheck(
+    tmp_path, monkeypatch,
+):
+    from agent.recovery_context import current_incarnation
+    from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+    from hermes_state import SessionDB
+    from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
+    from tests.recovery_provider_fixture import provider_admission
+    import hermes_recovery_refusal
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
+    with sqlite3.connect(path) as setup:
+        setup.execute("DROP TABLE async_delegations")
+    original = hermes_recovery_refusal.require_unprotected_connection
+    outcomes = []
+
+    def reserve_after_precheck(conn):
+        original(conn)
+        result = store.reserve(
+            RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+            AdmissionIdentity(
+                scope, "byf-recovery-v1:root", "a" * 64, "run_root",
+                current_incarnation(), provider_admission(scope.session_id),
+            ),
+        )
+        outcomes.append((result.outcome, result.reason))
+
+    monkeypatch.setattr(hermes_recovery_refusal, "require_unprotected_connection", reserve_after_precheck)
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    try:
+        conn = ad._connect()
+        conn.close()
+        assert outcomes == [("refused", "raw_schema_active")]
+        with sqlite3.connect(path) as check:
+            assert check.execute(
+                "SELECT 1 FROM recovery_sessions WHERE session_id=?", (scope.session_id,)
+            ).fetchone() is None
+            assert check.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+            ).fetchone() is not None
+    finally:
+        db.close()
+
+
+def test_protected_reserve_winning_before_raw_claim_blocks_reconciliation(tmp_path, monkeypatch):
+    from agent.recovery_context import current_incarnation
+    from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+    from hermes_state import SessionDB
+    from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
+    from tests.recovery_provider_fixture import provider_admission
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
+    with sqlite3.connect(path) as setup:
+        setup.execute("DROP TABLE async_delegations")
+    original = exclusions.begin_raw_schema_claim
+    admitted = []
+
+    def admit_before_claim(target):
+        result = store.reserve(
+            RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+            AdmissionIdentity(
+                scope, "byf-recovery-v1:root", "a" * 64, "run_root",
+                current_incarnation(), provider_admission(scope.session_id),
+            ),
+        )
+        admitted.append(result.outcome)
+        return original(target)
+
+    monkeypatch.setattr(exclusions, "begin_raw_schema_claim", admit_before_claim)
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    try:
+        with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
+            ad._connect()
+        assert admitted == ["created"]
+        with sqlite3.connect(path) as check:
+            assert check.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+            ).fetchone() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["open", "initialize"])
+def test_failed_raw_schema_initialization_keeps_committed_claim(
+    tmp_path, monkeypatch, failure,
+):
+    from hermes_cli import sqlite_util
+    import hermes_state_schema
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected schema failure")
+
+    if failure == "open":
+        monkeypatch.setattr(sqlite_util, "open_db", fail)
+    else:
+        monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", fail)
+    with pytest.raises(RuntimeError, match="injected schema failure"):
+        ad._connect()
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+
+
+def test_raw_schema_connection_refuses_replaced_claimed_path(tmp_path, monkeypatch):
+    from hermes_cli import sqlite_util
+
+    path = tmp_path / "state.db"
+    displaced = tmp_path / "claimed.db"
+    real_open = sqlite_util.open_db
+
+    def replace_before_open(target, **kwargs):
+        path.rename(displaced)
+        with sqlite3.connect(path) as replacement:
+            replacement.execute("CREATE TABLE outsider(value TEXT)")
+        return real_open(target, **kwargs)
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", replace_before_open)
+    with pytest.raises(RecoveryRefused, match="invalid_raw_schema_lease"):
+        ad._connect()
+    with sqlite3.connect(displaced) as claimed:
+        assert claimed.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+    with sqlite3.connect(path) as replacement:
+        assert replacement.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+        ).fetchone() is None
+
+
+def test_failed_raw_schema_release_closes_connection_and_keeps_claim(tmp_path, monkeypatch):
+    from hermes_cli import sqlite_util
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    opened = []
+    real_open = sqlite_util.open_db
+
+    def track_open(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    def fail_finish(*_args, **_kwargs):
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", track_open)
+    monkeypatch.setattr(exclusions, "finish_raw_schema_claim", fail_finish)
+    with pytest.raises(RuntimeError, match="release failed"):
+        ad._connect()
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+
+
+def test_protected_existing_schema_open_never_recreates_disappeared_store(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli import sqlite_util
+
+    db, _store, _scope, _registry = _admitted(tmp_path)
+    path = db.db_path
+    db.close()
+    real_open = sqlite_util.open_db
+
+    def remove_before_open(target, **kwargs):
+        path.unlink()
+        return real_open(target, **kwargs)
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", remove_before_open)
+    with pytest.raises(sqlite3.OperationalError):
+        ad._connect()
+    assert not path.exists()
 
 
 def test_ordinary_delegation_uses_existing_schema_in_mixed_store(tmp_path, monkeypatch):

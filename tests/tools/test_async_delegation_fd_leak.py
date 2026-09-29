@@ -84,7 +84,7 @@ def _fail_large_schema_replay(self, script):
     # large multi-statement script (single durable-shape authority,
     # #94691). Simulate the DDL failure on that path so the
     # connect-close-on-init-failure contract stays pinned.
-    if len(script) > 1000:
+    if len(script) > 1000 and "CREATE TABLE IF NOT EXISTS async_delegations" in script:
         raise sqlite3.OperationalError("simulated schema init failure")
     return self._real.executescript(script)
 
@@ -96,10 +96,7 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
     real_connect = sqlite3.connect
 
     class _FailingSchemaConnection(_TrackingConnection):
-        def execute(self, sql, *args, **kwargs):
-            if "CREATE TABLE" in sql:
-                raise sqlite3.OperationalError("simulated schema init failure")
-            return self._real.execute(sql, *args, **kwargs)
+        executescript = _fail_large_schema_replay
 
     def tracking_connect(*args, **kwargs):
         conn = real_connect(*args, **kwargs)
@@ -108,11 +105,12 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
 
-    _FailingSchemaConnection.executescript = _fail_large_schema_replay
-
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(sqlite3.OperationalError, match="simulated schema init failure"):
         with ad._transaction():
             pass
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened and sorted(opened) == sorted(closed)
+    with real_connect(tmp_path / "state.db") as check:
+        assert check.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)

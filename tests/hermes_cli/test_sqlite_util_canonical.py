@@ -60,6 +60,54 @@ def test_open_db_closes_the_half_open_connection_when_initialize_raises(monkeypa
         opened[0].execute("SELECT 1")
 
 
+def test_existing_only_refuses_missing_parent_or_file_without_creation(tmp_path):
+    for path in (tmp_path / "missing" / "state.db", tmp_path / "state.db"):
+        with pytest.raises(sqlite3.OperationalError):
+            sqlite_util.open_db(path, db_label="state.db", wal=False, existing_only=True)
+        assert not path.exists()
+        if path.parent.name == "missing":
+            assert not path.parent.exists()
+
+
+def test_existing_only_uses_escaped_uri_and_preserves_existing_rows(tmp_path):
+    path = tmp_path / "state ?#%.db"
+    with sqlite3.connect(path) as setup:
+        setup.execute("CREATE TABLE example(value TEXT)")
+        setup.execute("INSERT INTO example VALUES('retained')")
+    before = {item.name for item in tmp_path.iterdir()}
+    conn = sqlite_util.open_db(path, db_label="state.db", wal=False, existing_only=True)
+    try:
+        assert conn.execute("SELECT value FROM example").fetchone()[0] == "retained"
+    finally:
+        conn.close()
+    assert {item.name for item in tmp_path.iterdir()} == before
+
+
+def test_existing_only_closes_opened_connection_on_callback_failure(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path):
+        pass
+    opened = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite_util.sqlite3, "connect", tracking_connect)
+
+    def fail(_conn):
+        raise RuntimeError("callback failure")
+
+    with pytest.raises(RuntimeError, match="callback failure"):
+        sqlite_util.open_db(path, db_label="state.db", wal=False,
+                            existing_only=True, initialize=fail)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+
+
 # Every store that opens its own SQLite file (path -> module attribute holding the opener).
 _STORE_OPENERS = (
     ("agent.verification_evidence", "_connect"),

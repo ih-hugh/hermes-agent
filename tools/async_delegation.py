@@ -93,6 +93,9 @@ def _db_path():
 def _connect() -> sqlite3.Connection:
     from hermes_recovery_refusal import require_unprotected_store
     from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import (
+        assert_raw_schema_lease_target, begin_raw_schema_claim, finish_raw_schema_claim,
+    )
 
     # A raw opener must not repair/reconcile an opted store, even before its
     # own ledger write. This probe does not instantiate SessionDB or create a DB.
@@ -111,13 +114,33 @@ def _connect() -> sqlite3.Connection:
 
     path = _db_path()
     mkdir_under_hermes_home(path.parent)
-    _secure_state_db_files(path, create_main=True)
+    # The raw initializer needs durable exclusion authority through its last
+    # schema write. A connection-local precheck alone races a root reserve.
+    lease = None if protected_store else begin_raw_schema_claim(path)
+    if lease is not None:
+        assert_raw_schema_lease_target(lease)
+    _secure_state_db_files(path)
+
+    def initialize(conn: sqlite3.Connection) -> None:
+        if lease is None:
+            _initialize_existing_schema(conn)
+            return
+        assert_raw_schema_lease_target(lease, conn=conn)
+        _initialize_schema(conn)
+
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
     conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None,
-                   initialize=_initialize_existing_schema if protected_store else _initialize_schema)
-    _secure_state_db_files(path)
-    return conn
+                   wal=False, row_factory=None, existing_only=True, initialize=initialize)
+    try:
+        if lease is not None:
+            assert_raw_schema_lease_target(lease, conn=conn)
+        _secure_state_db_files(path)
+        if lease is not None:
+            finish_raw_schema_claim(lease, conn=conn)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
