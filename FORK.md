@@ -13,9 +13,10 @@ updates this register in the same PR; an independent reviewer checks its behavio
 upstream status, and retirement criterion. BytFactory's operator contracts are the
 [Hermes integration contract](https://github.com/ih-hugh/BytFactory/blob/main/docs/hermes-integration.md)
 and [Mintlify handbook source, section 23.4](https://github.com/ih-hugh/BytFactory/blob/main/handbook/tenancy-and-forking.mdx).
-At this checkpoint their maintained-fork writeback is pending in a separate
-BytFactory documentation PR: they still contain an obsolete no-fork policy. This
-register records the approved fork state; it does not claim that writeback is merged.
+At the early 2026-09-28 checkpoint below, BytFactory's maintained-fork writeback
+was pending. [BytFactory PR #67](https://github.com/ih-hugh/BytFactory/pull/67)
+subsequently merged that policy into the linked contract and handbook. The dated
+checkpoint remains historical evidence, not a description of the current runtime.
 
 ## Source checkpoint: 2026-09-28 UTC
 
@@ -101,6 +102,113 @@ is not a builder-only action. No runtime update or restart accompanied this reco
   interrupt, HTTP 409, keyed persistence, redaction, and stopping/terminal race
   regressions, followed by exact-source scratch gateway qualification.
 
+## Unmerged candidate: R0 producer finalization
+
+This candidate is under implementation and review on `codex/recovery-session-seal`.
+It is not on fork main, in the BytFactory vendor pin, or deployed. The reviewed
+BytFactory plan is `docs/superpowers/plans/2026-09-28-supported-recovery.md`.
+At the 2026-09-29 source refresh, fork main remained
+`c8cc4723244cea6b994dab5974fcb11d7615f671` and BytFactory main remained
+`11414a16930c90de04b320bce2550c8746ed8018`, with vendor pin
+`2be8441ba14eb9cf5809d7f3084663066692206f`.
+
+- Purpose: retain keyed runs-API root/nudge membership before dispatch, account for
+  actual producers and acknowledged writes, then close admission and seal immutable
+  transcript, usage and workspace-provider observations. Unknown sends, outstanding
+  producers, unsupported lineage and incomplete source evidence refuse a seal.
+  The resulting receipt grants no Factory gate, budget, cleanup or work-order authority.
+- Main seams: `hermes_state_recovery*.py`, guarded session/message/usage writes,
+  `agent/recovery_context.py`, `agent/recovery_producers.py`, actual SDK/tool workers,
+  terminal-provider interception, and the runs and recovery HTTP routes. Alternate
+  dispatch, detached delivery, shutdown replay and ordinary maintenance must respect
+  protected rows. The PR diff is the complete changed-file inventory.
+- Eligibility: this first constructor path qualifies only an explicitly configured
+  direct OpenAI API chat-completions route and the exact loaded BytFactory workspace
+  terminal. Discovery, dynamic fallback, other transports, extra tools and auxiliary
+  producers remain unsupported. Ordinary model routing remains unchanged, but protected
+  or unclassifiable database authority can make repair and alternate dispatch refuse.
+  This restricted path is implemented, but the actual installed H/F source pair is
+  still pin-mismatched and capability readiness remains false. Frontier Terminal's
+  existing Nous configuration is not qualified by this candidate.
+- Protected startup requires completed local turn-machinery warmup. Initial, rebuilt
+  and per-request clients use the same stock OpenAI transport with SDK retries disabled;
+  automatic auxiliary title generation is suppressed. Native usage is validated before
+  acknowledgement, and pricing uses bundled metadata without remote model lookup.
+  Missing prices remain unknown instead of becoming invented zero cost.
+- HTTP: new protected admission and recovery routes require the selected profile's
+  configured owner key and explicit opt-in. An identical committed runs-API key and
+  owned run status remain readable when new admission is disabled or unready; this
+  lookup grants no authority to start more work. The physical profile home is retained
+  separately from the opaque owner scope. Bounded workers retain their slots until
+  actual completion after cancellation or HTTP timeout; a proved committed admission
+  result is handed off or explicitly marked incomplete rather than discarded.
+  Root admission does not decode existing ordinary history. Nudge history is read in
+  one snapshot with row, byte and deadline bounds before payload decoding.
+  Saved seal/page reads and identical committed seal replay can survive restart without
+  a provider; new finalization needs the matching admitted writer. A fresh process
+  cannot take over a predecessor's unsealed closing work: lost owner/callback evidence
+  remains incomplete. A receipt reports the
+  observed persistent store UUID, which Factory must compare to independently retained
+  admission evidence. Pathname checks are not adversarial opened-inode attestation.
+- Qualification recorded so far: independently reviewed source units include the
+  23-case process crash matrix, restricted constructor and request clients (98 checks),
+  protected accounting (101 checks), and bounded served admission (51 checks rerun in
+  independent review). A served scratch turn records one native SDK stream send,
+  acknowledged usage, persisted user/assistant rows and producer closure. Provider
+  capture is synthetic and no network request occurs. The broader comparison below
+  retains known base failures; these checks do not establish real provider billing,
+  a matching installed Factory source pair, shared-gateway readiness or human acceptance.
+- Baseline: the exact pre-change `c8cc4723` selection of 117 files passed 1,485 tests
+  and failed seven on macOS/Python 3.12.14 with the locked dev/messaging extras.
+  Failures were route enumeration, temporary-file cleanup classification, three Linux
+  mountinfo cases on macOS, SQLite synchronous expectation and an FTS query-count
+  assertion. Keep these distinct from candidate regressions and Linux/full-CI results.
+  An expanded 184-file base run passed 2,260 tests with the same seven failures and
+  six missing optional-SDK failures; the latter passed after installing existing locked
+  extras in a private qualification environment. The first 250-file candidate run at
+  `582227cd817f6a9728244d8aadd141e1808c75f6` passed 3,274 tests, failed 46 and skipped
+  42. The candidate regressions were fixed and independently reviewed, including
+  a later-discovered VACUUM identity-lock deadlock repaired in `53badc2f`. The final
+  251-file comparison at `53badc2fdecc1d37ea67991c0831b56230b627da`, using the same
+  private locked environment and canonical runner with four workers, no automatic
+  retries and a 180-second per-file limit, passed **3,339**, failed the same **seven**
+  base cases and skipped **42**, with no timeout. This is a qualified change
+  comparison, not a globally green suite or Linux/full-CI result. An earlier
+  intermittent `DeletedWalGenerationError` remains a recorded qualification item;
+  its absence here does not establish a causal fix. Blocking Ruff passes; `ty`
+  remains advisory and non-green, with its changed-path diagnostics reviewed.
+- Maintenance cost: this patch spans admission, asynchronous completion, SQLite schema
+  and triggers, source codecs, physical SDK sends and terminal ownership. Upstream
+  changes in any of those areas require a fresh behavioral audit. Do not forward-port
+  only the HTTP endpoints or treat a source revert as a database rollback; protected
+  stores require exact supported guard/schema definitions and preserve sealed evidence.
+  Ordinary-session exclusion claims are permanent. Raw-schema leases can be released
+  only by their owning process; an interrupted lease is not timed out on restart.
+  These claims block conflicting protected admission. Partial or stale guard catalogs
+  need a reviewed migration or forensic decision, never opportunistic repair.
+  The private `state_meta.ordinary_init_settled_v1` stamp lets a fully initialized
+  ordinary store reopen without a schema-write claim. It is an optimization, not
+  authority: loaded initializer source, schema/version, journal/search capabilities,
+  active raw-schema leases and actual store identity are rechecked. Drift uses claimed
+  reconciliation; protected stores retain their separate strict attach path.
+  Source installations must remain immutable until restart; this is not attestation
+  of every loaded module. Existing WAL refusal and durability rules still apply.
+- Upstream status: no R0 submission is recorded. A limited 2026-09-29 inventory at
+  upstream main `666f313d1d3abd8077291ba464cf0a10f1a6157f` and the historical release
+  commit above found no equivalent recovery ledger/modules. This is not a complete
+  upstream compatibility audit or proof that no differently named equivalent exists.
+- Retirement: retain tests for atomic keyed membership, producer closure across worker
+  cancellation, lost-owner refusal and committed replay after restart, guarded
+  cross-process writes, acknowledged usage without
+  invented zero cost, immutable receipt/page replay, exact owner/profile scope, bounded
+  capture and the independent Factory grant/source association. Qualify actual physical
+  SDK sends and the effective terminal-only tool surface; require refusal before effects
+  for alternate transports, dynamic fallback and auxiliary or delegated execution.
+  Retire the patch only
+  when a released upstream equivalent passes those tests plus the actual Factory pin
+  and disposable served-runtime qualification. A terminal status or dead PID is never
+  sufficient replacement evidence.
+
 ## Upstream maintenance plan
 
 This is the proposed operating cadence; no recurring job or automatic update has
@@ -141,5 +249,9 @@ been installed.
    fails, pause admission and use the reviewed restoration procedure. Never rewrite
    travelers, fork history, or unresolved run/accounting evidence to force recovery.
 
-The next deployment candidate is the small PR #2 change on the existing baseline.
-The much larger upstream catch-up is a separate reviewed compatibility scope.
+PR #2 was the next deployment candidate at the early 2026-09-28 checkpoint.
+[BytFactory PR #68](https://github.com/ih-hugh/BytFactory/pull/68) subsequently pinned
+it; the integration contract records the later dated deployment and bounded trials.
+This register does not freshly attest the running gateway. R0 requires a separate
+reviewed fork merge, Factory pin, release and deployment qualification. The much
+larger upstream catch-up remains a separate reviewed compatibility scope.
