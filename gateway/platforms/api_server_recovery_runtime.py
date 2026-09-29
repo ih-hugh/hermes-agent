@@ -99,6 +99,19 @@ def prepare_static_chat_runtime(
 
 def _inspect_static_chat_runtime(owner: RecoveryOwnerContext) -> _StaticInputs:
     """Inspect configured/loaded inputs without minting a constructor capability."""
+    # Startup warmup may time out. Never perform its lazy import graph on the
+    # protected admission/readiness path after taking a registry snapshot.
+    run_module = sys.modules.get("run_agent")
+    tools_module = sys.modules.get("model_tools")
+    if (
+        run_module is None
+        or getattr(getattr(run_module, "__spec__", None), "_initializing", True)
+        or not isinstance(getattr(run_module, "AIAgent", None), type)
+        or tools_module is None
+        or getattr(getattr(tools_module, "__spec__", None), "_initializing", True)
+        or not callable(getattr(tools_module, "get_tool_definitions", None))
+    ):
+        _refuse()
     from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
     from agent.secret_scope import get_secret_str
     from agent.terminal_env_registry import registry_generation

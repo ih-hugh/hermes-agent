@@ -59,11 +59,6 @@ def test_real_protected_agent_uses_loaded_terminal_without_discovery_or_checker(
         lambda: calls.append("checker") or True,
     )
 
-    def broad_client(*_args, **_kwargs):
-        calls.append("broad_client")
-        raise AssertionError("protected route used general client helper")
-
-    monkeypatch.setattr(AIAgent, "_create_openai_client", broad_client)
     monkeypatch.setattr(
         providers,
         "get_provider_profile",
@@ -118,6 +113,50 @@ def test_real_protected_agent_uses_loaded_terminal_without_discovery_or_checker(
             )
 
         sdk.run(qualify_client)
+        request = agent._create_request_openai_client(reason="protected_test")
+        try:
+            sdk = registry.enter(registry.permit, "sdk")
+            def qualify_request() -> None:
+                send = begin_chat_send(request)
+                assert send is not None
+                send.finish(SendOutcome(
+                    kind="no_charge_proved", attempt_id=send.attempt_id,
+                    reason="sdk_not_entered",
+                ))
+            sdk.run(qualify_request)
+        finally:
+            agent._close_request_openai_client(request, reason="request_complete")
+        reused = agent._create_request_openai_client(reason="protected_reuse")
+        assert reused is request
+        agent._close_request_openai_client(reused, reason="request_complete")
+        agent._close_cached_request_openai_client(reason="protected_evict")
+        replacement = agent._create_request_openai_client(reason="protected_evicted")
+        assert replacement is not request
+        try:
+            sdk = registry.enter(registry.permit, "sdk")
+            sdk.run(lambda: _qualify_no_invocation(replacement))
+        finally:
+            agent._close_request_openai_client(replacement, reason="protected_evicted")
+        assert agent._replace_primary_openai_client(reason="protected_rebuild")
+        sdk = registry.enter(registry.permit, "sdk")
+        sdk.run(lambda: _qualify_no_invocation(agent.client))
+        for mutation in (
+            lambda: agent._client_kwargs.__setitem__("base_url", "https://other.example/v1"),
+            lambda: agent._client_kwargs.__setitem__("default_headers", {"X-Extra": "1"}),
+        ):
+            original = dict(agent._client_kwargs)
+            mutation()
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                agent._create_request_openai_client(reason="protected_drift")
+            agent._client_kwargs = original
+        original_key = agent.api_key
+        agent.api_key = "different-key"
+        with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+            agent._create_request_openai_client(reason="protected_key_drift")
+        agent.api_key = original_key
+        registry.request_close()
+        with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+            agent._create_request_openai_client(reason="protected_closed")
         agent.client.close()
 
     try:
@@ -126,6 +165,15 @@ def test_real_protected_agent_uses_loaded_terminal_without_discovery_or_checker(
         assert manager._discovered
     finally:
         db.close()
+
+
+def _qualify_no_invocation(client: object) -> None:
+    send = begin_chat_send(client)
+    assert send is not None
+    send.finish(SendOutcome(
+        kind="no_charge_proved", attempt_id=send.attempt_id,
+        reason="sdk_not_entered",
+    ))
 
 
 def test_cold_protected_constructor_and_prompt_never_start_environment_probe(

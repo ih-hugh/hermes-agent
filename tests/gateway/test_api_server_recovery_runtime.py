@@ -8,6 +8,9 @@ from threading import Event, Thread
 
 import pytest
 
+# Positive loaded-only cases complete ordinary turn-machinery import first.
+import run_agent  # noqa: F401
+
 from gateway.platforms.api_server_recovery import RecoveryOwnerContext
 from hermes_state_recovery import RecoveryRefused
 
@@ -123,6 +126,44 @@ def test_static_preparation_refuses_missing_key_and_wrong_physical_home(
     )
     with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
         prepare_static_chat_runtime(wrong, session_id="protected-session")
+
+
+def test_static_preparation_requires_loaded_turn_machinery_without_importing_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import sys
+    from types import SimpleNamespace
+    from gateway.platforms.api_server_recovery_runtime import prepare_static_chat_runtime
+
+    owner = _profile(tmp_path, monkeypatch)
+    from tests.agent.test_recovery_runtime import _admitted, _install_selected_plugin_fixture
+    db, _, _, registry = _admitted(owner.home)
+    _install_selected_plugin_fixture(registry, monkeypatch)
+    monkeypatch.setattr(
+        "tools.terminal_tool_config._get_plugin_env_provider",
+        lambda *_: pytest.fail("cold preparation inspected selected provider"),
+    )
+    try:
+        with monkeypatch.context() as patcher:
+            patcher.delitem(sys.modules, "run_agent", raising=False)
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                prepare_static_chat_runtime(owner, session_id="protected-session")
+            assert "run_agent" not in sys.modules
+        with monkeypatch.context() as patcher:
+            patcher.delitem(sys.modules, "model_tools", raising=False)
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                prepare_static_chat_runtime(owner, session_id="protected-session")
+            assert "model_tools" not in sys.modules
+        with monkeypatch.context() as patcher:
+            patcher.setitem(
+                sys.modules, "run_agent", SimpleNamespace(
+                    __spec__=SimpleNamespace(_initializing=True), AIAgent=object()
+                ),
+            )
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                prepare_static_chat_runtime(owner, session_id="protected-session")
+    finally:
+        db.close()
 
 
 def test_static_preparation_bounds_config_before_parsing_or_provider_lookup(

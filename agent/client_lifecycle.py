@@ -299,6 +299,11 @@ class ClientLifecycleMixin:
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        from agent.recovery_producers import (
+            protected_client_required, require_protected_chat_client_inputs,
+        )
+        if protected_client_required(self):
+            require_protected_chat_client_inputs(self, getattr(self, "_client_kwargs", None))
         with self._openai_client_lock():
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):

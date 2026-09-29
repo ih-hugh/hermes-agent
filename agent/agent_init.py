@@ -920,29 +920,12 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
     """OpenAI-wire client: resolve kwargs, apply header/TLS policy, construct."""
     prepared = getattr(agent, "_recovery_constructor_prepared", None)
     if prepared is not None:
-        # The normal helper consults provider hooks and can install a shared
-        # keepalive transport. Neither is part of this inventoried route.
+        from agent.recovery_producers import build_protected_chat_client
         from hermes_state_recovery import RecoveryRefused
-        from httpx import HTTPTransport
-        from openai import OpenAI
-        from openai._base_client import SyncHttpxClientWrapper
-
-        if (agent.provider != "openai-api" or agent.api_mode != "chat_completions"
-                or api_key != prepared.api_key or base_url != prepared.base_url
-                or _provider_timeout is not None):
+        if api_key != prepared.api_key or base_url != prepared.base_url or _provider_timeout is not None:
             raise RecoveryRefused("unsupported_configuration")
-        http_client = SyncHttpxClientWrapper(
-            transport=HTTPTransport(retries=0, trust_env=False), trust_env=False,
-        )
-        try:
-            agent.client = OpenAI(
-                api_key=api_key, base_url=base_url, max_retries=0,
-                organization="", project="", webhook_secret="",
-                http_client=http_client,
-            )
-        except BaseException:
-            http_client.close()
-            raise
+        kwargs = {"api_key": api_key, "base_url": base_url, "max_retries": 0}
+        agent.client = build_protected_chat_client(agent, kwargs)
         agent._client_kwargs = {
             "api_key": api_key, "base_url": base_url, "max_retries": 0,
         }
@@ -2415,6 +2398,9 @@ def init_agent(
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    # Retain only exact issued local client inputs for this agent's request and
+    # rebuild lifetime. The constructor-specific routing switch remains transient.
+    agent._recovery_client_inputs = prepared
     agent._recovery_constructor_prepared = None
 
 

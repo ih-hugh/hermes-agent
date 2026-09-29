@@ -20,7 +20,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterator, Literal, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterator, Literal, TypeVar, cast
 
 from agent.recovery_context import ProducerPermit, _register_usage_completion
 from hermes_state_recovery import RecoveryRefused
@@ -163,6 +163,74 @@ def _require_preparation_current(prepared: FrozenProtectedRuntime) -> ProducerRe
     except Exception as exc:
         raise RecoveryRefused("unsupported_configuration") from exc
     return registry
+
+
+def protected_client_required(agent: object) -> bool:
+    """A protected context or agent must never fall through to broad client routing."""
+    return (
+        current_registry() is not None
+        or getattr(agent, "_recovery_registry", None) is not None
+        or getattr(agent, "_recovery_constructor_prepared", None) is not None
+        or getattr(agent, "_recovery_client_inputs", None) is not None
+    )
+
+
+def require_protected_chat_client_inputs(agent: object, kwargs: object) -> FrozenProtectedRuntime:
+    """Check exact issued local inputs before constructing or reusing a client."""
+    prepared = (
+        getattr(agent, "_recovery_constructor_prepared", None)
+        or getattr(agent, "_recovery_client_inputs", None)
+    )
+    if type(prepared) is not FrozenProtectedRuntime:
+        raise RecoveryRefused("unsupported_configuration")
+    registry = _require_preparation_current(prepared)
+    lease = current_lease()
+    with registry._lock:
+        closing = registry._close_requested
+    if (
+        lease is None or lease.registry is not registry or lease._state != "running"
+        or closing
+        or getattr(agent, "_recovery_registry", registry) is not registry
+        or getattr(agent, "session_id", None) != prepared.session_id
+        or getattr(agent, "model", None) != prepared.model
+        or getattr(agent, "provider", None) != prepared.provider
+        or getattr(agent, "api_mode", None) != prepared.api_mode
+        or getattr(agent, "base_url", None) != prepared.base_url
+        or (getattr(agent, "_recovery_constructor_prepared", None) is None
+            and getattr(agent, "api_key", None) != prepared.api_key)
+        or type(kwargs) is not dict
+    ):
+        raise RecoveryRefused("unsupported_configuration")
+    mapping = cast(dict[str, object], kwargs)
+    if (
+        set(mapping) != {"api_key", "base_url", "max_retries"}
+        or mapping.get("api_key") != prepared.api_key
+        or mapping.get("base_url") != prepared.base_url
+        or type(mapping.get("max_retries")) is not int
+        or mapping.get("max_retries") != 0
+    ):
+        raise RecoveryRefused("unsupported_configuration")
+    return prepared
+
+
+def build_protected_chat_client(agent: object, kwargs: object) -> object:
+    """Build the one inventoried OpenAI transport without provider hooks."""
+    prepared = require_protected_chat_client_inputs(agent, kwargs)
+    from httpx import HTTPTransport
+    from openai import OpenAI
+    from openai._base_client import SyncHttpxClientWrapper
+
+    http_client = SyncHttpxClientWrapper(
+        transport=HTTPTransport(retries=0, trust_env=False), trust_env=False,
+    )
+    try:
+        return OpenAI(
+            api_key=prepared.api_key, base_url=prepared.base_url, max_retries=0,
+            organization="", project="", webhook_secret="", http_client=http_client,
+        )
+    except BaseException:
+        http_client.close()
+        raise
 
 
 @contextmanager

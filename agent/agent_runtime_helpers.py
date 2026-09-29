@@ -1677,6 +1677,9 @@ def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: s
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    from agent.recovery_producers import build_protected_chat_client, protected_client_required
+    if protected_client_required(agent):
+        return build_protected_chat_client(agent, client_kwargs)
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only: callers pass agent._client_kwargs, and in-place mutation
