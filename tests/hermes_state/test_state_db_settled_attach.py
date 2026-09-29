@@ -71,6 +71,21 @@ def test_current_ordinary_catalog_attaches_without_a_raw_claim(
     assert claims == []
 
 
+def test_vulnerable_runtime_forced_delete_settles_configured_wal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "wal")
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: True)
+    _settled(path)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    claims = _raw_claims(monkeypatch)
+    SessionDB(path).close()
+    assert claims == []
+
+
 def test_deleted_wal_refusal_precedes_any_catalog_connection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -101,6 +116,7 @@ def test_fast_wal_attach_restores_connection_durability_companions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: False)
     _settled(path)
     called: list[str] = []
     original = hermes_state_wal._apply_wal_companions
@@ -211,6 +227,7 @@ def test_configured_wal_rechecks_external_delete_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: False)
     monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "delete")
     _settled(path)
     with sqlite3.connect(path) as conn:
