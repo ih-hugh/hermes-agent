@@ -38,6 +38,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
 from hermes_state_common import stat_db_file_identity as _stat_db_file_identity
+from hermes_state_recovery_deadline import (
+    RecoveryDeadlineExceeded, acquire_recovery_lock, current_deadline, require_time,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, typed only
     from hermes_state import SessionDB
@@ -192,6 +195,119 @@ def _finish_opening(path: Path, opening: threading.Event) -> None:
     opening.set()
 
 
+def _acquire_recovery(path: Path) -> "SessionDB":
+    """Recovery-only bounded waits; cleanup may continue after the deadline."""
+    while True:
+        require_time()
+        wait_for: Optional[threading.Event] = None
+        with acquire_recovery_lock(_lock):
+            generation = _generations.get(path)
+            if generation is not None:
+                current = _stat_db_file_identity(path)
+                require_time()
+                if current is not None and generation.identity is not None and current != generation.identity:
+                    generation.retired = True
+                    del _generations[path]
+                    _retired[id(generation.db)] = generation
+                else:
+                    generation.refcount += 1
+                    try:
+                        require_time()
+                    except BaseException:
+                        generation.refcount -= 1
+                        raise
+                    return generation.db
+            teardown = _tearing_down.get(path)
+            if teardown is not None:
+                wait_for = teardown.event
+            else:
+                opening = _opening.get(path)
+                if opening is None:
+                    opening = _opening[path] = threading.Event()
+                    lifecycle_lock = _path_lifecycle_lock_locked(path)
+                else:
+                    wait_for = opening
+        if wait_for is not None:
+            if not wait_for.wait(timeout=require_time()):
+                raise RecoveryDeadlineExceeded("recovery_deadline_exceeded")
+            continue
+
+        # This worker alone owns the opening marker. Keep it until a speculative
+        # handle has been published or physically closed, including late opens.
+        db = None
+        marker_active = True
+        published = False
+        retained = None
+        try:
+            with acquire_recovery_lock(lifecycle_lock):
+                db = _open_session_db(path)
+                db._shared_registry_owned = True
+                identity = _stat_db_file_identity(path)
+                require_time()
+            with acquire_recovery_lock(_lock):
+                teardown = _tearing_down.get(path)
+                if teardown is None:
+                    existing = _generations.get(path)
+                    if existing is not None:
+                        existing.refcount += 1
+                        try:
+                            require_time()
+                        except BaseException:
+                            existing.refcount -= 1
+                            raise
+                        retained = existing.db
+                    else:
+                        _generations[path] = _Generation(path, db, identity)
+                        try:
+                            require_time()
+                        except BaseException:
+                            _generations.pop(path, None)
+                            raise
+                        published = True
+            if not published:
+                # No other opener can be elected while our marker remains.
+                speculative = db
+                db = None
+                _teardown_generation(path, speculative)
+            with _lock:
+                _finish_opening(path, opening)
+                marker_active = False
+            if teardown is not None:
+                if not teardown.event.wait(timeout=require_time()):
+                    raise RecoveryDeadlineExceeded("recovery_deadline_exceeded")
+                continue
+            if retained is not None:
+                try:
+                    require_time()
+                except BaseException:
+                    release(retained)
+                    raise
+                return retained
+            assert db is not None
+            try:
+                require_time()
+            except BaseException:
+                # Publication succeeded, so release its exact registry ref
+                # rather than closing the shared connection behind the map.
+                release(db)
+                raise
+            return db
+        except BaseException:
+            if db is not None and not published:
+                speculative = db
+                db = None
+                _teardown_generation(path, speculative)
+            if retained is not None and marker_active:
+                release(retained)
+            raise
+        finally:
+            if marker_active:
+                # Cleanup is mandatory even if its lock wait outlives the
+                # request. The HTTP worker keeps its slot until this settles.
+                with _lock:
+                    _finish_opening(path, opening)
+
+
 def acquire(db_path: Optional[Path] = None) -> "SessionDB":
     """Return the shared SessionDB for *db_path*, incrementing its refcount. If the file was
     replaced (different inode) since the generation opened, that generation is RETIRED
@@ -205,6 +321,9 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
         path = raw_path.resolve()
     except OSError:
         path = raw_path
+
+    if current_deadline() is not None:
+        return _acquire_recovery(path)
 
     while True:
         wait_for: Optional[threading.Event] = None

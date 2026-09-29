@@ -54,6 +54,9 @@ from hermes_state_dbfile import (
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
 from hermes_state_messages import SessionMessagesMixin
+from hermes_state_recovery_deadline import (
+    acquire_recovery_lock, bounded_sqlite_busy, current_deadline, require_time,
+)
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
@@ -938,6 +941,19 @@ class SessionDB(
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
         degradation: slower beats EMFILE, which the supervisor cannot see."""
+        if current_deadline() is not None:
+            # Recovery's two-worker HTTP path deliberately serializes reads on
+            # the writer connection: no pooled-reader open/return lock or
+            # independent five-second SQLite busy wait can escape its budget.
+            with acquire_recovery_lock(self._lock):
+                if self._conn is None:
+                    self._reopen_after_close_locked(context="read")
+                conn = cast(sqlite3.Connection, self._conn)
+                with bounded_sqlite_busy(conn):
+                    require_time()
+                    yield conn
+                    require_time()
+            return
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
@@ -1006,6 +1022,9 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        recovery_limit = current_deadline()
+        if recovery_limit is not None:
+            deadline = min(deadline, recovery_limit)
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1015,6 +1034,7 @@ class SessionDB(
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
         while True:
+            require_time()
             self._raise_if_db_corrupt()
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
             # not here. close() mutates _conn and _db_sidecar_identity under that
@@ -1028,27 +1048,36 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
+                with acquire_recovery_lock(self._lock):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                    conn = cast(sqlite3.Connection, self._conn)
+                    with bounded_sqlite_busy(conn):
+                        require_time()
+                        conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(conn)
+                            require_time()
+                            conn.commit()
+                        except BaseException:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                        require_time()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                if current_deadline() is None:
+                    # Both opportunistic tasks can take unrelated locks after
+                    # commit. Recovery's one budget cannot wait on them.
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                        self._try_incremental_merge_fts()
+                require_time()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
@@ -1071,6 +1100,7 @@ class SessionDB(
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                require_time()
                 err_msg = str(exc).lower()
                 if isinstance(exc, sqlite3.OperationalError):
                     if "locked" in err_msg or "busy" in err_msg:
@@ -1147,13 +1177,18 @@ class SessionDB(
         closed and reopened (close() cancels this process's POSIX locks for every sibling connection),
         never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+            require_time()
             try:
                 with self._read_ctx() as conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
+                require_time()
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
                     raise
-                time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                remaining = require_time()
+                time.sleep(min(_READ_ONLY_IOERR_RETRY_BACKOFF_S, remaining)
+                           if remaining is not None else _READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                require_time()
 
     def _ensure_db_file_generation(self) -> None:
         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
