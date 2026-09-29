@@ -1161,6 +1161,12 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
     if err is not None:
         return err
     if status.get("status") in TERMINAL_STATUSES:
+        if run_id in self._protected_run_ids:
+            try:
+                await _await_protected_status(self, run_id)
+            except Exception:
+                return _json_error(_openai_error, "Protected stop status unavailable",
+                                   code="recovery_status_unavailable", status=503)
         return web.json_response(status)
     if agent is None and task is None:
         return _json_error(

@@ -874,3 +874,52 @@ async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_p
         release.set()
         await adapter.disconnect()
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_stop_terminal_status_waits_for_protected_write(tmp_path: Path, monkeypatch,
+                                                              write_fails: bool):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    store.reserve(_root(), identity)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    adapter._run_statuses[identity.run_id] = {"status": "running"}
+    entered, release = threading.Event(), threading.Event()
+    original_update = store.update_status
+
+    def held_terminal_write(run_id: str, current: dict):
+        entered.set()
+        assert release.wait(timeout=3)
+        if write_fails:
+            raise sqlite3.OperationalError("terminal status write failed")
+        return original_update(run_id, current)
+
+    monkeypatch.setattr(store, "update_status", held_terminal_write)
+    monkeypatch.setattr(api_server_runs, "_load_owned_run", lambda *args, **kwargs: (
+        identity.run_id, adapter._run_statuses[identity.run_id], None, None, None))
+    app = web.Application()
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            adapter._set_run_status(identity.run_id, "completed", output="done")
+            assert await asyncio.to_thread(entered.wait, 2)
+            response_task = asyncio.create_task(client.post(f"/v1/runs/{identity.run_id}/stop"))
+            await asyncio.sleep(0.05)
+            assert not response_task.done()
+            release.set()
+            response = await response_task
+            assert response.status == (503 if write_fails else 200)
+            if write_fails:
+                assert (await response.json())["error"]["code"] == "recovery_status_unavailable"
+            else:
+                assert (await response.json())["status"] == "completed"
+                assert store.status_for_run(identity.scope.profile, identity.scope.scope_digest,
+                                            identity.run_id)["status"] == "completed"
+    finally:
+        release.set()
+        await adapter.disconnect()
+        db.close()
