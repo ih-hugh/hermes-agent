@@ -49,6 +49,26 @@ def _source():
     )
 
 
+def _initialize_protected_tip(db, store, scope, registry) -> None:
+    from agent.recovery_context import bind_write_permit, issue_write_permit
+
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    executor = registry.enter(registry.permit, "executor")
+
+    def initialize() -> None:
+        db.initialize_protected_session(
+            scope.session_id, "api_server", recovery_permit=writer,
+            profile_name=scope.profile, parent_session_id="ordinary",
+        )
+
+    with bind_write_permit(writer):
+        executor.run(initialize)
+    assert db._read_one(
+        "SELECT parent_session_id FROM sessions WHERE id=?", (scope.session_id,),
+    )[0] == "ordinary"
+
+
 def test_adapter_supports_push_default_true():
     assert adapter_supports_push(PushAdapter()) is True
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
@@ -149,14 +169,9 @@ async def test_delegation_delivery_checks_original_and_resolved_before_append(tm
 
     db, store, scope, registry = _admitted(tmp_path)
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
-    from agent.recovery_context import bind_write_permit, issue_write_permit
-
     db.create_session("ordinary", "api_server")
     db.end_session("ordinary", "compression")
-    writer = issue_write_permit(
-        registry.permit, store, scope, registry.run_id, registry.generation)
-    with bind_write_permit(writer):
-        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+    _initialize_protected_tip(db, store, scope, registry)
     db.append_delegation_delivery = lambda *a, **kw: pytest.fail("delivery row appended")
     adapter = SimpleNamespace(_ensure_session_db=lambda: db)
     try:
@@ -171,17 +186,13 @@ async def test_delegation_delivery_checks_original_and_resolved_before_append(tm
 @pytest.mark.asyncio
 async def test_delivery_tip_refuses_before_writable_session_db_init(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from agent.recovery_context import bind_write_permit, issue_write_permit
     from gateway.wake import persist_delegation_delivery
     from tests.agent.test_recovery_runtime import _admitted
 
     db, store, scope, registry = _admitted(tmp_path)
     db.create_session("ordinary", "api_server")
     db.end_session("ordinary", "compression")
-    writer = issue_write_permit(
-        registry.permit, store, scope, registry.run_id, registry.generation)
-    with bind_write_permit(writer):
-        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+    _initialize_protected_tip(db, store, scope, registry)
     db.close()
     with sqlite3.connect(tmp_path / "state.db") as conn:
         conn.execute("DROP TABLE async_delegations")

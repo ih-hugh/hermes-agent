@@ -13,6 +13,32 @@ from gateway.platforms.api_server import APIServerAdapter
 from tests.agent.test_recovery_runtime import _admitted
 
 
+def _initialize_protected_route(
+    db, store, scope, registry, *,
+    session_key: str | None = None,
+    parent_session_id: str | None = None,
+) -> None:
+    from agent.recovery_context import bind_write_permit, issue_write_permit
+
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    executor = registry.enter(registry.permit, "executor")
+
+    def initialize() -> None:
+        db.initialize_protected_session(
+            scope.session_id, "api_server", recovery_permit=writer,
+            profile_name=scope.profile, session_key=session_key,
+            parent_session_id=parent_session_id,
+        )
+
+    with bind_write_permit(writer):
+        executor.run(initialize)
+    assert tuple(db._read_one(
+        "SELECT session_key, parent_session_id FROM sessions WHERE id=?",
+        (scope.session_id,),
+    )) == (session_key, parent_session_id)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["chat_original", "chat_resolved", "responses_chain"])
 async def test_alternate_route_refuses_before_selection_or_agent(tmp_path, monkeypatch, path):
@@ -24,14 +50,10 @@ async def test_alternate_route_refuses_before_selection_or_agent(tmp_path, monke
     monkeypatch.setattr(adapter, "_run_agent",
                         lambda *a, **kw: pytest.fail("agent task started"))
     if path == "chat_resolved":
-        from agent.recovery_context import bind_write_permit, issue_write_permit
-
         db.create_session("ordinary", "api_server")
         db.end_session("ordinary", "compression")
-        writer = issue_write_permit(
-            _registry.permit, _store, scope, _registry.run_id, _registry.generation)
-        with bind_write_permit(writer):
-            db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+        _initialize_protected_route(
+            db, _store, scope, _registry, parent_session_id="ordinary")
     if path == "responses_chain":
         adapter._response_store.put("resp_prior", {
             "session_id": scope.session_id, "conversation_history": []})
@@ -58,18 +80,15 @@ async def test_alternate_route_refuses_before_selection_or_agent(tmp_path, monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["responses_alias", "chat_tip"])
 async def test_protected_alias_or_tip_refuses_before_writable_init(tmp_path, monkeypatch, route):
-    from agent.recovery_context import bind_write_permit, issue_write_permit
-
     db, store, scope, registry = _admitted(tmp_path)
     if route == "chat_tip":
         db.create_session("ordinary", "api_server")
         db.end_session("ordinary", "compression")
-    writer = issue_write_permit(
-        registry.permit, store, scope, registry.run_id, registry.generation)
-    with bind_write_permit(writer):
-        db.create_session(scope.session_id, "api_server",
-                          **({"parent_session_id": "ordinary"} if route == "chat_tip"
-                             else {"session_key": "route-key"}))
+    _initialize_protected_route(
+        db, store, scope, registry,
+        parent_session_id="ordinary" if route == "chat_tip" else None,
+        session_key="route-key" if route == "responses_alias" else None,
+    )
     db.close()
     with sqlite3.connect(tmp_path / "state.db") as conn:
         conn.execute("DROP TABLE async_delegations")
@@ -100,17 +119,14 @@ async def test_protected_alias_or_tip_refuses_before_writable_init(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_broken_compression_read_refuses_before_writable_init(tmp_path, monkeypatch):
-    from agent.recovery_context import bind_write_permit, issue_write_permit
     from hermes_recovery_refusal import readonly_resume_session
     from hermes_state_recovery import RecoveryRefused
 
     db, store, scope, registry = _admitted(tmp_path)
     db.create_session("ordinary", "api_server")
     db.end_session("ordinary", "compression")
-    writer = issue_write_permit(
-        registry.permit, store, scope, registry.run_id, registry.generation)
-    with bind_write_permit(writer):
-        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+    _initialize_protected_route(
+        db, store, scope, registry, parent_session_id="ordinary")
     db.close()
     with sqlite3.connect(tmp_path / "state.db") as conn:
         conn.execute("ALTER TABLE sessions RENAME COLUMN source TO source_broken")
