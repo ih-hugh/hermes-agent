@@ -1,0 +1,96 @@
+{
+  "admission": {
+    "schema": "hermes.recovery/v1",
+    "generation": 0,
+    "parent_run_id": null
+  },
+  "member": {
+    "run_id": "run_root",
+    "generation": 0,
+    "parent_run_id": null,
+    "request_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "producer_state": "closed"
+  },
+  "seal_request": {
+    "request_id": "b4f13d1b-7e8d-4519-8fd7-6e0f1c920001",
+    "session_id": "exact-session",
+    "run_ids": ["run_root"],
+    "expected_membership_sha256": "eec6b8d1ad0b2478c5a9e7e63dcc40a770cbd8246d2e4d59747f9ebf923fc0fc"
+  },
+  "seal_receipt": {
+    "schema": "hermes.recovery-receipt/v1",
+    "store_id": "b4f13d1b-7e8d-4519-8fd7-6e0f1c920002",
+    "gateway_incarnation": "example-gateway-incarnation",
+    "profile": "factory",
+    "scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "session_id": "exact-session",
+    "members": [{
+      "run_id": "run_root",
+      "generation": 0,
+      "parent_run_id": null,
+      "request_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "producer_state": "closed"
+    }],
+    "sealed_at": 1790630000.0,
+    "revision": 3,
+    "membership_sha256": "eec6b8d1ad0b2478c5a9e7e63dcc40a770cbd8246d2e4d59747f9ebf923fc0fc",
+    "transcript_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "snapshot_manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "accounting_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "send_ledger_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "acknowledged_usage": {
+      "api_call_count": 1,
+      "input_tokens": 20,
+      "output_tokens": 10,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0,
+      "estimated_cost_usd": 0.001,
+      "actual_cost_usd": null,
+      "cost_status": "estimated",
+      "cost_source": "model-pricing",
+      "billing_provider": "example-provider",
+      "billing_mode": "api"
+    },
+    "provider_binding": {
+      "provider": "byf_workspace",
+      "state": "bound",
+      "binding_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "workspace_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "attestation_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "container_id": "example-container"
+    },
+    "no_calls": false
+  },
+  "seal_result": {
+    "schema": "hermes.recovery/v1",
+    "state": "sealed",
+    "request_id": "b4f13d1b-7e8d-4519-8fd7-6e0f1c920001",
+    "reasons": [],
+    "receipt": {
+      "schema": "hermes.recovery-receipt/v1",
+      "store_id": "b4f13d1b-7e8d-4519-8fd7-6e0f1c920002",
+      "gateway_incarnation": "example-gateway-incarnation",
+      "profile": "factory",
+      "scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "session_id": "exact-session",
+      "members": [{"run_id": "run_root", "generation": 0, "parent_run_id": null, "request_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "producer_state": "closed"}],
+      "sealed_at": 1790630000.0,
+      "revision": 3,
+      "membership_sha256": "eec6b8d1ad0b2478c5a9e7e63dcc40a770cbd8246d2e4d59747f9ebf923fc0fc",
+      "transcript_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "snapshot_manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "accounting_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "send_ledger_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "acknowledged_usage": {"api_call_count": 1, "input_tokens": 20, "output_tokens": 10, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "estimated_cost_usd": 0.001, "actual_cost_usd": null, "cost_status": "estimated", "cost_source": "model-pricing", "billing_provider": "example-provider", "billing_mode": "api"},
+      "provider_binding": {"provider": "byf_workspace", "state": "bound", "binding_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "workspace_sha256": "2222222222222222222222222222222222222222222222222222222222222222", "attestation_sha256": "3333333333333333333333333333333333333333333333333333333333333333", "container_id": "example-container"},
+      "no_calls": false
+    }
+  },
+  "snapshot_page": {
+    "receipt_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "page_index": 0,
+    "rows": [{"row_index": 0, "row_sha256": "8888888888888888888888888888888888888888888888888888888888888888", "message": {"role": "user", "content": "hello"}}],
+    "next_page": null
+  }
+}

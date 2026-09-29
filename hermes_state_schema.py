@@ -917,6 +917,35 @@ class SessionSchemaMixin:
         report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
+        # Protected recovery has its own non-prunable authority. These rows intentionally
+        # do not reference ordinary sessions: admission precedes session creation and
+        # transport/session retention must never erase the member inventory.
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS recovery_store (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), store_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sessions (
+                session_id TEXT PRIMARY KEY, profile TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('open','closing','sealed')),
+                revision INTEGER NOT NULL, root_run_id TEXT NOT NULL UNIQUE,
+                close_request_id TEXT, close_request_json TEXT, reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                receipt_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS recovery_members (
+                run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES recovery_sessions(session_id),
+                generation INTEGER NOT NULL CHECK (generation IN (0,1)), parent_run_id TEXT,
+                profile TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, request_sha256 TEXT NOT NULL,
+                owner_incarnation TEXT NOT NULL,
+                producer_state TEXT NOT NULL CHECK (producer_state IN ('open','closed','incomplete')),
+                status_json TEXT NOT NULL,
+                UNIQUE (session_id, generation), UNIQUE (profile, scope_digest, idempotency_key)
+            );
+        """)
+        # A settled open must not take the writer lock just to restamp the UUID.
+        if cursor.execute("SELECT 1 FROM recovery_store WHERE singleton=1").fetchone() is None:
+            cursor.execute("INSERT OR IGNORE INTO recovery_store(singleton, store_id) VALUES (1, ?)",
+                           (str(uuid.uuid4()),))
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
         self._reconcile_columns(cursor)

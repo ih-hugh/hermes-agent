@@ -93,6 +93,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # outlive the request, hence the separate stopping set), pollable statuses, and
     # approval session keys (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
+    self._protected_run_ids: set[str] = set()
+    self._protected_run_stores: dict[str, Any] = {}
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     (
@@ -148,6 +150,10 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
             self._run_idempotency_store.update_status(run_id, current)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
+    if run_id in self._protected_run_ids and should_persist:
+        # A failed protected status write is visible to the caller and never
+        # grants closure. The member remains durable even if transport status lags.
+        self._protected_run_stores[run_id].update_status(run_id, current)
     return current
 
 
@@ -240,6 +246,23 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
         return status
     scope = self._run_idempotency_scope(request)
+    from hermes_state_recovery import RecoveryStore, RecoveryRefused
+    try:
+        db = self._ensure_session_db()
+        protected = RecoveryStore(db) if db is not None else None
+        profile = self._profile_for_request(request) if hasattr(self, "_profile_for_request") else None
+        if profile is None:
+            from gateway.platforms import api_server
+            profile = api_server._api_request_profile.get() or "default"
+        protected_status = protected.status_for_run(profile, scope, run_id) if protected else None
+    except (RecoveryRefused, AttributeError):
+        protected_status = None
+    if protected_status is not None:
+        self._run_statuses[run_id] = protected_status
+        self._run_owners[run_id] = scope
+        self._protected_run_ids.add(run_id)
+        self._protected_run_stores[run_id] = protected
+        return protected_status
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
     if record is None:
@@ -398,6 +421,30 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    # Protected execution is opened only by the served runtime instrumentation
+    # (producer, tool, SDK and write guards). Until that runtime is installed,
+    # no request flag can turn a reservation into an untracked dispatch.
+    protected_key = request.headers.get("Idempotency-Key", "").strip().startswith("byf-recovery-v1:")
+    requested_recovery = isinstance(body, dict) and "recovery" in body
+    recovery_admission = None
+    if protected_key or requested_recovery:
+        from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+        if not protected_key or not requested_recovery:
+            return _json_error(_openai_error, "Protected recovery key and body must be paired",
+                               code="recovery_admission_mismatch", status=400)
+        try:
+            recovery_admission = RecoveryAdmission.model_validate(body["recovery"])
+            if (len(json.dumps(body, separators=(",", ":")).encode()) > 16 * 1024
+                    or not isinstance(body.get("session_id"), str) or not body["session_id"]
+                    or (recovery_admission.generation == 0) != (recovery_admission.parent_run_id is None)):
+                raise ValueError("invalid protected recovery request")
+        except (ValueError, TypeError):
+            return _json_error(_openai_error, "Invalid protected recovery admission",
+                               code="invalid_recovery_admission", status=400)
+        ready = getattr(self, "_recovery_runtime_ready", None)
+        if not callable(ready) or not ready(request, body):
+            return _json_error(_openai_error, "Protected runtime is not yet eligible",
+                               code="recovery_runtime_unavailable", status=503)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -454,7 +501,30 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(_openai_error, selection_error, status=400)
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if idempotency_key:
+    protected_store = protected_scope = None
+    if recovery_admission is not None:
+        from hermes_state_recovery import RecoveryStore, RecoveryScope, RecoveryRefused
+        if self._run_idempotency_store.has_key(idempotency_scope, idempotency_key):
+            return _json_error(_openai_error, "Legacy key collision", code="recovery_legacy_collision", status=409)
+        db = await self._ensure_session_db_async()
+        try:
+            protected_store = RecoveryStore(db)
+            protected_scope = RecoveryScope(
+                protected_store.store_id, _api_server._api_request_profile.get() or "default",
+                idempotency_scope, body["session_id"])
+            prior = protected_store.lookup_key(protected_scope, idempotency_key, idempotency_fingerprint)
+        except (RecoveryRefused, AttributeError):
+            return _json_error(_openai_error, "Protected state store unavailable",
+                               code="recovery_store_unavailable", status=503)
+        if prior is not None:
+            if prior.outcome == "conflict":
+                return _json_error(_openai_error, "Protected key conflict",
+                                   code="idempotency_key_conflict", status=409)
+            prior_status = protected_store.status_for_run(
+                protected_scope.profile, protected_scope.scope_digest, prior.member.run_id) or {"status": "queued"}
+            return _accepted_response(prior.member.run_id, prior_status.get("status", "queued"),
+                                      gateway_session_key, replayed=True)
+    elif idempotency_key:
         outcome, record = self._run_idempotency_store.lookup(
             idempotency_scope, idempotency_key, idempotency_fingerprint,
             retention_until=_room_retention_until(request))
@@ -480,7 +550,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # history loads from it, the turn writes to it, and a detached delivery row persisted to it
     # is what the next same-id run consumes below.
     if selected_session_id:
+        if recovery_admission is not None and str(selected_session_id) != body["session_id"]:
+            return _json_error(_openai_error, "Protected session changed",
+                               code="recovery_session_mismatch", status=409)
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+        if recovery_admission is not None and selected_session_id != body["session_id"]:
+            return _json_error(_openai_error, "Protected session rotated",
+                               code="recovery_session_rotated", status=409)
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
@@ -509,7 +585,26 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
         run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
-    if idempotency_key:
+    if recovery_admission is not None:
+        from agent.recovery_context import current_incarnation
+        from hermes_state_recovery import AdmissionIdentity
+        result = protected_store.reserve(recovery_admission, AdmissionIdentity(
+            protected_scope, idempotency_key, idempotency_fingerprint, run_id,
+            current_incarnation(), initial_status))
+        if result.outcome != "created":
+            self._run_tool_diagnostics.pop(run_id, None)
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            if result.outcome == "replayed":
+                status = protected_store.status_for_run(
+                    protected_scope.profile, protected_scope.scope_digest, result.member.run_id) or {"status": "queued"}
+                return _accepted_response(result.member.run_id, status.get("status", "queued"),
+                                          gateway_session_key, replayed=True)
+            return _json_error(_openai_error, "Protected admission refused",
+                               code=result.reason or "recovery_conflict", status=409)
+        self._protected_run_ids.add(run_id)
+        self._protected_run_stores[run_id] = protected_store
+    elif idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
@@ -801,7 +896,16 @@ def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    return self._run_idempotency_store.owns_run(scope, run_id)
+    if self._run_idempotency_store.owns_run(scope, run_id):
+        return True
+    from hermes_state_recovery import RecoveryStore, RecoveryRefused
+    from gateway.platforms import api_server
+    try:
+        db = self._ensure_session_db()
+        return bool(db and RecoveryStore(db).owns_run(
+            api_server._api_request_profile.get() or "default", scope, run_id))
+    except (RecoveryRefused, AttributeError):
+        return False
 
 
 def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
