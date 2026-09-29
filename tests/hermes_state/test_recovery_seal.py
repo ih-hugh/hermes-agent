@@ -379,6 +379,67 @@ def test_accounted_send_replays_exact_source_totals(tmp_path: Path, monkeypatch)
         db.close()
 
 
+def test_proved_pre_sdk_send_seals_without_accounted_usage(tmp_path: Path, monkeypatch):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        registry = ProducerRegistry(store, scope, "root", 0, producer)
+
+        def _prove_not_entered():
+            send = registry.sends.begin(registry.permit, "pre-sdk-attempt")
+            send.finish(
+                SendOutcome(
+                    kind="no_charge_proved",
+                    attempt_id=send.attempt_id,
+                    reason="sdk_not_entered",
+                )
+            )
+
+        registry.enter(registry.permit, "sdk").run(_prove_not_entered)
+        assert tuple(
+            db._read_one(
+                "SELECT state,payload_sha256,payload_json FROM recovery_usage_slots "
+                "WHERE attempt_id='pre-sdk-attempt'"
+            )
+        ) == ("no_charge", None, None)
+        request = _close(store, scope, producer)
+        result = finalize(store, scope, request, evidence)
+        assert result.receipt is not None
+        assert result.receipt.no_calls is False
+        assert result.receipt.send_row_count == 1
+        assert result.receipt.acknowledged_usage.api_call_count == 0
+        assert result.receipt.acknowledged_usage.billing_provider is None
+    finally:
+        db.close()
+
+
+def test_oversized_registered_producer_id_refuses_before_full_fetch(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        long_id = "x" * (128 * 1024 + 1)
+        store.register_producer(scope, "root", producer, long_id, "callback")
+        store.start_registered_producer(scope, "root", producer, long_id)
+        store.close_registered_producer(scope, "root", producer, long_id)
+        request = _close(store, scope, producer)
+        selected: list[str] = []
+        db._conn.set_trace_callback(selected.append)
+        try:
+            with pytest.raises(RecoveryRefused, match="producer_inventory_invalid"):
+                finalize(store, scope, request, evidence)
+        finally:
+            db._conn.set_trace_callback(None)
+        assert not any(
+            "SELECT producer_id,kind,state,owner_incarnation FROM recovery_producers"
+            in query
+            for query in selected
+        )
+        assert store.lookup_root(scope, "root").phase == "closing"
+    finally:
+        db.close()
+
+
 def test_guarded_transcript_preserves_inactive_blob_and_json_looking_text(
     tmp_path: Path,
     monkeypatch,
@@ -724,6 +785,38 @@ def test_damaged_committed_page_is_refused_on_read(tmp_path: Path, monkeypatch):
         db.close()
 
 
+@pytest.mark.parametrize("column", ["close_request_json", "receipt_json"])
+def test_oversized_retained_tombstone_refuses_before_full_fetch(
+    tmp_path: Path,
+    monkeypatch,
+    column: str,
+):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        request = _close(store, scope, producer)
+        finalize(store, scope, request, evidence)
+        # A scratch-only damaged tombstone models malformed retained state.
+        store._write(
+            lambda conn: conn.execute(
+                f"UPDATE recovery_sessions SET {column}=? WHERE session_id=?",
+                ("z" * (1024 * 1024 + 1), scope.session_id),
+            )
+        )
+        selected: list[str] = []
+        db._conn.set_trace_callback(selected.append)
+        try:
+            with pytest.raises(RecoveryRefused, match="sealed_document_invalid"):
+                read_seal_bytes(store, scope, "root")
+        finally:
+            db._conn.set_trace_callback(None)
+        assert not any(
+            "SELECT s.close_request_json,s.receipt_json,d.result_json" in query
+            for query in selected
+        )
+    finally:
+        db.close()
+
+
 def test_source_walk_queries_use_scope_indexes(tmp_path: Path, monkeypatch):
     db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
     try:
@@ -758,12 +851,20 @@ def test_source_walk_queries_use_scope_indexes(tmp_path: Path, monkeypatch):
                 (scope.session_id, 0),
                 "sqlite_autoindex_recovery_provider_invocations_",
             ),
+            (
+                "SELECT rowid,substr(state,1,256),substr(producer_id,1,256) "
+                "FROM recovery_producers INDEXED BY idx_recovery_producers_run_state "
+                "WHERE run_id=? AND (state,rowid)>(?,?) ORDER BY state,rowid LIMIT 1",
+                ("root", "", 0),
+                "idx_recovery_producers_run_state",
+            ),
         )
         for sql, params, index in queries:
             details = " ".join(
                 row[3] for row in db._conn.execute("EXPLAIN QUERY PLAN " + sql, params)
             )
             assert "SEARCH" in details and index in details, details
+            assert "USE TEMP B-TREE" not in details, details
     finally:
         db.close()
 

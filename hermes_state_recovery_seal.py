@@ -84,6 +84,7 @@ _SEAL_SECONDS = 5.0
 _MAX_SOURCE_ROW_BYTES = MAX_RESPONSE_BYTES
 _MAX_ACK_RESULT_BYTES = 65_536
 _MAX_SOURCE_ROWS = 100_000
+_MAX_PRODUCER_METADATA_BYTES = MAX_SNAPSHOT_BYTES
 _KINDS = cast(tuple[ArtifactKind, ...], tuple(SECTION_TAGS))
 _EVIDENCE_ISSUER = object()
 _PREPARED: weakref.WeakValueDictionary[int, PreparedProviderEvidence] = (
@@ -167,6 +168,7 @@ class _Budget:
         self.active_deadline: float | None = None
         self.snapshot_bytes = 0
         self.accounting_bytes = 0
+        self.producer_bytes = 0
         self._section_counts = {kind: 0 for kind in _KINDS}
 
     def start(self) -> None:
@@ -222,6 +224,15 @@ class _Budget:
         if kind == "accounting":
             self.accounting_bytes += size
         self._section_counts[kind] += 1
+
+    def charge_producer_metadata(self, raw_bytes: int) -> None:
+        self.check()
+        if (
+            raw_bytes < 0
+            or self.producer_bytes + raw_bytes > _MAX_PRODUCER_METADATA_BYTES
+        ):
+            raise RecoveryRefused("producer_inventory_invalid")
+        self.producer_bytes += raw_bytes
 
 
 def _check_columns(
@@ -288,6 +299,7 @@ def _member_preflight(
     store: RecoveryStore,
     scope: RecoveryScope,
     request: SealRequest,
+    budget: _Budget,
 ) -> tuple[int, tuple[RecoveryMember, ...]]:
     session = conn.execute(
         "SELECT phase,revision,root_run_id,close_request_id,close_request_json,"
@@ -367,13 +379,51 @@ def _member_preflight(
             "cancelled",
         }:
             raise RecoveryRefused("status_barrier_missing")
-        producers = conn.execute(
-            "SELECT producer_id,kind,state,owner_incarnation FROM recovery_producers "
-            "WHERE run_id=?",
-            (row[0],),
-        )
+        count = conn.execute(
+            "SELECT COUNT(*) FROM recovery_producers WHERE run_id=?", (row[0],)
+        ).fetchone()[0]
+        if type(count) is not int or count > _MAX_SOURCE_ROWS:
+            raise RecoveryRefused("producer_inventory_invalid")
         closed_callbacks = 0
-        for producer_id, kind, state, owner in producers:
+        last_state, last_rowid = "", 0
+        for _ in range(count):
+            budget.check()
+            metadata = conn.execute(
+                "SELECT rowid,substr(state,1,256),substr(producer_id,1,256),"
+                "length(substr(CAST(producer_id AS BLOB),1,257)),"
+                "length(substr(CAST(kind AS BLOB),1,257)),"
+                "length(substr(CAST(state AS BLOB),1,257)),"
+                "length(substr(CAST(owner_incarnation AS BLOB),1,257)) "
+                "FROM recovery_producers INDEXED BY idx_recovery_producers_run_state "
+                "WHERE run_id=? AND (state,rowid)>(?,?) "
+                "ORDER BY state,rowid LIMIT 1",
+                (row[0], last_state, last_rowid),
+            ).fetchone()
+            if (
+                metadata is None
+                or type(metadata[0]) is not int
+                or type(metadata[1]) is not str
+                or type(metadata[2]) is not str
+                or any(
+                    type(size) is not int or not 0 < size <= 255
+                    for size in metadata[3:]
+                )
+            ):
+                raise RecoveryRefused("producer_inventory_invalid")
+            budget.charge_producer_metadata(sum(metadata[3:]) + 64)
+            last_rowid, last_state = metadata[0], metadata[1]
+            producer = conn.execute(
+                "SELECT producer_id,kind,state,owner_incarnation "
+                "FROM recovery_producers WHERE rowid=? AND run_id=?",
+                (last_rowid, row[0]),
+            ).fetchone()
+            if (
+                producer is None
+                or producer[0] != metadata[2]
+                or producer[2] != last_state
+            ):
+                raise RecoveryRefused("producer_inventory_invalid")
+            producer_id, kind, state, owner = producer
             if (
                 owner != current_incarnation()
                 or kind not in {"executor", "tool", "sdk", "callback", "usage_write"}
@@ -652,7 +702,7 @@ def _send_values(
                         "p.owner_incarnation",
                     )
                 )
-                + ",length(substr(s.payload_json,1,65537)) "
+                + ",length(substr(s.payload_json,1,65537)),substr(a.state,1,256) "
                 "FROM recovery_sends a LEFT JOIN recovery_usage_slots s USING(attempt_id) "
                 "LEFT JOIN recovery_producers p ON p.producer_id=a.producer_id "
                 "WHERE a.run_id=? AND a.sequence=?",
@@ -662,7 +712,13 @@ def _send_values(
                 lengths is None
                 or any(
                     type(size) is not int or size > 255
-                    for size in lengths[:4] + lengths[5:13]
+                    for size in lengths[:4] + lengths[5:8] + lengths[9:13]
+                )
+                or lengths[14] not in {"accounted", "no_charge_proved"}
+                or (
+                    lengths[8] != 64
+                    if lengths[14] == "accounted"
+                    else lengths[8] is not None
                 )
                 or lengths[4] is not None
                 and (type(lengths[4]) is not int or lengths[4] > 255)
@@ -670,7 +726,9 @@ def _send_values(
                 and (type(lengths[13]) is not int or lengths[13] > 65_536)
             ):
                 raise RecoveryRefused("send_inventory_invalid")
-            budget.preview_source(sum(size or 0 for size in lengths), "send_ledger")
+            budget.preview_source(
+                sum(size or 0 for size in lengths[:14]), "send_ledger"
+            )
             meta = conn.execute(
                 "SELECT a.sequence,a.attempt_id,a.producer_id,a.delta_id,a.state,a.reason,"
                 "s.delta_id,s.attempt_id,s.state,s.ack_revision,s.payload_sha256,"
@@ -1176,7 +1234,7 @@ def finalize(
                     conn, scope, request.run_ids[0], request
                 )
                 return document[0]
-            revision, members = _member_preflight(conn, store, scope, request)
+            revision, members = _member_preflight(conn, store, scope, request, budget)
             acks, lineage = _ack_values(conn, scope, budget)
             transcript, accounting = _source_values(conn, scope, budget, lineage)
             if _cells_row(accounting[0], SESSION_COLUMNS)["source"] != "api_server":
@@ -1276,56 +1334,96 @@ def _read_document_on_conn(
     root_id: str,
     request: SealRequest | None = None,
 ) -> tuple[SealResult, bytes, SealReceipt, int]:
+    metadata = conn.execute(
+        "SELECT s.phase,typeof(s.close_request_json),"
+        "length(substr(CAST(s.close_request_json AS BLOB),1,?)),"
+        "typeof(s.receipt_json),length(substr(CAST(s.receipt_json AS BLOB),1,?)),"
+        "typeof(d.result_json),length(d.result_json),"
+        "typeof(d.receipt_json),length(d.receipt_json),"
+        "typeof(d.receipt_sha256),"
+        "length(substr(CAST(d.receipt_sha256 AS BLOB),1,65)),d.page_count "
+        "FROM recovery_sessions s JOIN recovery_seal_documents d USING(session_id) "
+        "WHERE s.session_id=? AND s.profile=? AND s.scope_digest=? AND s.root_run_id=?",
+        (
+            MAX_RESPONSE_BYTES + 1,
+            MAX_ACCOUNTING_BYTES + 1,
+            scope.session_id,
+            scope.profile,
+            scope.scope_digest,
+            root_id,
+        ),
+    ).fetchone()
+    if metadata is None or metadata[0] != "sealed":
+        raise RecoveryRefused("seal_not_found")
+    if (
+        metadata[1] != "text"
+        or type(metadata[2]) is not int
+        or not 0 < metadata[2] <= MAX_RESPONSE_BYTES
+        or metadata[3] != "text"
+        or type(metadata[4]) is not int
+        or not 0 < metadata[4] <= MAX_ACCOUNTING_BYTES
+        or metadata[5] != "blob"
+        or type(metadata[6]) is not int
+        or not 0 < metadata[6] <= MAX_RESPONSE_BYTES
+        or metadata[7] != "blob"
+        or type(metadata[8]) is not int
+        or not 0 < metadata[8] <= MAX_ACCOUNTING_BYTES
+        or metadata[9] != "text"
+        or metadata[10] != 64
+        or type(metadata[11]) is not int
+        or not 1 <= metadata[11] <= MAX_ROUTE_PAGES
+    ):
+        raise RecoveryRefused("sealed_document_invalid")
     row = conn.execute(
-        "SELECT s.phase,s.root_run_id,s.close_request_json,s.receipt_json,"
-        "length(d.result_json),length(d.receipt_json),d.receipt_sha256,d.page_count "
+        "SELECT s.close_request_json,s.receipt_json,d.result_json,d.receipt_json,"
+        "d.receipt_sha256,d.page_count "
         "FROM recovery_sessions s JOIN recovery_seal_documents d USING(session_id) "
         "WHERE s.session_id=? AND s.profile=? AND s.scope_digest=? AND s.root_run_id=?",
         (scope.session_id, scope.profile, scope.scope_digest, root_id),
     ).fetchone()
-    if row is None or row[0] != "sealed":
-        raise RecoveryRefused("seal_not_found")
-    if request is not None and row[2] != request.model_dump_json():
-        raise RecoveryRefused("close_conflict")
-    if (
-        type(row[4]) is not int
-        or not 0 < row[4] <= MAX_RESPONSE_BYTES
-        or type(row[5]) is not int
-        or not 0 < row[5] <= MAX_ACCOUNTING_BYTES
-        or type(row[7]) is not int
-        or not 1 <= row[7] <= MAX_ROUTE_PAGES
-    ):
-        raise RecoveryRefused("sealed_document_invalid")
-    payload = conn.execute(
-        "SELECT result_json,receipt_json FROM recovery_seal_documents WHERE session_id=?",
-        (scope.session_id,),
-    ).fetchone()
-    if payload is None or any(type(part) is not bytes for part in payload):
-        raise RecoveryRefused("sealed_document_invalid")
     try:
-        result = SealResult.model_validate(strict_json_loads(payload[0]))
+        if (
+            row is None
+            or type(row[0]) is not str
+            or type(row[1]) is not str
+            or type(row[2]) is not bytes
+            or type(row[3]) is not bytes
+            or type(row[4]) is not str
+            or row[5] != metadata[11]
+            or len(row[0].encode("utf-8")) != metadata[2]
+            or len(row[1].encode("utf-8")) != metadata[4]
+            or len(row[2]) != metadata[6]
+            or len(row[3]) != metadata[8]
+        ):
+            raise RecoveryRefused("sealed_document_invalid")
+    except UnicodeError as exc:
+        raise RecoveryRefused("sealed_document_invalid") from exc
+    if request is not None and row[0] != request.model_dump_json():
+        raise RecoveryRefused("close_conflict")
+    try:
+        result = SealResult.model_validate(strict_json_loads(row[2]))
         receipt = SealReceipt.model_validate(
-            strict_json_loads(payload[1], max_bytes=MAX_ACCOUNTING_BYTES)
+            strict_json_loads(row[3], max_bytes=MAX_ACCOUNTING_BYTES)
         )
         if (
             result.state != "sealed"
             or result.receipt != receipt
             or (request is not None and result.request_id != request.request_id)
-            or canonical_json_bytes(result) != payload[0]
-            or canonical_json_bytes(receipt) != payload[1]
-            or receipt_sha256(receipt) != row[6]
-            or row[3] != payload[1].decode("utf-8")
+            or canonical_json_bytes(result) != row[2]
+            or canonical_json_bytes(receipt) != row[3]
+            or receipt_sha256(receipt) != row[4]
+            or row[1] != row[3].decode("utf-8")
             or receipt.session_id != scope.session_id
             or receipt.store_id != scope.store_id
             or receipt.profile != scope.profile
             or receipt.scope_digest != scope.scope_digest
             or receipt.members[0].run_id != root_id
-            or receipt.manifest_page_count + receipt.data_page_count != row[7]
+            or receipt.manifest_page_count + receipt.data_page_count != row[5]
         ):
             raise ValueError("sealed document mismatch")
     except (ValueError, TypeError, UnicodeError) as exc:
         raise RecoveryRefused("sealed_document_invalid") from exc
-    return result, payload[0], receipt, row[7]
+    return result, row[2], receipt, row[5]
 
 
 def _read_document(
