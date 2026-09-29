@@ -250,6 +250,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     newly_created = False
+    created_fd: int | None = None
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
@@ -288,22 +289,34 @@ def _connect(path: Path) -> sqlite3.Connection:
     else:
         try:
             identity = os.fstat(fd)
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        created_fd = fd
         newly_created = True
-    if newly_created:
-        _secure_state_db_files(path)
-    conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
     try:
-        current = path.lstat()
-        if ((current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
-                or not stat.S_ISREG(current.st_mode)):
-            raise RecoveryRefused("protected_session_authority_unavailable")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
-    except BaseException:
-        conn.close()
-        raise
+        if newly_created:
+            _secure_state_db_files(path)
+        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+        try:
+            # Force SQLite's main-file open before comparing the pathname with
+            # the still-held O_EXCL inode. Closing it earlier permits immediate
+            # inode reuse after an unlink/replacement on some filesystems.
+            databases = conn.execute("PRAGMA database_list").fetchall()
+            main = [row[2] for row in databases if row[1] == "main"]
+            current = path.lstat()
+            if (len(main) != 1 or not main[0] or Path(main[0]).resolve() != path.resolve()
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
+                    or not stat.S_ISREG(current.st_mode)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+    finally:
+        if created_fd is not None:
+            os.close(created_fd)
 
 
 def _authorize_one(conn: sqlite3.Connection, operation: str, claim_id: str,

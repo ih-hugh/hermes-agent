@@ -100,19 +100,92 @@ def test_valid_empty_sqlite_header_can_bootstrap(tmp_path: Path):
 def test_bootstrap_refuses_path_replaced_after_exclusive_creation(tmp_path: Path,
                                                                   monkeypatch):
     import hermes_state as hs
+    import hermes_state_recovery_exclusions as exclusions
 
     path = tmp_path / "state.db"
     original = hs._secure_state_db_files
+    original_open = exclusions.os.open
+    original_connect = exclusions.sqlite3.connect
+    retained: list[int] = []
+    swapped: list[bool] = []
+    connected: list[bool] = []
+    original_identity: list[tuple[int, int]] = []
+    retained_at_swap: list[bool] = []
+
+    def capture_exclusive(target, flags, mode=0o777):
+        fd = original_open(target, flags, mode)
+        if Path(target) == path and flags & os.O_EXCL:
+            retained.append(fd)
+            identity = os.fstat(fd)
+            original_identity.append((identity.st_dev, identity.st_ino))
+        return fd
 
     def swap(target, *, create_main=False):
+        swapped.append(True)
         original(target, create_main=create_main)
+        assert len(retained) == 1
+        try:
+            created = os.fstat(retained[0])
+        except OSError:
+            retained_at_swap.append(False)
+        else:
+            retained_at_swap.append(True)
+            assert (created.st_dev, created.st_ino) == original_identity[0]
         target.unlink()
         target.write_bytes(b"")
+        if retained_at_swap[-1]:
+            replacement = target.lstat()
+            assert (replacement.st_dev, replacement.st_ino) != original_identity[0]
 
+    def connect(*args, **kwargs):
+        assert len(retained) == 1
+        os.fstat(retained[0])
+        connected.append(True)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(exclusions.os, "open", capture_exclusive)
+    monkeypatch.setattr(exclusions.sqlite3, "connect", connect)
     monkeypatch.setattr(hs, "_secure_state_db_files", swap)
     with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
         begin_raw_schema_claim(path)
+    assert swapped == [True]
+    assert connected == [True]
+    assert retained_at_swap == [True]
     assert path.read_bytes() == b""
+    with pytest.raises(OSError):
+        os.fstat(retained[0])
+
+
+@pytest.mark.parametrize("failure", ["secure", "connect"])
+def test_exclusive_inode_descriptor_closes_on_bootstrap_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    import hermes_state as hs
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    original_open = exclusions.os.open
+    retained: list[int] = []
+
+    def capture_exclusive(target, flags, mode=0o777):
+        fd = original_open(target, flags, mode)
+        if Path(target) == path and flags & os.O_EXCL:
+            retained.append(fd)
+        return fd
+
+    def fail(*args, **kwargs):
+        raise sqlite3.OperationalError("synthetic bootstrap failure")
+
+    monkeypatch.setattr(exclusions.os, "open", capture_exclusive)
+    if failure == "secure":
+        monkeypatch.setattr(hs, "_secure_state_db_files", fail)
+    else:
+        monkeypatch.setattr(exclusions.sqlite3, "connect", fail)
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        begin_raw_schema_claim(path)
+    assert len(retained) == 1
+    with pytest.raises(OSError):
+        os.fstat(retained[0])
 
 
 def test_raw_claim_close_cannot_retire_wal_during_initializer_open(tmp_path: Path,
