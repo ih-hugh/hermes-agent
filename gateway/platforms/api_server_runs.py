@@ -364,6 +364,7 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     tool_observer: Any = None
+    recovery_handoff: object | None = None  # one-use, process-local authority from committed admission
 
     @property
     def approval_session_key(self) -> str:
@@ -417,14 +418,29 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     gateway_session_key, key_err = self._parse_session_key_header(request)
     if key_err is not None:
         return key_err
+    protected_key = request.headers.get("Idempotency-Key", "").strip().startswith("byf-recovery-v1:")
     try:
-        body = await request.json()
+        if protected_key:
+            # StreamReader.read(n) may return a fragment before EOF. Count actual
+            # wire bytes, including whitespace, and stop before JSON decoding.
+            limit = 16 * 1024
+            raw = bytearray()
+            while len(raw) <= limit:
+                fragment = await request.content.read(min(4096, limit + 1 - len(raw)))
+                if not fragment:
+                    break
+                raw.extend(fragment)
+            if len(raw) > limit:
+                return _json_error(_openai_error, "Protected request body too large",
+                                   code="recovery_body_too_large", status=413)
+            body = json.loads(raw)
+        else:
+            body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
     # Protected execution is opened only by the served runtime instrumentation
     # (producer, tool, SDK and write guards). Until that runtime is installed,
     # no request flag can turn a reservation into an untracked dispatch.
-    protected_key = request.headers.get("Idempotency-Key", "").strip().startswith("byf-recovery-v1:")
     requested_recovery = isinstance(body, dict) and "recovery" in body
     recovery_admission = None
     if protected_key or requested_recovery:
@@ -434,17 +450,12 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                                code="recovery_admission_mismatch", status=400)
         try:
             recovery_admission = RecoveryAdmission.model_validate(body["recovery"])
-            if (len(json.dumps(body, separators=(",", ":")).encode()) > 16 * 1024
-                    or not isinstance(body.get("session_id"), str) or not body["session_id"]
+            if (not isinstance(body.get("session_id"), str) or not body["session_id"]
                     or (recovery_admission.generation == 0) != (recovery_admission.parent_run_id is None)):
                 raise ValueError("invalid protected recovery request")
         except (ValueError, TypeError):
             return _json_error(_openai_error, "Invalid protected recovery admission",
                                code="invalid_recovery_admission", status=400)
-        ready = getattr(self, "_recovery_runtime_ready", None)
-        if not callable(ready) or not ready(request, body):
-            return _json_error(_openai_error, "Protected runtime is not yet eligible",
-                               code="recovery_runtime_unavailable", status=503)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -502,17 +513,19 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
     protected_store = protected_scope = None
+    recovery_handoff = None
     if recovery_admission is not None:
         from hermes_state_recovery import RecoveryStore, RecoveryScope, RecoveryRefused
-        if self._run_idempotency_store.has_key(idempotency_scope, idempotency_key):
+        if await asyncio.to_thread(self._run_idempotency_store.has_key, idempotency_scope, idempotency_key):
             return _json_error(_openai_error, "Legacy key collision", code="recovery_legacy_collision", status=409)
         db = await self._ensure_session_db_async()
         try:
-            protected_store = RecoveryStore(db)
+            protected_store = await asyncio.to_thread(RecoveryStore, db)
             protected_scope = RecoveryScope(
                 protected_store.store_id, _api_server._api_request_profile.get() or "default",
                 idempotency_scope, body["session_id"])
-            prior = protected_store.lookup_key(protected_scope, idempotency_key, idempotency_fingerprint)
+            prior = await asyncio.to_thread(
+                protected_store.lookup_key, protected_scope, idempotency_key, idempotency_fingerprint)
         except (RecoveryRefused, AttributeError):
             return _json_error(_openai_error, "Protected state store unavailable",
                                code="recovery_store_unavailable", status=503)
@@ -520,10 +533,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             if prior.outcome == "conflict":
                 return _json_error(_openai_error, "Protected key conflict",
                                    code="idempotency_key_conflict", status=409)
-            prior_status = protected_store.status_for_run(
-                protected_scope.profile, protected_scope.scope_digest, prior.member.run_id) or {"status": "queued"}
+            prior_status = await asyncio.to_thread(
+                protected_store.status_for_run, protected_scope.profile, protected_scope.scope_digest,
+                prior.member.run_id) or {"status": "queued"}
             return _accepted_response(prior.member.run_id, prior_status.get("status", "queued"),
                                       gateway_session_key, replayed=True)
+        ready = getattr(self, "_recovery_runtime_ready", None)
+        if not callable(ready) or not ready(request, body):
+            return _json_error(_openai_error, "Protected runtime is not yet eligible",
+                               code="recovery_runtime_unavailable", status=503)
     elif idempotency_key:
         outcome, record = self._run_idempotency_store.lookup(
             idempotency_scope, idempotency_key, idempotency_fingerprint,
@@ -588,7 +606,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if recovery_admission is not None:
         from agent.recovery_context import current_incarnation
         from hermes_state_recovery import AdmissionIdentity
-        result = protected_store.reserve(recovery_admission, AdmissionIdentity(
+        result = await asyncio.to_thread(protected_store.reserve, recovery_admission, AdmissionIdentity(
             protected_scope, idempotency_key, idempotency_fingerprint, run_id,
             current_incarnation(), initial_status))
         if result.outcome != "created":
@@ -596,14 +614,16 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             _forget_run(self, run_id, self._run_streams, self._run_streams_created,
                         self._run_approval_sessions, self._run_statuses, self._run_owners)
             if result.outcome == "replayed":
-                status = protected_store.status_for_run(
-                    protected_scope.profile, protected_scope.scope_digest, result.member.run_id) or {"status": "queued"}
+                status = await asyncio.to_thread(
+                    protected_store.status_for_run, protected_scope.profile, protected_scope.scope_digest,
+                    result.member.run_id) or {"status": "queued"}
                 return _accepted_response(result.member.run_id, status.get("status", "queued"),
                                           gateway_session_key, replayed=True)
             return _json_error(_openai_error, "Protected admission refused",
                                code=result.reason or "recovery_conflict", status=409)
         self._protected_run_ids.add(run_id)
         self._protected_run_stores[run_id] = protected_store
+        recovery_handoff = result.handoff
     elif idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
@@ -627,7 +647,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author,
-        tool_observer=tool_observer)
+        tool_observer=tool_observer,
+        recovery_handoff=recovery_handoff)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -931,8 +952,8 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = _load_owned_run(
-        self, request, _api_server=_api_server, permission="status", active_fallback=True)
+    _, status, _, _, err = await asyncio.to_thread(
+        _load_owned_run, self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err or web.json_response(status)
 
 
@@ -942,7 +963,7 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await asyncio.to_thread(self._request_owns_run, request, run_id):
         return _run_not_found(_api_server._openai_error, run_id)
     # Allow subscribing slightly before the run is registered (race window).
     # Confirm the force-kill actually reaped the process before we clear its PID file / scoped locks.
@@ -996,8 +1017,8 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
-        self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+    run_id, _, _, _, err = await asyncio.to_thread(
+        _load_owned_run, self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
     try:
@@ -1049,8 +1070,8 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, _, err = _load_owned_run(
-        self, request, _api_server=_api_server, permission=None, active_fallback=False)
+    run_id, status, agent, _, err = await asyncio.to_thread(
+        _load_owned_run, self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
     # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
@@ -1083,8 +1104,8 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, task, err = _load_owned_run(
-        self, request, _api_server=_api_server, permission="stop", active_fallback=True)
+    run_id, status, agent, task, err = await asyncio.to_thread(
+        _load_owned_run, self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
     if status.get("status") in TERMINAL_STATUSES:

@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 _PROCESS_NONCE = uuid.uuid4().hex
 _ISSUER = object()
 _REGISTRY: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
-_CLAIMED: set[tuple] = set()
-_CLAIM_LOCK = threading.Lock()
+_HANDOFFS: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
+_ISSUE_LOCK = threading.Lock()
 _ACTIVE_WRITE: ContextVar[WritePermit | None] = ContextVar("recovery_write_permit", default=None)
 
 
@@ -48,31 +48,69 @@ class WritePermit:
         raise TypeError("write permits cannot be copied or serialized")
 
 
-def issue_producer_permit(store: RecoveryStore, identity: AdmissionIdentity) -> ProducerPermit:
+class AdmissionHandoff:
+    """One-use authority returned only with a newly committed reservation."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, issuer: object):
+        if issuer is not _ISSUER:
+            raise TypeError("admission handoffs are issued internally")
+
+    def __reduce_ex__(self, protocol: int):
+        raise TypeError("admission handoffs cannot be copied or serialized")
+
+
+def _register_admission_handoff(store: RecoveryStore, identity: AdmissionIdentity,
+                                generation: int) -> AdmissionHandoff | None:
+    """Called by RecoveryStore only after its BEGIN IMMEDIATE reservation committed."""
+    if identity.owner_incarnation != current_incarnation():
+        return None
+    handoff = AdmissionHandoff(_ISSUER)
+    with _ISSUE_LOCK:
+        _HANDOFFS[handoff] = (
+            os.getpid(), _PROCESS_NONCE, id(store.db), store.store_id, identity.scope,
+            identity.run_id, generation, identity.idempotency_key, identity.request_sha256,
+            identity.owner_incarnation)
+    return handoff
+
+
+def issue_producer_permit(store: RecoveryStore, handoff: AdmissionHandoff) -> ProducerPermit:
     from hermes_state_recovery import RecoveryRefused
 
-    if identity.owner_incarnation != current_incarnation() or identity.scope.store_id != store.store_id:
+    if type(handoff) is not AdmissionHandoff:
+        raise RecoveryRefused("invalid_admission_handoff")
+    with _ISSUE_LOCK:
+        record = _HANDOFFS.pop(handoff, None)
+    if record is None:
+        raise RecoveryRefused("admission_handoff_consumed")
+    (pid, nonce, db_id, store_id, scope, run_id, generation, key, fingerprint, owner) = record
+    if (pid, nonce, db_id, store_id) != (os.getpid(), _PROCESS_NONCE, id(store.db), store.store_id):
         raise RecoveryRefused("foreign_producer")
     row = store.db._read_one(
-        "SELECT generation,owner_incarnation,producer_state FROM recovery_members "
+        "SELECT generation,owner_incarnation,producer_state,idempotency_key,request_sha256 "
+        "FROM recovery_members "
         "WHERE run_id=? AND session_id=? AND profile=? AND scope_digest=?",
-        (identity.run_id, identity.scope.session_id, identity.scope.profile, identity.scope.scope_digest))
-    if row is None or row[1] != current_incarnation() or row[2] != "open":
-        raise RecoveryRefused("producer_unavailable")
-    claim = (os.getpid(), _PROCESS_NONCE, store.store_id, identity.scope,
-             identity.run_id, int(row[0]))
-    with _CLAIM_LOCK:
-        if claim in _CLAIMED:
-            raise RecoveryRefused("producer_already_claimed")
+        (run_id, scope.session_id, scope.profile, scope.scope_digest))
+    if (row is None or (row[0], row[1], row[2], row[3], row[4])
+            != (generation, owner, "open", key, fingerprint) or owner != current_incarnation()):
+        raise RecoveryRefused("admission_handoff_mismatch")
+    with _ISSUE_LOCK:
         permit = ProducerPermit(_ISSUER)
-        _CLAIMED.add(claim)
-        _REGISTRY[permit] = (os.getpid(), _PROCESS_NONCE, id(store.db), identity.scope,
-                             identity.run_id, int(row[0]))
+        _REGISTRY[permit] = (os.getpid(), _PROCESS_NONCE, id(store.db), scope,
+                             run_id, generation)
     return permit
 
 
 def validate_producer_permit(permit: ProducerPermit, store: RecoveryStore, scope: RecoveryScope,
                              run_id: str, generation: int) -> bool:
+    return _validate_permit(permit, ProducerPermit, store, scope, run_id, generation)
+
+
+def _validate_permit(permit: object, kind: type, store: RecoveryStore, scope: RecoveryScope,
+                     run_id: str, generation: int) -> bool:
+    if type(permit) is not kind:
+        return False
     try:
         record = _REGISTRY.get(permit)
     except TypeError:
@@ -98,7 +136,7 @@ def issue_write_permit(permit: ProducerPermit, store: RecoveryStore, scope: Reco
 
 def validate_write_permit(permit: WritePermit, store: RecoveryStore, scope: RecoveryScope,
                           run_id: str, generation: int) -> bool:
-    return validate_producer_permit(permit, store, scope, run_id, generation)
+    return _validate_permit(permit, WritePermit, store, scope, run_id, generation)
 
 
 @contextmanager

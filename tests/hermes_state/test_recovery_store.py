@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from copy import copy
+from copy import copy, deepcopy
 from multiprocessing import get_context
 from pathlib import Path
+import asyncio
+import json
+import sqlite3
+import threading
 from uuid import uuid4
 
 import pytest
@@ -13,10 +17,13 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore, RecoveryRefused
 from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, SealRequest
-from gateway.platforms.api_server_recovery_contract import SealResult, SnapshotPage
+from gateway.platforms.api_server_recovery_contract import SealResult, SnapshotPage, SnapshotRow
 from gateway.platforms.api_server_recovery_contract import RecoveryMember, SealReceipt
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
-from agent.recovery_context import current_incarnation, issue_producer_permit, validate_producer_permit
+from agent.recovery_context import (
+    current_incarnation, issue_producer_permit, issue_write_permit,
+    validate_producer_permit, validate_write_permit,
+)
 from gateway.platforms import api_server, api_server_runs
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -92,7 +99,7 @@ def test_atomic_member_before_dispatch(tmp_path: Path):
         result = first.reserve(_root(), _identity(first))
         assert result.outcome == "created"
         admitted_members.append(result.member.run_id)
-        assert second.lookup_root(_identity(second).scope, "run_root").members[0].run_id == "run_root"
+        assert second.lookup_key(_identity(second).scope, "byf-recovery-v1:one", "a" * 64).member.run_id == "run_root"
         # A crash here leaves a durable reservation, never an unrecorded dispatch.
         assert dispatched_members == []
         replay = second.reserve(_root(), _identity(second))
@@ -110,8 +117,9 @@ def test_close_races_admission(tmp_path: Path):
     first, second = _stores(tmp_path)
     try:
         root_identity = _identity(first, owner=current_incarnation())
-        assert first.reserve(_root(), root_identity).outcome == "created"
-        first.close_producer(root_identity.scope, "run_root", issue_producer_permit(first, root_identity))
+        admitted = first.reserve(_root(), root_identity)
+        assert admitted.outcome == "created"
+        first.close_producer(root_identity.scope, "run_root", issue_producer_permit(first, admitted.handoff))
         scope = _identity(first).scope
         request = _seal()
         nudge = RecoveryAdmission(schema="hermes.recovery/v1", generation=1, parent_run_id="run_root")
@@ -150,8 +158,8 @@ def test_two_processes_serialize_close_against_nudge(tmp_path: Path):
     db = SessionDB(path)
     store = RecoveryStore(db)
     identity = _identity(store, owner=current_incarnation())
-    store.reserve(_root(), identity)
-    store.close_producer(identity.scope, "run_root", issue_producer_permit(store, identity))
+    result = store.reserve(_root(), identity)
+    store.close_producer(identity.scope, "run_root", issue_producer_permit(store, result.handoff))
     db.close()
     context = get_context("spawn")
     with context.Manager() as manager, ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
@@ -182,6 +190,7 @@ def test_receipt_members_survive_run_retention(tmp_path: Path):
     legacy = RunIdempotencyStore(str(tmp_path / "legacy.db"))
     try:
         protected.reserve(_root(), _identity(protected))
+        protected.begin_close(_identity(protected).scope, _seal())
         legacy.reserve("scope", "ordinary", "fingerprint", "run_old", {"status": "completed"})
         legacy._conn.execute("DELETE FROM run_idempotency")
         legacy._conn.commit()
@@ -191,6 +200,46 @@ def test_receipt_members_survive_run_retention(tmp_path: Path):
         protected.db.close()
         other.db.close()
         legacy.close()
+
+
+def test_lookup_root_requires_recorded_close(tmp_path: Path):
+    first, second = _stores(tmp_path)
+    try:
+        first.reserve(_root(), _identity(first))
+        with pytest.raises(RecoveryRefused) as absent:
+            second.lookup_root(_identity(second).scope, "run_root")
+        assert absent.value.code == "not_found"
+        first.begin_close(_identity(first).scope, _seal())
+        assert second.lookup_root(_identity(second).scope, "run_root").request_id is not None
+    finally:
+        first.db.close()
+        second.db.close()
+
+
+def test_readback_keeps_revision_and_members_in_one_snapshot(tmp_path: Path, monkeypatch):
+    first, second = _stores(tmp_path)
+    identity = _identity(first, owner=current_incarnation())
+    try:
+        admitted = first.reserve(_root(), identity)
+        permit = issue_producer_permit(first, admitted.handoff)
+        first.begin_close(identity.scope, _seal())
+        original_view = RecoveryStore._view
+        changed = False
+
+        def change_between_reads(cls, conn, row):
+            nonlocal changed
+            if not changed:
+                changed = True
+                first.close_producer(identity.scope, "run_root", permit)
+            return original_view(conn, row)
+
+        monkeypatch.setattr(RecoveryStore, "_view", classmethod(change_between_reads))
+        view = second.lookup_root(_identity(second).scope, "run_root")
+        assert view.revision == 2
+        assert view.members[0].producer_state == "open"
+    finally:
+        first.db.close()
+        second.db.close()
 
 
 def test_memory_fallback_refused(tmp_path: Path):
@@ -214,16 +263,26 @@ def test_permit_is_process_owned_and_cannot_be_copied(tmp_path: Path):
     first, second = _stores(tmp_path)
     identity = _identity(first, owner=current_incarnation())
     try:
-        assert first.reserve(_root(), identity).outcome == "created"
-        permit = issue_producer_permit(first, identity)
+        admitted = first.reserve(_root(), identity)
+        assert admitted.outcome == "created"
+        permit = issue_producer_permit(first, admitted.handoff)
         assert validate_producer_permit(permit, first, identity.scope, "run_root", 0)
         with pytest.raises(RecoveryRefused) as repeated:
+            issue_producer_permit(first, admitted.handoff)
+        assert repeated.value.code == "admission_handoff_consumed"
+        with pytest.raises(RecoveryRefused):
             issue_producer_permit(first, identity)
-        assert repeated.value.code == "producer_already_claimed"
+        assert first.reserve(_root(), identity).handoff is None
         assert not validate_producer_permit(permit, second, identity.scope, "run_root", 0)
         with pytest.raises(TypeError):
             copy(permit)
         assert not validate_producer_permit(permit, first, identity.scope, "run_other", 0)
+        write = issue_write_permit(permit, first, identity.scope, "run_root", 0)
+        assert validate_write_permit(write, first, identity.scope, "run_root", 0)
+        assert not validate_write_permit(permit, first, identity.scope, "run_root", 0)
+        assert not validate_producer_permit(write, first, identity.scope, "run_root", 0)
+        with pytest.raises(RecoveryRefused):
+            first.close_producer(identity.scope, "run_root", write)
         first.close_producer(identity.scope, "run_root", permit)
         assert not validate_producer_permit(permit, first, identity.scope, "run_root", 0)
     finally:
@@ -231,13 +290,29 @@ def test_permit_is_process_owned_and_cannot_be_copied(tmp_path: Path):
         second.db.close()
 
 
+@pytest.mark.parametrize("changed_column", ["idempotency_key", "request_sha256"])
+def test_handoff_checks_complete_recorded_identity(tmp_path: Path, changed_column: str):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    try:
+        admitted = store.reserve(_root(), identity)
+        db._write_sql(f"UPDATE recovery_members SET {changed_column}=? WHERE run_id=?",
+                      ("different" if changed_column == "idempotency_key" else "c" * 64, "run_root"))
+        with pytest.raises(RecoveryRefused) as refused:
+            issue_producer_permit(store, admitted.handoff)
+        assert refused.value.code == "admission_handoff_mismatch"
+    finally:
+        db.close()
+
+
 def test_incomplete_reason_sticks_through_close(tmp_path: Path):
     db = SessionDB(tmp_path / "state.db")
     store = RecoveryStore(db)
     identity = _identity(store, owner=current_incarnation())
     try:
-        store.reserve(_root(), identity)
-        permit = issue_producer_permit(store, identity)
+        admitted = store.reserve(_root(), identity)
+        permit = issue_producer_permit(store, admitted.handoff)
         store.mark_incomplete(identity.scope, "run_root", permit, "unknown_send_outcome")
         view = store.begin_close(identity.scope, _seal())
         assert view.state == "unsupported"
@@ -249,8 +324,6 @@ def test_incomplete_reason_sticks_through_close(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("key", "recovery", "expected_status", "expected_code"), [
-    ("byf-recovery-v1:one", {"schema": "hermes.recovery/v1", "generation": 0,
-                              "parent_run_id": None}, 503, b"recovery_runtime_unavailable"),
     ("byf-recovery-v1:one", None, 400, b"recovery_admission_mismatch"),
     ("ordinary", {"schema": "hermes.recovery/v1", "generation": 0,
                    "parent_run_id": None}, 400, b"recovery_admission_mismatch"),
@@ -267,15 +340,54 @@ async def test_http_refuses_protected_dispatch_until_runtime_ready(key, recovery
     class Request:
         headers = {"Idempotency-Key": key}
 
-        async def json(self):
+        def __init__(self):
             body = {"input": "hello", "session_id": "exact-session"}
             if recovery is not None:
                 body["recovery"] = recovery
-            return body
+            self._body = body
+            self.content = self
+            self._raw = json.dumps(body).encode()
+
+        async def read(self, limit):
+            chunk, self._raw = self._raw[:limit], self._raw[limit:]
+            return chunk
+
+        async def json(self):
+            return self._body
 
     response = await api_server_runs._handle_runs(Adapter(), Request(), _api_server=api_server)
     assert response.status == expected_status
     assert expected_code in response.body
+
+
+@pytest.mark.asyncio
+async def test_raw_protected_body_limit_precedes_json_parse():
+    class Adapter:
+        def _parse_session_key_header(self, request):
+            return None, None
+
+    class Request:
+        headers = {"Idempotency-Key": "byf-recovery-v1:one"}
+
+        def __init__(self):
+            self.content = self
+            self.remaining = 16 * 1024 + 1
+            self.reads = 0
+
+        async def read(self, limit):
+            amount = min(257, limit, self.remaining)
+            self.remaining -= amount
+            self.reads += 1
+            return b" " * amount
+
+        async def json(self):
+            raise AssertionError("oversized protected JSON must not be parsed")
+
+    request = Request()
+    response = await api_server_runs._handle_runs(Adapter(), request, _api_server=api_server)
+    assert response.status == 413
+    assert b"recovery_body_too_large" in response.body
+    assert request.reads > 1
 
 
 def test_wire_rejects_non_json_snapshot_and_inconsistent_result():
@@ -299,6 +411,59 @@ def test_shared_wire_fixture_is_strict_and_round_trips():
         assert model.model_validate(fixture[name]).model_dump(mode="json", by_alias=True) == fixture[name]
         with pytest.raises(ValueError):
             model.model_validate({**fixture[name], "unexpected": "field"})
+    assert isinstance(SealRequest.model_validate(fixture["seal_request"]).run_ids, tuple)
+    assert isinstance(SealReceipt.model_validate(fixture["seal_receipt"]).members, tuple)
+    assert isinstance(SnapshotPage.model_validate(fixture["snapshot_page"]).rows, tuple)
+    assert SnapshotPage.model_validate_json(json.dumps(fixture["snapshot_page"])).model_dump(
+        mode="json", by_alias=True) == fixture["snapshot_page"]
+
+
+def test_snapshot_row_nested_json_is_immutable_and_serializes():
+    row = SnapshotRow(row_index=0, row_sha256="a" * 64,
+                      message={"blocks": [{"text": "hello"}]})
+    with pytest.raises(TypeError):
+        row.message["blocks"] = []
+    assert isinstance(row.message["blocks"], tuple)
+    with pytest.raises(TypeError):
+        row.message["blocks"][0]["text"] = "changed"
+    assert row.model_dump(mode="json")["message"] == {"blocks": [{"text": "hello"}]}
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("gateway_incarnation", ""), ("profile", ""), ("scope_digest", "bad"),
+    ("session_id", ""), ("revision", -1), ("sealed_at", float("inf")),
+])
+def test_receipt_rejects_unbounded_identity_or_time(field: str, value):
+    import json
+
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures" / "recovery_contract_v1.json").read_text())
+    receipt = deepcopy(fixture["seal_receipt"])
+    receipt[field] = value
+    with pytest.raises(ValueError):
+        SealReceipt.model_validate(receipt)
+
+
+def test_seal_result_rejects_unknown_or_unbounded_reason():
+    with pytest.raises(ValueError):
+        SealResult(schema="hermes.recovery/v1", state="unsupported", request_id=str(uuid4()),
+                   reasons=["arbitrary developer exception " * 100], receipt=None)
+
+
+def test_wire_rejects_unbounded_member_identity_and_revision():
+    with pytest.raises(ValueError):
+        RecoveryMember(run_id="x" * 256, generation=0, parent_run_id=None,
+                       request_sha256="a" * 64, producer_state="open")
+    with pytest.raises(ValueError):
+        RecoveryMember(run_id="run_nudge", generation=1, parent_run_id="",
+                       request_sha256="a" * 64, producer_state="open")
+    with pytest.raises(ValueError):
+        SealRequest(request_id=str(uuid4()), session_id="exact-session",
+                    run_ids=["x" * 256], expected_membership_sha256="a" * 64)
+    receipt = json.loads((Path(__file__).parents[1] / "fixtures" / "recovery_contract_v1.json").read_text())[
+        "seal_receipt"]
+    receipt["revision"] = 2**63
+    with pytest.raises(ValueError):
+        SealReceipt.model_validate(receipt)
 
 
 @pytest.mark.asyncio
@@ -307,10 +472,10 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     db = SessionDB(tmp_path / "state.db")
     adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = db
-    adapter._recovery_runtime_ready = lambda request, body: True
     dispatched: list[str] = []
 
     async def fake_execute(owner, launch, *, _api_server):
+        assert launch.recovery_handoff is not None
         dispatched.append(launch.run_id)
 
     monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
@@ -322,9 +487,13 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     headers = {"Idempotency-Key": "byf-recovery-v1:one"}
     try:
         async with TestClient(TestServer(app)) as client:
+            unavailable = await client.post("/v1/runs", json=body, headers=headers)
+            assert unavailable.status == 503
+            adapter._recovery_runtime_ready = lambda request, body: True
             first = await client.post("/v1/runs", json=body, headers=headers)
             assert first.status == 202
             first_id = (await first.json())["run_id"]
+            adapter._recovery_runtime_ready = lambda request, body: False
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202
             assert (await replay.json())["run_id"] == first_id
@@ -335,11 +504,118 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
             status = await client.get(f"/v1/runs/{first_id}")
             assert status.status == 200
             assert (await status.json())["run_id"] == first_id
-            assert [m.run_id for m in RecoveryStore(db).lookup_root(
-                RecoveryScope(RecoveryStore(db).store_id, "default",
-                              adapter._run_idempotency_scope(type("R", (), {"path": "/v1/runs", "headers": {}})()),
-                              "exact-session"), first_id).members] == [first_id]
+            scope = RecoveryScope(RecoveryStore(db).store_id, "default",
+                                  adapter._run_idempotency_scope(type("R", (), {
+                                      "path": "/v1/runs", "headers": {}})()), "exact-session")
+            assert RecoveryStore(db).owns_run(scope.profile, scope.scope_digest, first_id)
         assert dispatched == [first_id]
     finally:
         await adapter.disconnect()
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_lock_does_not_block_unrelated_event_loop_work(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    adapter._recovery_runtime_ready = lambda request, body: True
+
+    async def fake_execute(owner, launch, *, _api_server):
+        return None
+
+    monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    lock_conn = sqlite3.connect(tmp_path / "state.db", check_same_thread=False)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    released = threading.Event()
+
+    def release_writer():
+        lock_conn.rollback()
+        released.set()
+
+    timer = threading.Timer(0.4, release_writer)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            timer.start()
+            task = asyncio.create_task(client.post("/v1/runs", json={
+                "input": "hello", "session_id": "exact-session",
+                "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None},
+            }, headers={"Idempotency-Key": "byf-recovery-v1:one"}))
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.05)
+            assert asyncio.get_running_loop().time() - started < 0.2
+            assert (await task).status == 202
+    finally:
+        timer.join(timeout=1)
+        if not released.is_set():
+            lock_conn.rollback()
+        lock_conn.close()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_protected", [False, True])
+async def test_pending_protected_reservation_holds_concurrency_slot(
+        tmp_path: Path, monkeypatch, second_protected: bool):
+    db = SessionDB(tmp_path / "state.db")
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    adapter._max_concurrent_runs = 1
+    adapter._recovery_runtime_ready = lambda request, body: True
+    entered = threading.Event()
+    release = threading.Event()
+    original_reserve = RecoveryStore.reserve
+
+    def held_reserve(store, admission, identity):
+        entered.set()
+        assert release.wait(timeout=3)
+        return original_reserve(store, admission, identity)
+
+    async def fake_execute(owner, launch, *, _api_server):
+        return None
+
+    monkeypatch.setattr(RecoveryStore, "reserve", held_reserve)
+    monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    body = {"input": "hello", "session_id": "exact-session",
+            "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None}}
+    first = None
+    try:
+        async with TestClient(TestServer(app)) as client:
+            first = asyncio.create_task(client.post(
+                "/v1/runs", json=body, headers={"Idempotency-Key": "byf-recovery-v1:one"}))
+            assert await asyncio.to_thread(entered.wait, 2)
+            next_body = body if second_protected else {"input": "ordinary"}
+            next_headers = {"Idempotency-Key": "byf-recovery-v1:two"} if second_protected else {}
+            second = await client.post("/v1/runs", json=next_body, headers=next_headers)
+            assert second.status == 429
+            release.set()
+            assert (await first).status == 202
+    finally:
+        release.set()
+        if first is not None and not first.done():
+            await first
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_run_body_above_protected_limit_retains_legacy_admission(monkeypatch):
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+
+    async def fake_execute(owner, launch, *, _api_server):
+        return None
+
+    monkeypatch.setattr(api_server_runs, "_execute_run", fake_execute)
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/v1/runs", json={"input": "x" * (16 * 1024 + 1)})
+            assert response.status == 202
+    finally:
+        await adapter.disconnect()

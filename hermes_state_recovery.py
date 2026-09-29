@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -58,6 +58,7 @@ class AdmissionResult:
     outcome: Literal["created", "replayed", "conflict", "refused"]
     member: RecoveryMember | None
     reason: str | None = None
+    handoff: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +173,12 @@ class RecoveryStore:
                 parent_run_id=admission.parent_run_id, request_sha256=identity.request_sha256,
                 producer_state="open"))
 
-        return self.db._execute_write(_tx)
+        result = self.db._execute_write(_tx)
+        if result.outcome == "created":
+            from agent.recovery_context import _register_admission_handoff
+            return replace(result, handoff=_register_admission_handoff(
+                self, identity, admission.generation))
+        return result
 
     def lookup_key(self, scope: RecoveryScope, key: str, fingerprint: str) -> AdmissionResult | None:
         self._check_scope(scope)
@@ -221,7 +227,7 @@ class RecoveryStore:
                 return view
             ordered = [m.run_id for m in view.members]
             reasons = list(view.reason_codes)
-            if ordered != request.run_ids or membership_sha256(ordered) != request.expected_membership_sha256:
+            if tuple(ordered) != request.run_ids or membership_sha256(ordered) != request.expected_membership_sha256:
                 if "missing_membership" not in reasons:
                     reasons.append("missing_membership")
             conn.execute(
@@ -234,23 +240,35 @@ class RecoveryStore:
 
     def lookup(self, scope: RecoveryScope, request_id: str) -> CloseView:
         self._check_scope(scope)
-        row = self.db._read_one(
+        return self._read_close_snapshot(
             "SELECT session_id,phase,revision,close_request_id,reason_codes_json,receipt_json "
             "FROM recovery_sessions WHERE session_id=? AND profile=? AND scope_digest=? AND close_request_id=?",
             (scope.session_id, scope.profile, scope.scope_digest, request_id))
-        if row is None:
-            raise RecoveryRefused("not_found")
-        return self.db._read_retrying_ioerr(lambda conn: self._view(conn, row))
 
     def lookup_root(self, scope: RecoveryScope, root_id: str) -> CloseView:
         self._check_scope(scope)
-        row = self.db._read_one(
+        return self._read_close_snapshot(
             "SELECT session_id,phase,revision,close_request_id,reason_codes_json,receipt_json "
-            "FROM recovery_sessions WHERE session_id=? AND profile=? AND scope_digest=? AND root_run_id=?",
+            "FROM recovery_sessions WHERE session_id=? AND profile=? AND scope_digest=? "
+            "AND root_run_id=? AND close_request_id IS NOT NULL",
             (scope.session_id, scope.profile, scope.scope_digest, root_id))
-        if row is None:
-            raise RecoveryRefused("not_found")
-        return self.db._read_retrying_ioerr(lambda conn: self._view(conn, row))
+
+    def _read_close_snapshot(self, query: str, params: tuple[str, ...]) -> CloseView:
+        """Session revision and ordered members come from one SQLite read snapshot."""
+        def _read(conn):
+            conn.execute("BEGIN")
+            try:
+                row = conn.execute(query, params).fetchone()
+                if row is None:
+                    raise RecoveryRefused("not_found")
+                view = self._view(conn, row)
+                conn.execute("COMMIT")
+                return view
+            except BaseException:
+                conn.rollback()
+                raise
+
+        return self.db._read_retrying_ioerr(_read)
 
     def close_producer(self, scope: RecoveryScope, run_id: str, permit: object) -> None:
         """Only the live process that owns an issued permit may close its producer."""
