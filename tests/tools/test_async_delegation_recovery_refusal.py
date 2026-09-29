@@ -208,6 +208,78 @@ def test_failed_submit_cleans_only_its_unchanged_row(tmp_path, monkeypatch):
         ad._reset_for_tests()
 
 
+def test_failed_submit_origin_change_between_check_and_delete_survives(
+    tmp_path, monkeypatch,
+):
+    from contextlib import contextmanager
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    ad._reset_for_tests()
+    before_delete = threading.Event()
+    changed = threading.Event()
+    errors = []
+
+    def change_from_other_connection():
+        try:
+            assert before_delete.wait(10)
+            with sqlite3.connect(db.db_path) as other:
+                other.execute(
+                    "UPDATE async_delegations SET parent_session_id='changed-origin' "
+                    "WHERE delegation_id='deleg_interleaved'"
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            changed.set()
+
+    worker = threading.Thread(target=change_from_other_connection)
+    worker.start()
+    original_transaction = ad._transaction
+
+    @contextmanager
+    def interleaving_transaction():
+        with original_transaction() as conn:
+            class ConnectionProxy:
+                def execute(self, sql, params=()):
+                    if sql.startswith("DELETE FROM async_delegations WHERE delegation_id=?") \
+                            and "AND task_json=?" in sql:
+                        before_delete.set()
+                        assert changed.wait(10)
+                        assert not errors
+                    return conn.execute(sql, params)
+
+            yield ConnectionProxy()
+
+    monkeypatch.setattr(ad, "_transaction", interleaving_transaction)
+
+    class FailingExecutor:
+        def submit(self, _worker):
+            raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda *_: FailingExecutor())
+    try:
+        result = ad.dispatch_async_delegation_batch(
+            delegation_id="deleg_interleaved", goals=["ordinary work"], context=None,
+            toolsets=None, role="worker", model=None, session_key="key",
+            parent_session_id="ordinary-parent",
+            runner=lambda: pytest.fail("runner started"),
+        )
+        assert result["status"] == "unknown"
+        assert not errors
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT parent_session_id FROM async_delegations "
+                "WHERE delegation_id='deleg_interleaved'"
+            ).fetchone() == ("changed-origin",)
+    finally:
+        before_delete.set()
+        worker.join(timeout=10)
+        db.close()
+        ad._reset_for_tests()
+
+
 @pytest.mark.parametrize("parent_id,expected_kind", [
     ("ordinary-parent", "ordinary_session"), (None, "unscoped_ordinary"),
 ])

@@ -285,7 +285,9 @@ def _cleanup_failed_dispatch(record: Dict[str, Any]) -> bool:
             return False
         return conn.execute(
             "DELETE FROM async_delegations WHERE delegation_id=? AND task_json=? "
-            "AND state='running'", (record["delegation_id"], task_json),
+            "AND parent_session_id IS ? AND origin_session_id IS ? AND state='running'",
+            (record["delegation_id"], task_json, record.get("parent_session_id"),
+             record.get("origin_session_id", "")),
         ).rowcount == 1
 
 
