@@ -28,6 +28,7 @@ from hermes_state_common import (
 )
 from hermes_state_fts import _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
+from hermes_state_recovery_exclusions import install_exclusion_schema
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -917,6 +918,7 @@ class SessionSchemaMixin:
         report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
+        install_exclusion_schema(self._conn)
         # Protected recovery has its own non-prunable authority. These rows intentionally
         # do not reference ordinary sessions: admission precedes session creation and
         # transport/session retention must never erase the member inventory.
@@ -1395,6 +1397,7 @@ def reconcile_state_schema(conn: sqlite3.Connection) -> None:
     hand-maintained shape for the same durable tables.
     """
     conn.executescript(SCHEMA_SQL)
+    install_exclusion_schema(conn)
     # _reconcile_columns only touches the staticmethod _parse_schema_columns,
     # so a bare instance works; reusing it keeps one reconciliation
     # implementation (one authority) instead of a near-copy on raw

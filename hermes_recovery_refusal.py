@@ -14,12 +14,16 @@ from pathlib import Path
 from hermes_state_recovery_guard import _LEDGER, _ROWS
 from hermes_state_recovery import RecoveryRefused
 
-_AUTHORITY_TABLES = frozenset(_LEDGER)
+_AUTHORITY_TABLES = frozenset((*_LEDGER, "recovery_exclusions"))
 _GUARD_TRIGGERS = frozenset(
     f"recovery_guard_{table}_{operation}"
     for table in (*_ROWS, *_LEDGER)
     for operation in ("insert", "update", "delete")
-)
+) | frozenset({
+    "recovery_guard_recovery_exclusions_insert",
+    "recovery_guard_recovery_exclusions_update",
+    "recovery_guard_recovery_exclusions_delete",
+})
 _REQUIRED_COLUMNS = {
     "recovery_store": {"singleton", "store_id"},
     "recovery_sessions": {"session_id", "profile", "scope_digest", "phase", "revision", "root_run_id"},
@@ -31,6 +35,7 @@ _REQUIRED_COLUMNS = {
     "recovery_write_acks": {"write_id", "session_id", "run_id", "generation", "mutation", "state"},
     "recovery_provider_admissions": {"session_id", "provider", "hermes_revision", "source_sha256", "provider_sha256", "lease_id", "grant_sha256", "admission_json", "admission_sha256"},
     "recovery_provider_invocations": {"invocation_id", "session_id", "run_id", "generation", "producer_id", "sequence", "kind", "state", "create_invocation_id", "container_id", "container_attestation_sha256", "exit_code", "outcome_reason"},
+    "recovery_exclusions": {"claim_id", "kind", "session_id"},
 }
 
 
@@ -47,11 +52,21 @@ def _check_catalog(conn: sqlite3.Connection, session_ids: tuple[str, ...] | None
         rows = conn.execute(
             "SELECT type,name FROM sqlite_master WHERE name GLOB 'recovery_*'"
         ).fetchall()
+        from hermes_state_recovery_exclusions import EXCLUSION_NAMES, _canonical_exclusion_shape
+
+        names = {name for _kind, name in rows}
+        if names == EXCLUSION_NAMES:
+            if not _canonical_exclusion_shape(conn):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            return  # Exact exclusion-only bootstrap is ordinary and has no sessions table.
+        if EXCLUSION_NAMES & names and not _canonical_exclusion_shape(conn):
+            raise RecoveryRefused("protected_session_authority_unavailable")
         tables = {name for kind, name in rows if kind == "table"}
         triggers = {name for kind, name in rows if kind == "trigger"}
         if len(rows) != len(tables) + len(triggers):
             raise RecoveryRefused("protected_session_authority_unavailable")
-        has_guards = any(name.startswith("recovery_guard_") for name in triggers)
+        has_guards = any(name.startswith("recovery_guard_") and name not in EXCLUSION_NAMES
+                         for name in triggers)
         if not tables:
             if triggers:
                 raise RecoveryRefused("protected_session_authority_unavailable")
@@ -65,7 +80,8 @@ def _check_catalog(conn: sqlite3.Connection, session_ids: tuple[str, ...] | None
         if session_ids is None:
             protected = has_guards or any(conn.execute(
                 f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
-                for table in _AUTHORITY_TABLES - {"recovery_store"} if table in tables)
+                for table in _AUTHORITY_TABLES - {"recovery_store", "recovery_exclusions"}
+                if table in tables)
         else:
             protected = any(conn.execute(
                 "SELECT 1 FROM recovery_sessions WHERE session_id=? LIMIT 1", (sid,)
@@ -76,7 +92,8 @@ def _check_catalog(conn: sqlite3.Connection, session_ids: tuple[str, ...] | None
                 raise RecoveryRefused("protected_session_authority_unavailable")
         if protected:
             raise RecoveryRefused("protected_session_dispatch")
-        if triggers and triggers != _GUARD_TRIGGERS:
+        if triggers and triggers not in (frozenset(EXCLUSION_NAMES - {"recovery_exclusions"}),
+                                         _GUARD_TRIGGERS):
             raise RecoveryRefused("protected_session_authority_unavailable")
     except sqlite3.DatabaseError as exc:
         raise RecoveryRefused("protected_session_authority_unavailable") from exc

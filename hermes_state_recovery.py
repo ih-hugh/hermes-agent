@@ -165,6 +165,11 @@ class RecoveryStore:
             if admission.generation == 0:
                 if admission.parent_run_id is not None or row is not None:
                     return AdmissionResult("refused", None, "root_conflict")
+                from hermes_state_recovery_exclusions import root_exclusion
+
+                exclusion = root_exclusion(conn, scope.session_id)
+                if exclusion is not None:
+                    return AdmissionResult("refused", None, exclusion)
                 if conn.execute("SELECT 1 FROM sessions WHERE id=?", (scope.session_id,)).fetchone():
                     return AdmissionResult("refused", None, "existing_session")
                 from hermes_state_recovery_guard import install_recovery_guards

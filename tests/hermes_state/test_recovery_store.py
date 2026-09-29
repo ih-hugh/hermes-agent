@@ -62,12 +62,12 @@ def _seal(session: str = "exact-session", runs: list[str] | None = None,
                        '["run_root"]'.encode()).hexdigest())
 
 
-def _process_reserve(db_path: str, run_id: str) -> tuple[str, str | None]:
+def _process_reserve(db_path: str, run_id: str) -> tuple[str, str | None, str | None]:
     db = SessionDB(Path(db_path))
     try:
         store = RecoveryStore(db)
         result = store.reserve(_root(), _identity(store, run=run_id, owner=current_incarnation()))
-        return result.outcome, result.member.run_id if result.member else None
+        return result.outcome, result.member.run_id if result.member else None, result.reason
     finally:
         db.close()
 
@@ -151,9 +151,19 @@ def test_two_processes_cannot_dispatch_unrecorded_member(tmp_path: Path):
         left = pool.submit(_process_reserve, str(path), "run_left")
         right = pool.submit(_process_reserve, str(path), "run_right")
         outcomes = [left.result(), right.result()]
-    assert sorted(outcome for outcome, _ in outcomes) == ["created", "replayed"]
-    assert len({run_id for _, run_id in outcomes}) == 1
-    winner = next(run_id for outcome, run_id in outcomes if outcome == "created")
+    assert sum(outcome == "created" for outcome, _, _ in outcomes) == 1
+    winner = next(run_id for outcome, run_id, _ in outcomes if outcome == "created")
+    assert winner is not None
+    for outcome, run_id, reason in outcomes:
+        if outcome == "replayed":
+            assert run_id == winner and reason is None
+        elif outcome == "refused":
+            assert run_id is None and reason == "raw_schema_active"
+        else:
+            assert outcome == "created" and run_id == winner
+    # A transient initializer claim may refuse one contender, but after all
+    # claims drain the same key must replay the sole durable member.
+    assert _process_reserve(str(path), winner) == ("replayed", winner, None)
     admitted_members = [winner]
     dispatched_members = [winner]
     assert admitted_members == dispatched_members

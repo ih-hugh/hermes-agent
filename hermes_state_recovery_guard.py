@@ -38,6 +38,7 @@ _LEDGER = (
     "recovery_write_acks",
     "recovery_provider_admissions",
     "recovery_provider_invocations",
+    "recovery_exclusions",
 )
 T = TypeVar("T")
 
@@ -289,6 +290,10 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                 f"BEGIN SELECT CASE WHEN NOT ({checks}) THEN RAISE(ABORT, 'recovery_write_refused') END; END"
             )
     for table in _LEDGER:
+        if table == "recovery_exclusions":
+            # Its canonical bootstrap triggers accept only one exact raw-claim
+            # operation; a general store guard would grant broader authority.
+            continue
         for operation in ("INSERT", "UPDATE", "DELETE"):
             name = f"recovery_guard_{table}_{operation.lower()}"
             conn.execute(

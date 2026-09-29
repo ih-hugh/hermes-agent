@@ -568,6 +568,66 @@ class SessionDB(
                 self._close_connection_quietly(conn)
 
     def _open_writer(self) -> None:
+        """Choose a claimed schema initializer or the validated no-DDL protected path."""
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery_exclusions import (
+            begin_raw_schema_claim, existing_protected_store, finish_raw_schema_claim,
+        )
+
+        if existing_protected_store(self.db_path):
+            self._open_writer_existing_schema()
+            return
+        try:
+            lease = begin_raw_schema_claim(self.db_path)
+        except RecoveryRefused as exc:
+            # A protected root may have won between the read-only branch hint
+            # and the claim. Its committed guard/schema is now the only path.
+            if exc.code != "protected_session_dispatch" or not existing_protected_store(self.db_path):
+                raise
+            self._open_writer_existing_schema()
+            return
+        # Failed or uncertain schema work intentionally leaves this exact raw
+        # claim sticky. Only known successful initialization releases it.
+        self._open_writer_reconcile()
+        finish_raw_schema_claim(lease, conn=self._conn)
+
+    def _open_writer_existing_schema(self) -> None:
+        """Attach a protected store without schema DDL, reconciliation or repair."""
+        from hermes_recovery_refusal import require_compatible_recovery_connection
+        from hermes_state_schema import schema_read_probe_statements
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery_guard import register_connection_guard
+
+        preflight_db_writability(self.db_path, db_label="state.db")
+        if not self.db_path.is_file():
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        conn = _connect_tracked_db(
+            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+        )
+        self._conn = conn
+        conn.row_factory = sqlite3.Row
+        register_connection_guard(conn, self)
+        require_compatible_recovery_connection(conn)
+        try:
+            for statement in schema_read_probe_statements():
+                conn.execute(statement).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        # Keep ordinary writer file-permission hardening after validating the
+        # exact protected catalog, without changing its on-disk journal mode.
+        _secure_state_db_files(self.db_path)
+        apply_database_pragmas(conn, db_label="state.db")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._wal_active = _on_disk_journal_mode(conn) == "wal"
+        self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+        cursor = conn.cursor()
+        self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
+        if self._fts_enabled:
+            self._trigram_available = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+        if self._wal_active:
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
+
+    def _open_writer_reconcile(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
         malformed sqlite_master), generation stamp."""
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend

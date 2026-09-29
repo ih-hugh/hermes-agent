@@ -13,6 +13,7 @@ from hermes_recovery_refusal import (
     require_unprotected_store,
 )
 from hermes_state_recovery import RecoveryRefused
+from hermes_state_recovery_exclusions import install_exclusion_schema
 
 
 def _catalog(path, *, phase="open", member_state="open"):
@@ -39,6 +40,7 @@ def _catalog(path, *, phase="open", member_state="open"):
                 kind TEXT, state TEXT, create_invocation_id TEXT, container_id TEXT,
                 container_attestation_sha256 TEXT, exit_code INTEGER, outcome_reason TEXT);
         """)
+        install_exclusion_schema(conn)
         conn.execute("INSERT INTO recovery_sessions VALUES('protected', '', '', ?, 0, 'run')", (phase,))
         conn.execute("INSERT INTO recovery_members VALUES('run', 'protected', 0, ?)", (member_state,))
 
