@@ -515,6 +515,8 @@ class SessionDB(
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
         self._db_file_identity: Optional[tuple] = None
         self._db_file_application_id: int = 0
+        self._opened_store_id: Optional[str] = None
+        self._opened_generation_token: Optional[str] = None
         self._db_sidecar_identity: Dict[str, tuple] = {}
         self._db_replaced = self._db_wal_generation_lost = False
         # Durable capture of a lost WAL generation (see _capture_retired_generation): once per handle.
@@ -571,16 +573,12 @@ class SessionDB(
         """Choose a claimed schema initializer or the validated no-DDL protected path."""
         from hermes_state_recovery import RecoveryRefused
         from hermes_state_recovery_exclusions import (
-            begin_raw_schema_claim, existing_protected_store, finish_raw_schema_claim,
+            begin_raw_schema_claim, finish_raw_schema_claim, inspect_protected_store,
         )
 
-        try:
-            observed = self.db_path.lstat()
-            observed_identity = (observed.st_dev, observed.st_ino)
-        except FileNotFoundError:
-            observed_identity = None
-        if existing_protected_store(self.db_path):
-            self._open_writer_existing_schema(observed_identity)
+        protected_identity = inspect_protected_store(self.db_path)
+        if protected_identity is not None:
+            self._open_writer_existing_schema(*protected_identity)
             return
         try:
             lease = begin_raw_schema_claim(self.db_path)
@@ -589,20 +587,18 @@ class SessionDB(
             # and the claim. Its committed guard/schema is now the only path.
             if exc.code != "protected_session_dispatch":
                 raise
-            try:
-                observed = self.db_path.lstat()
-            except OSError as stat_exc:
-                raise RecoveryRefused("protected_session_authority_unavailable") from stat_exc
-            if not existing_protected_store(self.db_path):
+            protected_identity = inspect_protected_store(self.db_path)
+            if protected_identity is None:
                 raise RecoveryRefused("protected_session_authority_unavailable") from exc
-            self._open_writer_existing_schema((observed.st_dev, observed.st_ino))
+            self._open_writer_existing_schema(*protected_identity)
             return
         # Failed or uncertain schema work intentionally leaves this exact raw
         # claim sticky. Only known successful initialization releases it.
         self._open_writer_reconcile(lease)
         finish_raw_schema_claim(lease, conn=self._conn)
 
-    def _open_writer_existing_schema(self, expected_identity: tuple[int, int] | None) -> None:
+    def _open_writer_existing_schema(self, expected_identity: tuple[int, int],
+                                     expected_store_id: str) -> None:
         """Attach a protected store without schema DDL, reconciliation or repair."""
         from hermes_recovery_refusal import require_compatible_recovery_connection
         from hermes_state_schema import schema_read_probe_statements
@@ -610,8 +606,6 @@ class SessionDB(
         from hermes_state_recovery_guard import register_connection_guard
         from hermes_state_recovery_exclusions import _catalog, _protected_exists
 
-        if expected_identity is None:
-            raise RecoveryRefused("protected_session_authority_unavailable")
         preflight_db_writability(self.db_path, db_label="state.db")
         try:
             observed = self.db_path.lstat()
@@ -632,6 +626,9 @@ class SessionDB(
             observed = self.db_path.lstat()
             if ((observed.st_dev, observed.st_ino) != expected_identity
                     or not _protected_exists(conn, _catalog(conn))):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            row = conn.execute("SELECT store_id FROM recovery_store WHERE singleton=1").fetchone()
+            if row is None or row[0] != expected_store_id:
                 raise RecoveryRefused("protected_session_authority_unavailable")
         except OSError as exc:
             raise RecoveryRefused("protected_session_authority_unavailable") from exc
@@ -767,11 +764,11 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self, lease=None) -> sqlite3.Connection:
+    def _open_writer_conn(self, lease=None, *, reopen: bool = False) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
-        if lease is None:
+        if lease is None and not reopen:
             conn = _connect_tracked_db(
                 str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
             )
@@ -785,6 +782,24 @@ class SessionDB(
                 from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
 
                 assert_raw_schema_lease_target(lease, conn=conn)
+            if reopen:
+                from hermes_state_recovery import RecoveryRefused
+                from hermes_state_recovery_exclusions import _catalog
+
+                if (_catalog(conn) != "full" or not self._opened_store_id
+                        or not self._opened_generation_token):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+                store = conn.execute(
+                    "SELECT store_id FROM recovery_store WHERE singleton=1"
+                ).fetchone()
+                generation = conn.execute(
+                    "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+                ).fetchone()
+                if (store is None or store[0] != self._opened_store_id
+                        or generation is None or generation[0] != self._opened_generation_token
+                        or (self._db_file_identity is not None
+                            and _stat_db_file_identity(self.db_path) != self._db_file_identity)):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
             conn.row_factory = sqlite3.Row
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
@@ -970,7 +985,7 @@ class SessionDB(
             "flight — reopening (teardown/worker race, #94736)", self.db_path, context,
         )
         try:
-            self._conn = self._open_writer_conn()
+            self._conn = self._open_writer_conn(reopen=True)
         except Exception as exc:
             raise sqlite3.OperationalError(
                 f"state.db connection was closed while a {context} was still "
@@ -1186,6 +1201,15 @@ class SessionDB(
         """Snapshot inode plus the on-disk generation header when present."""
         self._db_file_identity = _stat_db_file_identity(self.db_path)
         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
+        if self._conn is not None:
+            store = self._conn.execute(
+                "SELECT store_id FROM recovery_store WHERE singleton=1"
+            ).fetchone()
+            generation = self._conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+            ).fetchone()
+            self._opened_store_id = str(store[0]) if store and store[0] else None
+            self._opened_generation_token = str(generation[0]) if generation and generation[0] else None
         disk_id = _read_sqlite_application_id(self.db_path)
         if disk_id:
             self._db_file_application_id = disk_id

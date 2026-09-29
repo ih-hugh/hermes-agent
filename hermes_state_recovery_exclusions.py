@@ -160,10 +160,15 @@ def _protected_exists(conn: sqlite3.Connection, catalog: str) -> bool:
 
 def existing_protected_store(path: Path) -> bool:
     """Read-only branch hint; claim/reserve recheck under BEGIN IMMEDIATE."""
+    return inspect_protected_store(path) is not None
+
+
+def inspect_protected_store(path: Path) -> tuple[tuple[int, int], str] | None:
+    """Capture a protected store's file and persistent identity in one observation."""
     try:
         identity = path.lstat()
     except FileNotFoundError:
-        return False
+        return None
     except OSError as exc:
         raise RecoveryRefused("protected_session_authority_unavailable") from exc
     if not stat.S_ISREG(identity.st_mode):
@@ -175,8 +180,19 @@ def existing_protected_store(path: Path) -> bool:
     try:
         with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.execute("PRAGMA query_only=ON")
-            return _protected_exists(conn, _catalog(conn))
+            if not _protected_exists(conn, _catalog(conn)):
+                return None
+            row = conn.execute(
+                "SELECT store_id FROM recovery_store WHERE singleton=1"
+            ).fetchone()
+            current = path.lstat()
+            if (row is None or type(row[0]) is not str or not row[0]
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            return (identity.st_dev, identity.st_ino), row[0]
     except sqlite3.DatabaseError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    except OSError as exc:
         raise RecoveryRefused("protected_session_authority_unavailable") from exc
 
 
@@ -335,7 +351,7 @@ def assert_raw_schema_lease_target(lease: RawSchemaLease,
         record = _RAW_LEASES.get(lease)
     if record is None or record[:2] != (os.getpid(), _NONCE):
         raise RecoveryRefused("invalid_raw_schema_lease")
-    _, _, path, _claim_id, device, inode = record
+    _, _, path, claim_id, device, inode = record
     try:
         identity = path.lstat()
         if (not stat.S_ISREG(identity.st_mode)
@@ -349,6 +365,14 @@ def assert_raw_schema_lease_target(lease: RawSchemaLease,
             databases = conn.execute("PRAGMA database_list").fetchall()
             main = [row[2] for row in databases if row[1] == "main"]
             if len(main) != 1 or not main[0] or Path(main[0]).resolve() != path:
+                raise RecoveryRefused("invalid_raw_schema_lease")
+            if _catalog(conn) not in {"bootstrap", "full"}:
+                raise RecoveryRefused("invalid_raw_schema_lease")
+            row = conn.execute(
+                "SELECT kind,session_id FROM recovery_exclusions WHERE claim_id=?",
+                (claim_id,),
+            ).fetchone()
+            if row is None or tuple(row) != ("raw_schema", None):
                 raise RecoveryRefused("invalid_raw_schema_lease")
     except OSError as exc:
         raise RecoveryRefused("invalid_raw_schema_lease") from exc

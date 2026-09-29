@@ -415,13 +415,15 @@ def test_protected_attach_rechecks_opened_catalog_after_stale_hint(tmp_path: Pat
     path = tmp_path / "state.db"
     ordinary = SessionDB(path)
     ordinary.close()
-    original = exclusions.existing_protected_store
-    monkeypatch.setattr(exclusions, "existing_protected_store", lambda target: True)
+    original = exclusions.inspect_protected_store
+    identity = path.lstat()
+    monkeypatch.setattr(exclusions, "inspect_protected_store",
+                        lambda target: ((identity.st_dev, identity.st_ino), "false-hint"))
     try:
         with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
             SessionDB(path)
     finally:
-        monkeypatch.setattr(exclusions, "existing_protected_store", original)
+        monkeypatch.setattr(exclusions, "inspect_protected_store", original)
     with sqlite3.connect(path) as raw:
         assert raw.execute("SELECT count(*) FROM recovery_sessions").fetchone()[0] == 0
 
@@ -438,7 +440,7 @@ def test_protected_attach_refuses_path_swap_after_positive_hint(tmp_path: Path, 
         protected.close()
     ordinary = SessionDB(replacement)
     ordinary.close()
-    original = exclusions.existing_protected_store
+    original = exclusions.inspect_protected_store
     hinted, swapped = threading.Event(), threading.Event()
 
     def replace_path():
@@ -458,7 +460,7 @@ def test_protected_attach_refuses_path_swap_after_positive_hint(tmp_path: Path, 
             assert swapped.wait(5)
         return result
 
-    monkeypatch.setattr(exclusions, "existing_protected_store", swap_after_hint)
+    monkeypatch.setattr(exclusions, "inspect_protected_store", swap_after_hint)
     monkeypatch.setattr(SessionDB, "_init_schema",
                         lambda _self: pytest.fail("stale protected hint ran schema work"))
     try:
@@ -486,6 +488,150 @@ def test_claimed_and_protected_existing_only_uri_escapes_filename(tmp_path: Path
         assert again._read_one("SELECT session_id FROM recovery_sessions")[0] == "protected"
     finally:
         again.close()
+
+
+def test_raw_claim_aba_open_refuses_unclaimed_connection_before_wal(tmp_path: Path, monkeypatch):
+    import hermes_state as hs
+
+    path, other, retained = (tmp_path / "state.db", tmp_path / "other.db",
+                             tmp_path / "retained.db")
+    with sqlite3.connect(other) as raw:
+        raw.execute("PRAGMA user_version=1")
+    original = hs._connect_tracked_db
+    swapped = threading.Event()
+
+    def open_other_during_connect(target, *args, **kwargs):
+        if kwargs.get("uri") and not swapped.is_set():
+            os.replace(path, retained)
+            os.replace(other, path)
+            try:
+                conn = original(target, *args, **kwargs)
+            finally:
+                os.replace(path, other)
+                os.replace(retained, path)
+            swapped.set()
+            return conn
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", open_other_during_connect)
+    monkeypatch.setattr(hs, "apply_wal_with_fallback",
+                        lambda *_args, **_kwargs: pytest.fail("unclaimed connection reached WAL setup"))
+    with pytest.raises(RecoveryRefused, match="invalid_raw_schema_lease"):
+        SessionDB(path)
+    assert swapped.is_set()
+    with sqlite3.connect(other) as raw:
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='recovery_exclusions'"
+        ).fetchone() is None
+    with sqlite3.connect(path) as raw:
+        assert raw.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone()[0] == 1
+
+
+def test_protected_attach_aba_open_refuses_different_store_uuid(tmp_path: Path, monkeypatch):
+    import hermes_state as hs
+
+    path, other, retained = (tmp_path / "state.db", tmp_path / "other.db",
+                             tmp_path / "retained.db")
+    first = SessionDB(path)
+    second = SessionDB(other)
+    try:
+        assert _reserve(RecoveryStore(first), "first", "first-run").outcome == "created"
+        assert _reserve(RecoveryStore(second), "second", "second-run").outcome == "created"
+        assert RecoveryStore(first).store_id != RecoveryStore(second).store_id
+    finally:
+        first.close()
+        second.close()
+    original = hs._connect_tracked_db
+    swapped = threading.Event()
+
+    def open_other_during_connect(target, *args, **kwargs):
+        if kwargs.get("uri") and not swapped.is_set():
+            os.replace(path, retained)
+            os.replace(other, path)
+            try:
+                conn = original(target, *args, **kwargs)
+            finally:
+                os.replace(path, other)
+                os.replace(retained, path)
+            swapped.set()
+            return conn
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", open_other_during_connect)
+    monkeypatch.setattr(hs, "apply_database_pragmas",
+                        lambda *_args, **_kwargs: pytest.fail("wrong protected store reached pragmas"))
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        SessionDB(path)
+    assert swapped.is_set()
+    with sqlite3.connect(path) as raw:
+        assert raw.execute("SELECT session_id FROM recovery_sessions").fetchone() == ("first",)
+    with sqlite3.connect(other) as raw:
+        assert raw.execute("SELECT session_id FROM recovery_sessions").fetchone() == ("second",)
+
+
+def test_late_writer_reopen_cannot_create_missing_state_db(tmp_path: Path, monkeypatch):
+    from hermes_state_errors import StateDbReplacedError
+
+    path, retained = tmp_path / "state.db", tmp_path / "retained.db"
+    db = SessionDB(path)
+    db.close()
+    original = db._halt_if_db_generation_changed
+    checked = 0
+
+    def remove_after_second_check():
+        nonlocal checked
+        original()
+        checked += 1
+        if checked == 2:
+            os.replace(path, retained)
+
+    monkeypatch.setattr(db, "_halt_if_db_generation_changed", remove_after_second_check)
+    with pytest.raises((StateDbReplacedError, sqlite3.Error, RecoveryRefused)):
+        db._execute_write(lambda conn: conn.execute("SELECT 1").fetchone()[0])
+    assert checked >= 2
+    assert not path.exists()
+    with sqlite3.connect(retained) as raw:
+        assert raw.execute("SELECT count(*) FROM recovery_exclusions").fetchone()[0] == 0
+
+
+def test_late_writer_reopen_aba_checks_opened_store_before_wal(tmp_path: Path, monkeypatch):
+    import hermes_state as hs
+
+    path, other, retained = (tmp_path / "state.db", tmp_path / "other.db",
+                             tmp_path / "retained.db")
+    db = SessionDB(path)
+    other_db = SessionDB(other)
+    other_db.close()
+    db.close()
+    original = hs._connect_tracked_db
+    swapped = threading.Event()
+
+    def open_other_during_reopen(target, *args, **kwargs):
+        if kwargs.get("uri") and not swapped.is_set():
+            os.replace(path, retained)
+            os.replace(other, path)
+            try:
+                conn = original(target, *args, **kwargs)
+            finally:
+                os.replace(path, other)
+                os.replace(retained, path)
+            swapped.set()
+            return conn
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", open_other_during_reopen)
+    monkeypatch.setattr(hs, "apply_wal_with_fallback",
+                        lambda *_args, **_kwargs: pytest.fail("wrong reopened store reached WAL setup"))
+    with pytest.raises(sqlite3.Error, match="automatic reopen failed"):
+        db._execute_write(lambda conn: conn.execute("SELECT 1").fetchone()[0])
+    assert swapped.is_set()
+    assert not db._conn
+    with sqlite3.connect(path) as raw:
+        first_id = raw.execute("SELECT store_id FROM recovery_store").fetchone()[0]
+    with sqlite3.connect(other) as raw:
+        assert raw.execute("SELECT store_id FROM recovery_store").fetchone()[0] != first_id
 
 
 def test_simultaneous_schema_openers_release_only_their_own_claim(tmp_path: Path,
