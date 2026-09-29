@@ -321,6 +321,46 @@ def test_sequential_tool_timeout_retains_actual_worker(tmp_path: Path, monkeypat
         db.close()
 
 
+def test_concurrent_tool_worker_keeps_exact_lease_after_executor_closes(tmp_path: Path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agent import tool_executor
+    from agent.recovery_producers import current_lease
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release, callback_done = Event(), Event(), Event()
+    observed = []
+    batch = tool_executor._ConcurrentBatch(
+        SimpleNamespace(), [], "task",
+        [tool_executor._ParsedCall(None, "terminal", {}, [], None, None)], 5.0)
+
+    def actual_worker(index, order):
+        observed.append(current_lease())
+        entered.set()
+        assert release.wait(5)
+        callback = registry.enter(current_lease(), "callback")
+        callback.run(callback_done.set)
+
+    batch.run_worker = actual_worker
+    parent = registry.enter(registry.permit, "executor")
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = parent.run(lambda: batch.submit_all(pool, [0])[0][0])
+        assert entered.wait(5)
+        tool_lease = batch._recovery_future_leases[future]
+        registry.request_close()
+        assert _close(store, scope).members[0].producer_state == "open"
+        assert observed == [tool_lease]
+        release.set()
+        future.result(timeout=5)
+        assert callback_done.is_set()
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        db.close()
+
+
 def test_streaming_caller_abandon_retains_actual_sdk_worker(tmp_path: Path, monkeypatch):
     from agent import chat_completion_helpers as helpers
 

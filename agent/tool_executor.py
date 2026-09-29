@@ -1283,10 +1283,13 @@ class _ConcurrentBatch:
         for submit_index, i in enumerate(runnable):
             recovery_lease = _protected_tool_lease(self.parsed_calls[i].name)
             try:
-                worker = propagate_context_to_thread(self.run_worker)
+                worker = self.run_worker
                 if recovery_lease is not None:
                     worker = lambda index, order, _worker=worker, _lease=recovery_lease: _lease.run(
                         lambda: _worker(index, order))
+                # Enter the copied turn context first, then the exact tool lease;
+                # callbacks from a surviving worker must retain that parent.
+                worker = propagate_context_to_thread(worker)
                 f = executor.submit(worker, i, submit_index)
             except RuntimeError as submit_error:
                 if recovery_lease is not None:
