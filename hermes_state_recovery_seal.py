@@ -108,8 +108,12 @@ class PreparedProviderEvidence:
 
 def prepare_provider_evidence(
     capture: SelectedProviderCapture,
+    *,
+    deadline: float | None = None,
 ) -> PreparedProviderEvidence:
     """Read the selected provider's retained association outside the DB lock."""
+    budget = _Budget(deadline)
+    budget.check()
     if type(capture) is not SelectedProviderCapture:
         raise RecoveryRefused("provider_selection_changed")
     provider = capture.require_selected()
@@ -117,7 +121,14 @@ def prepare_provider_evidence(
     if not callable(reader):
         raise RecoveryRefused("provider_readback_unavailable")
     try:
-        raw = reader(capture.admission.canonical_bytes())
+        admission_bytes = capture.admission.canonical_bytes()
+        budget.check()
+        raw = (
+            reader(admission_bytes, deadline=deadline)
+            if deadline is not None
+            else reader(admission_bytes)
+        )
+        budget.check()
         if (
             type(raw).__name__ != "RecoveryProviderReadback"
             or type(raw).__module__.split(".")[-1] != "workspace_recovery"
@@ -150,11 +161,13 @@ def prepare_provider_evidence(
             _EVIDENCE_ISSUER,
         )
         capture.require_selected()
+        budget.check()
         _PREPARED[id(evidence)] = evidence
         return evidence
     except RecoveryRefused:
         raise
     except Exception as exc:
+        budget.check()
         raise RecoveryRefused("provider_readback_invalid") from exc
 
 
@@ -1206,7 +1219,9 @@ def finalize(
         raise RecoveryRefused("scope_mismatch")
     budget = _Budget(deadline)
     budget.check()
-    committed = _read_document(store, scope, request.run_ids[0], request=request)
+    committed = _read_document(
+        store, scope, request.run_ids[0], request=request, deadline=deadline
+    )
     if committed is not None:
         return committed[0]
     if (
@@ -1337,7 +1352,10 @@ def _read_document_on_conn(
     scope: RecoveryScope,
     root_id: str,
     request: SealRequest | None = None,
+    budget: _Budget | None = None,
 ) -> tuple[SealResult, bytes, SealReceipt, int]:
+    if budget is not None:
+        budget.check()
     metadata = conn.execute(
         "SELECT s.phase,typeof(s.close_request_json),"
         "length(substr(CAST(s.close_request_json AS BLOB),1,?)),"
@@ -1359,6 +1377,8 @@ def _read_document_on_conn(
     ).fetchone()
     if metadata is None or metadata[0] != "sealed":
         raise RecoveryRefused("seal_not_found")
+    if budget is not None:
+        budget.check()
     if (
         metadata[1] != "text"
         or type(metadata[2]) is not int
@@ -1385,6 +1405,8 @@ def _read_document_on_conn(
         "WHERE s.session_id=? AND s.profile=? AND s.scope_digest=? AND s.root_run_id=?",
         (scope.session_id, scope.profile, scope.scope_digest, root_id),
     ).fetchone()
+    if budget is not None:
+        budget.check()
     try:
         if (
             row is None
@@ -1404,6 +1426,8 @@ def _read_document_on_conn(
         raise RecoveryRefused("sealed_document_invalid") from exc
     if request is not None and row[0] != request.model_dump_json():
         raise RecoveryRefused("close_conflict")
+    if budget is not None:
+        budget.check()
     try:
         result = SealResult.model_validate(strict_json_loads(row[2]))
         receipt = SealReceipt.model_validate(
@@ -1427,6 +1451,8 @@ def _read_document_on_conn(
             raise ValueError("sealed document mismatch")
     except (ValueError, TypeError, UnicodeError) as exc:
         raise RecoveryRefused("sealed_document_invalid") from exc
+    if budget is not None:
+        budget.check()
     return result, row[2], receipt, row[5]
 
 
@@ -1435,38 +1461,93 @@ def _read_document(
     scope: RecoveryScope,
     root_id: str,
     request: SealRequest | None = None,
+    *,
+    deadline: float | None = None,
 ) -> tuple[SealResult, bytes, SealReceipt, int] | None:
     store._check_scope(scope)
+    budget = _Budget(deadline)
+    budget.check()
 
     def _read(conn: sqlite3.Connection):
-        conn.execute("BEGIN")
+        budget.check()
+        conn.set_progress_handler(budget.progress, 1000)
         try:
+            conn.execute("BEGIN")
+            budget.check()
             exists = conn.execute(
                 "SELECT 1 FROM recovery_seal_documents WHERE session_id=?",
                 (scope.session_id,),
             ).fetchone()
+            budget.check()
             if exists is None:
                 conn.execute("COMMIT")
+                budget.check()
                 return None
-            result = _read_document_on_conn(conn, scope, root_id, request)
+            result = _read_document_on_conn(conn, scope, root_id, request, budget)
+            budget.check()
             conn.execute("COMMIT")
+            budget.check()
             return result
+        except sqlite3.OperationalError as exc:
+            conn.set_progress_handler(None, 0)
+            conn.rollback()
+            try:
+                budget.check()
+            except RecoveryRefused as deadline_exc:
+                raise deadline_exc from exc
+            raise
         except BaseException:
+            conn.set_progress_handler(None, 0)
             conn.rollback()
             raise
+        finally:
+            conn.set_progress_handler(None, 0)
 
     return store.db._read_retrying_ioerr(_read)
 
 
-def read_seal_bytes(store: RecoveryStore, scope: RecoveryScope, root_id: str) -> bytes:
-    document = _read_document(store, scope, root_id)
+def read_seal_bytes(
+    store: RecoveryStore,
+    scope: RecoveryScope,
+    root_id: str,
+    *,
+    deadline: float | None = None,
+) -> bytes:
+    document = _read_document(store, scope, root_id, deadline=deadline)
     if document is None:
         raise RecoveryRefused("seal_not_found")
     return document[1]
 
 
+def read_committed_seal_bytes(
+    store: RecoveryStore,
+    scope: RecoveryScope,
+    root_id: str,
+    request: SealRequest,
+    *,
+    deadline: float,
+) -> bytes | None:
+    """Validate one committed exact-request document and return its saved bytes.
+
+    Absence allows a new close attempt. A different request or malformed saved
+    document refuses inside the same consistent SQLite read snapshot.
+    """
+    budget = _Budget(deadline)
+    budget.check()
+    if request.session_id != scope.session_id or request.run_ids[0] != root_id:
+        raise RecoveryRefused("scope_mismatch")
+    document = _read_document(store, scope, root_id, request=request, deadline=deadline)
+    budget.check()
+    return None if document is None else document[1]
+
+
 def read_sealed_page_bytes(
-    store: RecoveryStore, scope: RecoveryScope, root_id: str, page: int
+    store: RecoveryStore,
+    scope: RecoveryScope,
+    root_id: str,
+    page: int,
+    *,
+    deadline: float | None = None,
 ) -> bytes:
     """Return one saved page after verifying the complete immutable page set."""
     from pydantic import TypeAdapter
@@ -1475,11 +1556,19 @@ def read_sealed_page_bytes(
     if type(page) is not int or page < 0 or page >= MAX_ROUTE_PAGES:
         raise RecoveryRefused("sealed_page_not_found")
     store._check_scope(scope)
+    budget = _Budget(deadline)
+    budget.check()
 
     def _read(conn: sqlite3.Connection) -> bytes:
-        conn.execute("BEGIN")
+        budget.check()
+        conn.set_progress_handler(budget.progress, 1000)
         try:
-            _, _, receipt, count = _read_document_on_conn(conn, scope, root_id)
+            conn.execute("BEGIN")
+            budget.check()
+            _, _, receipt, count = _read_document_on_conn(
+                conn, scope, root_id, budget=budget
+            )
+            budget.check()
             if page >= count:
                 raise RecoveryRefused("sealed_page_not_found")
             encoded: list[bytes] = []
@@ -1495,12 +1584,15 @@ def read_sealed_page_bytes(
                 is not None
             ):
                 raise RecoveryRefused("sealed_page_invalid")
+            budget.check()
             for index in range(count):
+                budget.check()
                 meta = conn.execute(
                     "SELECT length(page_bytes),typeof(page_bytes) FROM recovery_sealed_pages "
                     "WHERE session_id=? AND route_page=?",
                     (scope.session_id, index),
                 ).fetchone()
+                budget.check()
                 if (
                     meta is None
                     or meta[1] != "blob"
@@ -1513,6 +1605,7 @@ def read_sealed_page_bytes(
                     "WHERE session_id=? AND route_page=?",
                     (scope.session_id, index),
                 ).fetchone()
+                budget.check()
                 raw = bytes(row[0])
                 try:
                     parsed_page = adapter.validate_python(strict_json_loads(raw))
@@ -1520,6 +1613,7 @@ def read_sealed_page_bytes(
                         raise ValueError("noncanonical page")
                 except (TypeError, ValueError, UnicodeError) as exc:
                     raise RecoveryRefused("sealed_page_invalid") from exc
+                budget.check()
                 encoded.append(raw)
                 parsed.append(parsed_page)
                 encoded_total += len(raw)
@@ -1529,10 +1623,23 @@ def read_sealed_page_bytes(
                 verify_sealed_pages(receipt, parsed)
             except ValueError as exc:
                 raise RecoveryRefused("sealed_page_invalid") from exc
+            budget.check()
             conn.execute("COMMIT")
+            budget.check()
             return encoded[page]
+        except sqlite3.OperationalError as exc:
+            conn.set_progress_handler(None, 0)
+            conn.rollback()
+            try:
+                budget.check()
+            except RecoveryRefused as deadline_exc:
+                raise deadline_exc from exc
+            raise
         except BaseException:
+            conn.set_progress_handler(None, 0)
             conn.rollback()
             raise
+        finally:
+            conn.set_progress_handler(None, 0)
 
     return store.db._read_retrying_ioerr(_read)

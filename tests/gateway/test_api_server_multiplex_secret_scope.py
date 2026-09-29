@@ -101,6 +101,9 @@ async def test_profile_middleware_binds_auth_before_handler(
     worker_home.mkdir(parents=True)
     profile_key = "a" * 32
     default_key = "b" * 32
+    (tmp_path / ".env").write_text(
+        f"API_SERVER_KEY={default_key}\n", encoding="utf-8"
+    )
     (worker_home / ".env").write_text(
         f"API_SERVER_KEY={profile_key}\n", encoding="utf-8"
     )
@@ -159,5 +162,4 @@ async def test_profile_middleware_binds_auth_before_handler(
         )
         assert accepted.status == 200
         assert (await accepted.json())["profile"] == "worker"
-
 

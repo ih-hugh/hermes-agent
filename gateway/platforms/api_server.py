@@ -121,6 +121,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_recovery as _api_recovery
 from gateway.platforms import api_server_tool_diagnostic as _api_tool_diag
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
@@ -1110,6 +1111,16 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _recovery_route_delegate(name: str):
+    """Forward a recovery route without making the adapter the protocol owner."""
+    async def _handler(self, request: "web.Request") -> "web.Response":
+        return await getattr(_api_recovery, name)(
+            self, request, _api_server=sys.modules[__name__]
+        )
+    _handler.__name__ = name
+    return _handler
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -1160,6 +1171,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._session_dbs: Dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
+        self._recovery_workers = _api_recovery.RecoveryWorkerPool()
         # Last-known-good model per gateway_session_key ("*" = process-wide; never session_id,
         # which is per request -> unbounded). Recovers a transient empty model resolution.
         self._last_resolved_model: Dict[str, str] = {}
@@ -1343,7 +1355,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _expected_api_key(self) -> str:
         """Return the API key authorized for the URL-selected profile."""
         profile = _api_request_profile.get()
-        if not profile or profile == "default":
+        if profile is None:
             return self._api_key
         try:
             from agent.secret_scope import get_secret
@@ -1371,7 +1383,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         profile = _api_request_profile.get()
         expected_key = self._expected_api_key()
         if not expected_key:
-            if not (profile and profile != "default"):
+            if profile is None:
                 return None
             logger.warning(
                 "API server rejected request for profile %r: no profile-scoped "
@@ -1568,6 +1580,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        routes.extend(_api_recovery.http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -3872,6 +3885,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
+    _handle_recovery_capabilities = _recovery_route_delegate("handle_capabilities")
+    _handle_recovery_post_seal = _recovery_route_delegate("handle_post_seal")
+    _handle_recovery_get_seal = _recovery_route_delegate("handle_get_seal")
+    _handle_recovery_get_page = _recovery_route_delegate("handle_get_page")
 
     async def _sweep_orphaned_runs(self) -> None:
         return await _api_runs._sweep_orphaned_runs(self)
@@ -4038,6 +4055,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        recovery_cancelled = await self._recovery_workers.join()
         await _api_runs._drain_protected_status(self)
         if self._response_store is not None:
             try:
@@ -4056,6 +4074,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._close_cached_session_dbs()
             self._app = None
         logger.info("[%s] API server stopped", self.name)
+        if recovery_cancelled:
+            raise asyncio.CancelledError
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,

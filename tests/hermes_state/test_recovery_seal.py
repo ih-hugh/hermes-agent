@@ -44,6 +44,7 @@ from hermes_state_recovery_seal import (
     PreparedProviderEvidence,
     finalize,
     prepare_provider_evidence,
+    read_committed_seal_bytes,
     read_seal_bytes,
     read_sealed_page_bytes,
 )
@@ -191,6 +192,98 @@ def test_no_call_seal_is_immutable_across_reopen(tmp_path: Path, monkeypatch):
             reopened.db.close()
         else:
             db.close()
+
+
+def test_exact_committed_request_reads_saved_bytes_atomically(
+    tmp_path: Path, monkeypatch
+):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        request = _close(store, scope, producer)
+        deadline = time.monotonic() + 5.0
+        assert (
+            read_committed_seal_bytes(store, scope, "root", request, deadline=deadline)
+            is None
+        )
+        finalize(store, scope, request, evidence)
+        assert read_committed_seal_bytes(
+            store, scope, "root", request, deadline=deadline
+        ) == read_seal_bytes(store, scope, "root")
+        wrong = request.model_copy(update={"request_id": str(uuid4())})
+        with pytest.raises(RecoveryRefused, match="close_conflict"):
+            read_committed_seal_bytes(store, scope, "root", wrong, deadline=deadline)
+        with pytest.raises(RecoveryRefused, match="seal_deadline_exceeded"):
+            read_committed_seal_bytes(
+                store, scope, "root", request, deadline=time.monotonic() - 1
+            )
+    finally:
+        db.close()
+
+
+def test_read_deadline_is_checked_after_document_validation(
+    tmp_path: Path, monkeypatch
+):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        request = _close(store, scope, producer)
+        finalize(store, scope, request, evidence)
+        original = seal_module.canonical_json_bytes
+
+        def slow_canonical(value):
+            time.sleep(0.03)
+            return original(value)
+
+        monkeypatch.setattr(seal_module, "canonical_json_bytes", slow_canonical)
+        with pytest.raises(RecoveryRefused, match="seal_deadline_exceeded"):
+            read_seal_bytes(store, scope, "root", deadline=time.monotonic() + 0.01)
+    finally:
+        db.close()
+
+
+def test_page_read_deadline_is_checked_after_semantic_verification(
+    tmp_path: Path, monkeypatch
+):
+    db, store, scope, producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        request = _close(store, scope, producer)
+        finalize(store, scope, request, evidence)
+        original = seal_module.verify_sealed_pages
+
+        def slow_verify(receipt, pages):
+            time.sleep(0.03)
+            return original(receipt, pages)
+
+        monkeypatch.setattr(seal_module, "verify_sealed_pages", slow_verify)
+        with pytest.raises(RecoveryRefused, match="seal_deadline_exceeded"):
+            read_sealed_page_bytes(
+                store, scope, "root", 0, deadline=time.monotonic() + 0.01
+            )
+    finally:
+        db.close()
+
+
+def test_prepared_provider_readback_forwards_exact_absolute_deadline(
+    tmp_path: Path, monkeypatch
+):
+    db, _store, _scope, _producer, evidence = _case(tmp_path, monkeypatch)
+    try:
+        provider = evidence.capture.provider
+        original = provider.read_recovery_binding_wire
+        seen = []
+
+        def reader(expected, *, deadline):
+            seen.append(deadline)
+            return original(expected)
+
+        provider.read_recovery_binding_wire = reader
+        deadline = time.monotonic() + 5.0
+        prepare_provider_evidence(evidence.capture, deadline=deadline)
+        assert seen == [deadline]
+        with pytest.raises(RecoveryRefused, match="seal_deadline_exceeded"):
+            prepare_provider_evidence(evidence.capture, deadline=time.monotonic() - 1)
+        assert seen == [deadline]
+    finally:
+        db.close()
 
 
 def test_new_process_reads_only_committed_seal_bytes(tmp_path: Path, monkeypatch):
