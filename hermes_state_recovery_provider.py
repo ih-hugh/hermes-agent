@@ -307,7 +307,7 @@ class ProviderLedger:
         with _LOCK:
             _CAPABILITIES[capability] = (os.getpid(), _PROCESS_NONCE, id(self.store.db),
                                          self.store.store_id, scope, run_id, generation,
-                                         producer_id, kind, create_invocation_id)
+                                         producer_id, kind, create_invocation_id, invocation_id)
         return capability
 
     def finish(self, capability: ProviderInvocationPermit,
@@ -319,7 +319,9 @@ class ProviderLedger:
         if record is None or record[:4] != (os.getpid(), _PROCESS_NONCE, id(self.store.db),
                                              self.store.store_id):
             raise RecoveryRefused("invalid_provider_permit")
-        _, _, _, _, scope, run_id, generation, producer_id, kind, create_id = record
+        _, _, _, _, scope, run_id, generation, producer_id, kind, create_id, invocation_id = record
+        if capability.invocation_id != invocation_id:
+            raise RecoveryRefused("invalid_provider_permit")
         self._active(scope, run_id, generation, producer_id)
         if outcome.state == "returned":
             if kind == "create_environment":
@@ -338,7 +340,7 @@ class ProviderLedger:
                 "SELECT state,kind,create_invocation_id,container_id,container_attestation_sha256,"
                 "exit_code,outcome_reason FROM recovery_provider_invocations WHERE invocation_id=? "
                 "AND session_id=? AND run_id=? AND generation=? AND producer_id=?",
-                (capability.invocation_id, scope.session_id, run_id, generation,
+                (invocation_id, scope.session_id, run_id, generation,
                  producer_id)).fetchone()
             if row is None or (row[1], row[2]) != (kind, create_id):
                 raise RecoveryRefused("invalid_provider_permit")
@@ -360,7 +362,7 @@ class ProviderLedger:
                 "container_attestation_sha256=?,exit_code=?,outcome_reason=? "
                 "WHERE invocation_id=? AND state='invoking'",
                 (outcome.state, outcome.container_id, outcome.container_attestation_sha256,
-                 outcome.exit_code, outcome.reason, capability.invocation_id),
+                 outcome.exit_code, outcome.reason, invocation_id),
             )
             if outcome.state == "unknown":
                 self.store._add_reason(conn, scope, "untracked_producer")

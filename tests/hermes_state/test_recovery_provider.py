@@ -243,6 +243,30 @@ def test_quota_refuses_before_another_physical_effect(tmp_path, monkeypatch):
         db.close()
 
 
+def test_mutated_capability_cannot_settle_another_same_lease_invocation(tmp_path):
+    db, store, scope, registry = _setup(tmp_path)
+    ledger = ProviderLedger(store)
+    lease = registry.enter(registry.permit, "tool")
+    try:
+        def physical():
+            create = ledger.begin(scope, "root", 0, lease.producer_id, "create_environment")
+            ledger.finish(create, ProviderInvocationOutcome(
+                "returned", container_id="container-1", container_attestation_sha256="a" * 64))
+            first = ledger.begin(scope, "root", 0, lease.producer_id, "execute", create.invocation_id)
+            second = ledger.begin(scope, "root", 0, lease.producer_id, "execute", create.invocation_id)
+            first_id = first.invocation_id
+            first._invocation_id = second.invocation_id
+            with pytest.raises(RecoveryRefused, match="invalid_provider_permit"):
+                ledger.finish(first, ProviderInvocationOutcome("returned", exit_code=0))
+            assert [row.state for row in ledger.rows(scope)] == ["returned", "invoking", "invoking"]
+            first._invocation_id = first_id
+            ledger.finish(first, ProviderInvocationOutcome("returned", exit_code=1))
+            ledger.finish(second, ProviderInvocationOutcome("returned", exit_code=0))
+        lease.run(physical)
+    finally:
+        db.close()
+
+
 def test_raw_connections_cannot_mutate_provider_ledger(tmp_path):
     db, store, scope, _registry = _setup(tmp_path)
     try:
