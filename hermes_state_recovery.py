@@ -88,6 +88,16 @@ class RecoveryStore:
             raise RecoveryRefused("durable_store_required")
         self.store_id = str(row[0])
 
+    def _write(self, fn, *, patience_s: float | None = None):
+        """Run an authoritative ledger transition on its exact writer connection."""
+        from agent.recovery_context import _store_writer
+
+        def _authorized(conn):
+            with _store_writer(self.db, conn):
+                return fn(conn)
+
+        return self.db._execute_write(_authorized, patience_s=patience_s)
+
     def _check_scope(self, scope: RecoveryScope) -> None:
         if (scope.store_id != self.store_id or not scope.profile or not scope.scope_digest
                 or not scope.session_id):
@@ -145,6 +155,8 @@ class RecoveryStore:
                     return AdmissionResult("refused", None, "root_conflict")
                 if conn.execute("SELECT 1 FROM sessions WHERE id=?", (scope.session_id,)).fetchone():
                     return AdmissionResult("refused", None, "existing_session")
+                from hermes_state_recovery_guard import install_recovery_guards
+                install_recovery_guards(conn)
                 conn.execute(
                     "INSERT INTO recovery_sessions(session_id,profile,scope_digest,phase,revision,root_run_id) "
                     "VALUES(?,?,?,'open',1,?)",
@@ -174,7 +186,7 @@ class RecoveryStore:
                 parent_run_id=admission.parent_run_id, request_sha256=identity.request_sha256,
                 producer_state="open"))
 
-        result = self.db._execute_write(_tx)
+        result = self._write(_tx)
         if result.outcome == "created":
             from agent.recovery_context import _register_admission_handoff
             return replace(result, handoff=_register_admission_handoff(
@@ -206,7 +218,141 @@ class RecoveryStore:
 
     def update_status(self, run_id: str, status: dict) -> None:
         encoded = json.dumps(status, sort_keys=True, separators=(",", ":"))
-        self.db._write_rowcount("UPDATE recovery_members SET status_json=? WHERE run_id=?", (encoded, run_id))
+        self._write(lambda conn: conn.execute(
+            "UPDATE recovery_members SET status_json=? WHERE run_id=?", (encoded, run_id)))
+
+    def reserve_usage_payload(self, permit: object, delta: object, digest: str) -> str:
+        """Pin the first accepted payload before the worker crosses a thread boundary."""
+        from agent.recovery_context import current_incarnation, usage_write_binding
+
+        binding = usage_write_binding(permit, self)
+        if (binding is None or delta.write_id != binding.delta_id
+                or delta.attempt_id != binding.attempt_id or delta.generation != binding.generation):
+            raise RecoveryRefused("invalid_usage_permit")
+
+        def _tx(conn):
+            row = conn.execute(
+                "SELECT s.state,s.payload_sha256,a.state,p.state,p.owner_incarnation,"
+                "m.producer_state,m.owner_incarnation FROM recovery_usage_slots s "
+                "JOIN recovery_sends a USING(attempt_id) "
+                "JOIN recovery_producers p ON p.producer_id=a.producer_id "
+                "JOIN recovery_members m ON m.run_id=a.run_id "
+                "WHERE s.delta_id=? AND s.attempt_id=? AND a.run_id=? AND a.producer_id=? "
+                "AND m.session_id=? AND m.generation=? AND m.profile=? AND m.scope_digest=?",
+                (binding.delta_id, binding.attempt_id, binding.run_id, binding.producer_id,
+                 binding.scope.session_id, binding.generation, binding.scope.profile,
+                 binding.scope.scope_digest),
+            ).fetchone()
+            if row is None:
+                raise RecoveryRefused("invalid_usage_permit")
+            if row[1] is not None and row[1] != digest:
+                raise RecoveryRefused("usage_payload_conflict")
+            if row[0] == "committed":
+                return "committed"
+            if row[0] != "pending":
+                raise RecoveryRefused("usage_write_failed")
+            if (row[2] != "invoking" or row[3] not in {"running", "closed"}
+                    or row[4:] != (current_incarnation(), "open", current_incarnation())):
+                raise RecoveryRefused("invalid_usage_permit")
+            conn.execute(
+                "UPDATE recovery_usage_slots SET payload_sha256=? "
+                "WHERE delta_id=? AND payload_sha256 IS NULL",
+                (digest, binding.delta_id),
+            )
+            return "pending"
+
+        return self._write(_tx)
+
+    def apply_usage_delta(self, permit: object, delta: object, digest: str) -> None:
+        """Apply session/model counters and acknowledgement in one guarded transaction."""
+        from agent.recovery_context import _usage_apply, usage_write_binding
+        from hermes_state_usage import _TOKEN_UPDATE_DELTA_SQL
+
+        binding = usage_write_binding(permit, self)
+        if (binding is None or binding.delta_id != delta.write_id
+                or binding.attempt_id != delta.attempt_id or binding.generation != delta.generation):
+            raise RecoveryRefused("invalid_usage_permit")
+
+        def _tx(conn):
+            slot = conn.execute(
+                "SELECT state,payload_sha256,ack_revision FROM recovery_usage_slots "
+                "WHERE delta_id=? AND attempt_id=?", (binding.delta_id, binding.attempt_id),
+            ).fetchone()
+            if slot is None or slot[1] != digest:
+                raise RecoveryRefused("usage_payload_conflict")
+            if slot[0] == "committed":
+                return
+            if slot[0] != "pending":
+                raise RecoveryRefused("usage_write_failed")
+            row = conn.execute(
+                "SELECT id,model,billing_provider,api_call_count FROM sessions WHERE id=?",
+                (binding.scope.session_id,),
+            ).fetchone()
+            if row is None:
+                raise RecoveryRefused("protected_session_missing")
+            # Row triggers re-check live member, send, producer and slot on this same
+            # connection. The private usage context narrows this permit to these counters.
+            with _usage_apply(self.db, conn, permit):
+                if (int(row[3] or 0) == 0 and delta.model and delta.billing_provider
+                        and (row[1] != delta.model or row[2] != delta.billing_provider)):
+                    conn.execute(
+                        "UPDATE sessions SET model=?,billing_provider=?,billing_base_url=?,"
+                        "billing_mode=? WHERE id=?",
+                        (delta.model, delta.billing_provider, delta.billing_base_url,
+                         delta.billing_mode, binding.scope.session_id),
+                    )
+                conn.execute(_TOKEN_UPDATE_DELTA_SQL, (
+                    delta.input_tokens, delta.output_tokens, delta.cache_read_tokens,
+                    delta.cache_write_tokens, delta.reasoning_tokens,
+                    delta.estimated_cost_usd, delta.actual_cost_usd, delta.actual_cost_usd,
+                    delta.cost_status, delta.cost_source, delta.pricing_version,
+                    delta.billing_provider, delta.billing_base_url, delta.billing_mode,
+                    delta.model, delta.api_call_count, binding.scope.session_id,
+                ))
+                self.db._record_model_usage(
+                    conn, binding.scope.session_id, model=delta.model,
+                    billing_provider=delta.billing_provider,
+                    billing_base_url=delta.billing_base_url,
+                    billing_mode=delta.billing_mode,
+                    input_tokens=delta.input_tokens, output_tokens=delta.output_tokens,
+                    cache_read_tokens=delta.cache_read_tokens,
+                    cache_write_tokens=delta.cache_write_tokens,
+                    reasoning_tokens=delta.reasoning_tokens,
+                    estimated_cost_usd=delta.estimated_cost_usd,
+                    actual_cost_usd=delta.actual_cost_usd,
+                    cost_status=delta.cost_status, cost_source=delta.cost_source,
+                    api_call_count=delta.api_call_count,
+                )
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (binding.scope.session_id,))
+            revision = conn.execute("SELECT revision FROM recovery_sessions WHERE session_id=?",
+                                    (binding.scope.session_id,)).fetchone()[0]
+            conn.execute(
+                "UPDATE recovery_usage_slots SET state='committed',ack_revision=? "
+                "WHERE delta_id=? AND state='pending'", (revision, binding.delta_id),
+            )
+
+        self._write(_tx)
+
+    def fail_usage_delta(self, permit: object) -> None:
+        """Retain a sticky failure; an unavailable DB leaves the slot pending instead."""
+        from agent.recovery_context import usage_write_binding
+
+        binding = usage_write_binding(permit, self)
+        if binding is None:
+            raise RecoveryRefused("invalid_usage_permit")
+
+        def _tx(conn):
+            changed = conn.execute(
+                "UPDATE recovery_usage_slots SET state='abandoned' "
+                "WHERE delta_id=? AND attempt_id=? AND state='pending'",
+                (binding.delta_id, binding.attempt_id),
+            ).rowcount
+            if changed:
+                self._add_reason(conn, binding.scope, "failed_usage_acknowledgement")
+                self._settle_member(conn, binding.scope, binding.run_id)
+
+        self._write(_tx)
 
     def begin_close(self, scope: RecoveryScope, request: SealRequest) -> CloseView:
         self._check_scope(scope)
@@ -237,7 +383,7 @@ class RecoveryStore:
                 (request.request_id, exact, json.dumps(reasons), scope.session_id))
             return self._view(conn, self._session(conn, scope))
 
-        return self.db._execute_write(_tx)
+        return self._write(_tx)
 
     def lookup(self, scope: RecoveryScope, request_id: str) -> CloseView:
         self._check_scope(scope)
@@ -287,7 +433,7 @@ class RecoveryStore:
             conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def mark_incomplete(self, scope: RecoveryScope, run_id: str, permit: object, reason: str) -> None:
         """Record a sticky reason and close only after inventoried work drains."""
@@ -311,7 +457,7 @@ class RecoveryStore:
             conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def _owned_member(self, conn, scope: RecoveryScope, run_id: str) -> None:
         from agent.recovery_context import current_incarnation
@@ -350,6 +496,9 @@ class RecoveryStore:
             return
         if conn.execute("SELECT 1 FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
                         "WHERE a.run_id=? AND s.state='pending' LIMIT 1", (run_id,)).fetchone() is not None:
+            return
+        if conn.execute("SELECT 1 FROM recovery_write_acks WHERE run_id=? AND state='pending' LIMIT 1",
+                        (run_id,)).fetchone() is not None:
             return
         reasons = conn.execute("SELECT reason_codes_json FROM recovery_sessions WHERE session_id=?",
                                (scope.session_id,)).fetchone()
@@ -400,7 +549,7 @@ class RecoveryStore:
             conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
                          (scope.session_id,))
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def start_registered_producer(self, scope: RecoveryScope, run_id: str, permit: object,
                                   producer_id: str) -> None:
@@ -435,7 +584,7 @@ class RecoveryStore:
                          (scope.session_id,))
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def request_producer_close(self, scope: RecoveryScope, run_id: str, permit: object) -> None:
         from agent.recovery_context import validate_producer_permit
@@ -451,7 +600,7 @@ class RecoveryStore:
             conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def note_producer_incomplete(self, scope: RecoveryScope, run_id: str, permit: object,
                                  reason: str) -> None:
@@ -469,7 +618,7 @@ class RecoveryStore:
             self._add_reason(conn, scope, reason)
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def begin_send(self, scope: RecoveryScope, run_id: str, permit: object, producer_id: str,
                    attempt_id: str, delta_id: str) -> None:
@@ -504,7 +653,7 @@ class RecoveryStore:
                          (scope.session_id,))
 
         try:
-            self.db._execute_write(_tx)
+            self._write(_tx)
         except sqlite3.IntegrityError as exc:
             raise RecoveryRefused("send_attempt_reused") from exc
 
@@ -526,7 +675,7 @@ class RecoveryStore:
             conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
                          (scope.session_id,))
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def finish_send(self, scope: RecoveryScope, run_id: str, permit: object, attempt_id: str,
                     outcome: str, reason: str | None = None) -> None:
@@ -565,7 +714,7 @@ class RecoveryStore:
                          (scope.session_id,))
             self._settle_member(conn, scope, run_id)
 
-        self.db._execute_write(_tx)
+        self._write(_tx)
 
     def send_inventory(self, scope: RecoveryScope, run_id: str) -> tuple[tuple[str, int, str, str], ...]:
         self._check_scope(scope)

@@ -536,6 +536,11 @@ class SessionDB(
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = self._token_writer_busy = False
         self._token_atexit_hook: Optional[Callable[[], None]] = None
+        # Protected usage keeps each physical send's permit and durable delta ID.
+        self._recovery_queue = deque()
+        self._recovery_queue_cond = threading.Condition(threading.Lock())
+        self._recovery_writer_thread: Optional[threading.Thread] = None
+        self._recovery_writer_stop = self._recovery_writer_busy = False
         # Opened via hermes_state_registry.acquire(): close() releases a refcount instead.
         # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
         # registry (not individual callers) controls the connection lifecycle (#90837).
@@ -692,6 +697,8 @@ class SessionDB(
             _secure_state_db_files(self.db_path)
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
+            from hermes_state_recovery_guard import register_connection_guard
+            register_connection_guard(conn, self)
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
             self._close_connection_quietly(conn)
@@ -1378,6 +1385,7 @@ class SessionDB(
             from hermes_state_registry import release
             release(self)
             return
+        self._stop_recovery_writer()
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:

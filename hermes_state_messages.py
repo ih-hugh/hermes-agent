@@ -340,11 +340,18 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, *, recovery_permit: object = None,
+        recovery_write_id: Optional[str] = None, recovery_payload_sha256: Optional[str] = None) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
         if not messages:
             return 0
+        protected_ack = any(value is not None for value in
+                            (recovery_permit, recovery_write_id, recovery_payload_sha256))
+        if protected_ack and (recovery_permit is None or recovery_write_id is None
+                              or recovery_payload_sha256 is None or chunk_rows is not None):
+            from hermes_state_recovery import RecoveryRefused
+            raise RecoveryRefused("invalid_recovery_write")
         if chunk_rows is not None and len(messages) > chunk_rows:
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
@@ -359,6 +366,11 @@ class SessionMessagesMixin:
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
             return inserted
+        if protected_ack:
+            from hermes_state_recovery_guard import guarded_write
+            ack = guarded_write(self, recovery_permit, "message", recovery_write_id,
+                                recovery_payload_sha256, _do)
+            return int(ack.result)
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,

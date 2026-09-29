@@ -5,14 +5,62 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
+import json
 import logging
 import threading
 import time
 import weakref
+from collections import deque
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
+
+
+@dataclass(frozen=True, slots=True)
+class UsageDelta:
+    """One physical send's stable, per-route usage payload."""
+
+    write_id: str
+    attempt_id: str
+    generation: int
+    model: str
+    billing_provider: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    actual_cost_usd: float | None = None
+    cost_status: str | None = None
+    cost_source: str | None = None
+    pricing_version: str | None = None
+    billing_base_url: str | None = None
+    billing_mode: str | None = None
+    api_call_count: int = 1
+
+    def __post_init__(self) -> None:
+        from hermes_state_recovery import RecoveryRefused
+
+        if (not self.write_id or not self.attempt_id or self.generation not in {0, 1}
+                or not self.model or not self.billing_provider or self.api_call_count != 1
+                or any(getattr(self, field) < 0 for field in _TOKEN_COUNTERS)):
+            raise RecoveryRefused("invalid_usage_delta")
+
+    def digest(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class WriteAckState:
+    state: str
+    write_id: str
+    payload_sha256: str | None
+    revision: int | None
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 
@@ -81,6 +129,110 @@ _MODEL_USAGE_FIELDS = frozenset((
 
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
+
+    def queue_recovery_usage(self, permit: object, delta: UsageDelta) -> str:
+        """Carry the exact permit into the real writer; return its durable delta ID."""
+        from hermes_state_recovery import RecoveryRefused, RecoveryStore
+
+        if type(delta) is not UsageDelta:
+            raise RecoveryRefused("invalid_usage_delta")
+        digest = delta.digest()
+        store = RecoveryStore(self)
+        state = store.reserve_usage_payload(permit, delta, digest)
+        if state == "committed":
+            return delta.write_id
+        with self._recovery_queue_cond:
+            if self._recovery_writer_stop:
+                raise RecoveryRefused("usage_writer_stopped")
+            self._recovery_queue.append((permit, delta, digest))
+            thread = self._recovery_writer_thread
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=self._recovery_writer_loop,
+                    name="session-db-recovery-usage-writer", daemon=True,
+                )
+                self._recovery_writer_thread = thread
+                thread.start()
+            self._recovery_queue_cond.notify_all()
+        return delta.write_id
+
+    def _recovery_writer_loop(self) -> None:
+        from hermes_state_recovery import RecoveryStore
+
+        while True:
+            with self._recovery_queue_cond:
+                self._recovery_queue_cond.wait_for(
+                    lambda: self._recovery_queue or self._recovery_writer_stop,
+                )
+                if not self._recovery_queue:
+                    self._recovery_writer_thread = None
+                    self._recovery_queue_cond.notify_all()
+                    return
+                permit, delta, digest = self._recovery_queue.popleft()
+                self._recovery_writer_busy = True
+            try:
+                store = RecoveryStore(self)
+                store.apply_usage_delta(permit, delta, digest)
+            except Exception as exc:
+                logger.warning("protected usage acknowledgement failed: %s", type(exc).__name__)
+                try:
+                    RecoveryStore(self).fail_usage_delta(permit)
+                except Exception:
+                    # DB outage: the pending slot still holds producer capacity.
+                    logger.warning("protected usage failure remains pending")
+            finally:
+                with self._recovery_queue_cond:
+                    self._recovery_writer_busy = False
+                    self._recovery_queue_cond.notify_all()
+
+    def read_write_ack(self, scope: object, write_id: str) -> WriteAckState:
+        from hermes_state_recovery import RecoveryRefused, RecoveryStore
+
+        store = RecoveryStore(self)
+        store._check_scope(scope)
+        generic = self._read_one(
+            "SELECT a.state,a.payload_sha256,a.ack_revision FROM recovery_write_acks a "
+            "JOIN recovery_sessions s ON s.session_id=a.session_id "
+            "WHERE a.write_id=? AND a.session_id=? AND s.profile=? AND s.scope_digest=?",
+            (write_id, scope.session_id, scope.profile, scope.scope_digest),
+        )
+        if generic is not None:
+            return WriteAckState(generic[0], write_id, generic[1], generic[2])
+        row = self._read_one(
+            "SELECT s.state,s.payload_sha256,s.ack_revision FROM recovery_usage_slots s "
+            "JOIN recovery_sends a USING(attempt_id) "
+            "JOIN recovery_members m ON m.run_id=a.run_id "
+            "WHERE s.delta_id=? AND m.session_id=? AND m.profile=? AND m.scope_digest=?",
+            (write_id, scope.session_id, scope.profile, scope.scope_digest),
+        )
+        if row is None:
+            raise RecoveryRefused("write_not_found")
+        state = "committed" if row[0] == "committed" else "failed" if row[0] == "abandoned" else "pending"
+        return WriteAckState(state, write_id, row[1], row[2])
+
+    def wait_recovery_write_ack(self, scope: object, write_id: str, timeout: float = 5.0) -> WriteAckState:
+        deadline = time.monotonic() + timeout
+        while True:
+            ack = self.read_write_ack(scope, write_id)
+            if ack.state != "pending":
+                return ack
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ack
+            with self._recovery_queue_cond:
+                self._recovery_queue_cond.wait(min(remaining, 0.1))
+
+    def _stop_recovery_writer(self, timeout: float = 10.0) -> None:
+        from hermes_state_recovery import RecoveryRefused
+
+        with self._recovery_queue_cond:
+            self._recovery_writer_stop = True
+            self._recovery_queue_cond.notify_all()
+            thread = self._recovery_writer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+            if thread.is_alive():
+                raise RecoveryRefused("usage_writer_busy")
 
     def update_session_billing_route(
         self, session_id: str, *, provider: str, base_url: str, billing_mode: Optional[str] = None,

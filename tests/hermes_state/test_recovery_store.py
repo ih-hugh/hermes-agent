@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from copy import copy, deepcopy
 from multiprocessing import get_context
 from pathlib import Path
+from types import SimpleNamespace
 import asyncio
 import json
 import sqlite3
@@ -297,8 +298,11 @@ def test_handoff_checks_complete_recorded_identity(tmp_path: Path, changed_colum
     identity = _identity(store, owner=current_incarnation())
     try:
         admitted = store.reserve(_root(), identity)
-        db._write_sql(f"UPDATE recovery_members SET {changed_column}=? WHERE run_id=?",
-                      ("different" if changed_column == "idempotency_key" else "c" * 64, "run_root"))
+        # Simulate a previously committed authoritative ledger change; ordinary SQL
+        # cannot mutate recovery identity after admission.
+        store._write(lambda conn: conn.execute(
+            f"UPDATE recovery_members SET {changed_column}=? WHERE run_id=?",
+            ("different" if changed_column == "idempotency_key" else "c" * 64, "run_root")))
         with pytest.raises(RecoveryRefused) as refused:
             issue_producer_permit(store, admitted.handoff)
         assert refused.value.code == "admission_handoff_mismatch"
@@ -842,7 +846,7 @@ async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_p
 
     def fake_create_agent(**kwargs):
         created.set()
-        return object()
+        return SimpleNamespace()
 
     monkeypatch.setattr(RecoveryStore, "update_status", held_update)
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)

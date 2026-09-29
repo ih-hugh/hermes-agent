@@ -972,6 +972,17 @@ class SessionSchemaMixin:
                 payload_sha256 TEXT,
                 ack_revision INTEGER
             );
+            CREATE TABLE IF NOT EXISTS recovery_write_acks (
+                write_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES recovery_sessions(session_id),
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                generation INTEGER NOT NULL,
+                mutation TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending','committed','failed')),
+                ack_revision INTEGER,
+                result_json TEXT
+            );
         """)
         # Task 2a's first checkout may already have the producer table without parentage.
         if not any(row[1] == "parent_producer_id" for row in

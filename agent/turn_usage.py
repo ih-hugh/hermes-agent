@@ -70,6 +70,15 @@ def record_response_usage(
     """Fold ``response.usage`` into compressor, anchors, session counters, state.db
     and the API-call log line (see module docstring). No-usage responses only
     consume a pending compaction verdict. Returns the loop-visible outcome."""
+    registry = getattr(agent, "_recovery_registry", None)
+    protected_send = None
+    if registry is not None:
+        from hermes_state_recovery import RecoveryRefused
+
+        protected_send = registry.claim_response_send(response)
+        if protected_send is None:
+            registry.mark_unsupported("untracked_producer")
+            raise RecoveryRefused("untracked_send_response")
     rearmed = False
     compressor = agent.context_compressor
     # Count every completed provider attempt, including providers that omit usage.
@@ -77,6 +86,13 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
+        if protected_send is not None:
+            from agent.recovery_producers import SendOutcome
+
+            protected_send.finish(SendOutcome(
+                kind="unknown", attempt_id=protected_send.attempt_id,
+                reason="usage_unavailable",
+            ))
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -240,7 +256,56 @@ def record_response_usage(
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
     # loop); drained at finalize via _persist_session.
-    if agent._session_db and agent.session_id:
+    if protected_send is not None:
+        from agent.recovery_context import bind_write_permit, issue_usage_write_permit
+        from agent.recovery_producers import SendOutcome
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_usage import UsageDelta
+
+        try:
+            if not agent._session_db or not agent.session_id:
+                raise RecoveryRefused("protected_session_missing")
+            if not agent._session_db_created:
+                writer = getattr(agent, "_recovery_write_permit", None)
+                if writer is None:
+                    raise RecoveryRefused("untracked_write")
+                with bind_write_permit(writer):
+                    agent._ensure_db_session()
+            usage_writer = issue_usage_write_permit(registry.store, protected_send.completion)
+            delta = UsageDelta(
+                write_id=protected_send.delta_id, attempt_id=protected_send.attempt_id,
+                generation=registry.generation, model=agent.model,
+                billing_provider=agent.provider or "unknown",
+                billing_base_url=agent.base_url,
+                billing_mode="subscription_included" if cost_result.status == "included" else None,
+                input_tokens=canonical_usage.input_tokens,
+                output_tokens=canonical_usage.output_tokens,
+                cache_read_tokens=canonical_usage.cache_read_tokens,
+                cache_write_tokens=canonical_usage.cache_write_tokens,
+                reasoning_tokens=canonical_usage.reasoning_tokens,
+                estimated_cost_usd=_cost_delta,
+                cost_status=cost_result.status, cost_source=cost_result.source,
+                api_call_count=1,
+            )
+            agent._session_db.queue_recovery_usage(usage_writer, delta)
+            ack = agent._session_db.wait_recovery_write_ack(registry.scope, delta.write_id, timeout=20.0)
+            if ack.state != "committed":
+                raise RecoveryRefused("usage_ack_required")
+            protected_send.finish(SendOutcome(
+                kind="accounted", attempt_id=protected_send.attempt_id,
+                acknowledged_delta_ids=(protected_send.delta_id,),
+            ))
+        except Exception:
+            try:
+                protected_send.finish(SendOutcome(
+                    kind="unknown", attempt_id=protected_send.attempt_id,
+                    reason="usage_ack_failed",
+                ))
+            except RecoveryRefused:
+                pass
+            registry.mark_unsupported("failed_usage_acknowledgement")
+            raise
+    elif agent._session_db and agent.session_id:
         try:
             # Ensure the row exists: under concurrent SQLite load the initial
             # _ensure_db_session() may fail, and UPDATE on a missing row affects 0 rows.

@@ -1,0 +1,285 @@
+"""Connection-local write authority for explicitly protected recovery sessions.
+
+SQLite executes these functions from row triggers in the writer's transaction. A
+second connection without the functions cannot write through the triggers.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import weakref
+import json
+from dataclasses import dataclass
+from typing import Callable, TypeVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hermes_state import SessionDB
+
+
+_ROWS = {
+    "sessions": "id",
+    "messages": "session_id",
+    "session_model_usage": "session_id",
+}
+_MUTATION = {
+    "sessions": "session",
+    "messages": "message",
+    "session_model_usage": "usage",
+}
+_LEDGER = (
+    "recovery_store",
+    "recovery_sessions",
+    "recovery_members",
+    "recovery_producers",
+    "recovery_root_done",
+    "recovery_sends",
+    "recovery_usage_slots",
+    "recovery_write_acks",
+)
+T = TypeVar("T")
+
+
+@dataclass(frozen=True, slots=True)
+class WriteAck:
+    write_id: str
+    payload_sha256: str
+    revision: int
+    result: object
+
+
+def guarded_write(
+    db: SessionDB,
+    permit: object,
+    mutation: str,
+    write_id: str,
+    payload_sha256: str,
+    fn: Callable[[sqlite3.Connection], T],
+) -> WriteAck:
+    """Commit one protected mutation and its stable acknowledgement atomically."""
+    from agent.recovery_context import (
+        _generic_write,
+        authorize_recovery_row,
+        write_binding,
+    )
+    from hermes_state_recovery import RecoveryRefused, RecoveryStore
+
+    store = RecoveryStore(db)
+    binding = write_binding(permit, store)
+    if (
+        binding is None
+        or mutation not in {"session", "message", "completion"}
+        or not write_id
+        or len(payload_sha256) != 64
+    ):
+        raise RecoveryRefused("invalid_write_permit")
+    scope, run_id, generation = binding
+
+    identity = (scope.session_id, run_id, generation, mutation, payload_sha256)
+
+    def _existing(conn):
+        row = conn.execute(
+            "SELECT session_id,run_id,generation,mutation,payload_sha256,state,"
+            "ack_revision,result_json FROM recovery_write_acks WHERE write_id=?",
+            (write_id,),
+        ).fetchone()
+        if row is not None and tuple(row[:5]) != identity:
+            raise RecoveryRefused("write_payload_conflict")
+        return row
+
+    def _reserve(conn):
+        existing = _existing(conn)
+        if existing is not None:
+            if existing[5] == "committed":
+                return WriteAck(
+                    write_id, payload_sha256, existing[6], json.loads(existing[7])
+                )
+            if existing[5] == "failed":
+                raise RecoveryRefused("write_failed")
+            return None
+        with _generic_write(db, conn, permit):
+            if not authorize_recovery_row(db, conn, scope.session_id, mutation):
+                raise RecoveryRefused("invalid_write_permit")
+        conn.execute(
+            "INSERT INTO recovery_write_acks"
+            "(write_id,session_id,run_id,generation,mutation,payload_sha256,state) "
+            "VALUES(?,?,?,?,?,?,'pending')",
+            (write_id, *identity),
+        )
+        return None
+
+    committed = store._write(_reserve, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+    if committed is not None:
+        return committed
+
+    def _apply(conn):
+        existing = _existing(conn)
+        if existing is None or existing[5] != "pending":
+            if existing is not None and existing[5] == "committed":
+                return WriteAck(
+                    write_id, payload_sha256, existing[6], json.loads(existing[7])
+                )
+            raise RecoveryRefused("write_failed")
+        with _generic_write(db, conn, permit):
+            if not authorize_recovery_row(db, conn, scope.session_id, mutation):
+                raise RecoveryRefused("invalid_write_permit")
+            result = fn(conn)
+        conn.execute(
+            "UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+            (scope.session_id,),
+        )
+        revision = conn.execute(
+            "SELECT revision FROM recovery_sessions WHERE session_id=?",
+            (scope.session_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE recovery_write_acks SET state='committed',ack_revision=?,result_json=? "
+            "WHERE write_id=? AND state='pending'",
+            (revision, json.dumps(result, sort_keys=True), write_id),
+        )
+        return WriteAck(write_id, payload_sha256, revision, result)
+
+    try:
+        return store._write(_apply, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+    except BaseException:
+
+        def _fail(conn):
+            existing = _existing(conn)
+            if existing is not None and existing[5] == "pending":
+                conn.execute(
+                    "UPDATE recovery_write_acks SET state='failed' "
+                    "WHERE write_id=? AND state='pending'",
+                    (write_id,),
+                )
+                store._add_reason(conn, scope, "untracked_write")
+                store._settle_member(conn, scope, run_id)
+
+        try:
+            store._write(_fail, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S)
+        except Exception:
+            # An unavailable DB retains the pending row and member capacity.
+            pass
+        raise
+
+
+_USAGE_SESSION_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "cost_status",
+    "cost_source",
+    "pricing_version",
+    "billing_provider",
+    "billing_base_url",
+    "billing_mode",
+    "model",
+    "api_call_count",
+)
+_USAGE_INSERT_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "estimated_cost_usd",
+    "actual_cost_usd",
+    "api_call_count",
+)
+_UNSUPPORTED_SESSION_COLUMNS = ("title", "title_source", "display_name", "model_config")
+
+
+def register_connection_guard(conn: sqlite3.Connection, db: SessionDB) -> None:
+    """Install only process-owned functions, never a SQL-settable bypass value."""
+    from agent.recovery_context import authorize_recovery_row, authorize_recovery_store
+
+    db_ref = weakref.ref(db)
+    conn_ref = weakref.ref(conn)
+
+    def _row_guard(session_id, mutation):
+        live_db, live_conn = db_ref(), conn_ref()
+        return int(
+            live_db is not None
+            and live_conn is not None
+            and authorize_recovery_row(live_db, live_conn, session_id, mutation)
+        )
+
+    def _store_guard():
+        live_db, live_conn = db_ref(), conn_ref()
+        return int(
+            live_db is not None
+            and live_conn is not None
+            and authorize_recovery_store(live_db, live_conn)
+        )
+
+    conn.create_function(
+        "recovery_row_guard",
+        2,
+        _row_guard,
+    )
+    conn.create_function(
+        "recovery_store_guard",
+        0,
+        _store_guard,
+    )
+
+
+def install_recovery_guards(conn: sqlite3.Connection) -> None:
+    """Create opted-in triggers inside the admission transaction."""
+    for table, id_col in _ROWS.items():
+        mutation = _MUTATION[table]
+        for operation, identities in (
+            ("INSERT", (f"NEW.{id_col}",)),
+            ("UPDATE", (f"OLD.{id_col}", f"NEW.{id_col}")),
+            ("DELETE", (f"OLD.{id_col}",)),
+        ):
+            name = f"recovery_guard_{table}_{operation.lower()}"
+            checked_mutation = f"'{mutation}'"
+            if operation == "DELETE":
+                checked_mutation = "'delete'"
+            if table == "sessions" and operation == "INSERT":
+                nonzero = " OR ".join(
+                    f"COALESCE(NEW.{column}, 0) != 0"
+                    for column in _USAGE_INSERT_COLUMNS
+                )
+                checked_mutation = (
+                    f"CASE WHEN {nonzero} THEN 'usage' ELSE 'session' END"
+                )
+            if table == "sessions" and operation == "UPDATE":
+                changed = " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}"
+                    for column in _USAGE_SESSION_COLUMNS
+                )
+                unsupported = " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}"
+                    for column in _UNSUPPORTED_SESSION_COLUMNS
+                )
+                checked_mutation = (
+                    f"CASE WHEN OLD.id IS NOT NEW.id THEN 'move' "
+                    f"WHEN {unsupported} THEN 'unsupported' "
+                    f"WHEN {changed} THEN 'usage' ELSE 'session' END"
+                )
+            elif operation == "UPDATE":
+                checked_mutation = (
+                    f"CASE WHEN OLD.{id_col} IS NOT NEW.{id_col} THEN 'move' "
+                    f"ELSE '{mutation}' END"
+                )
+            checks = " AND ".join(
+                f"recovery_row_guard({identity}, {checked_mutation}) = 1"
+                for identity in identities
+            )
+            conn.execute(
+                f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
+                f"BEGIN SELECT CASE WHEN NOT ({checks}) THEN RAISE(ABORT, 'recovery_write_refused') END; END"
+            )
+    for table in _LEDGER:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            name = f"recovery_guard_{table}_{operation.lower()}"
+            conn.execute(
+                f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {operation} ON {table} "
+                "BEGIN SELECT CASE WHEN recovery_store_guard() != 1 "
+                "THEN RAISE(ABORT, 'recovery_store_refused') END; END"
+            )

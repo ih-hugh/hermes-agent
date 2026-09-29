@@ -581,8 +581,40 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     implicit transaction. Barriers are best-effort: on a malformed schema even ``PRAGMA synchronous=FULL`` raises,
     so whole-file rewrites call :func:`_reapply_durability_barriers` once the schema parses again."""
     conn = sqlite3.connect(str(db_path), timeout=timeout, isolation_level=None)
+    # Repair connections have no producer or RecoveryStore authority. Registering
+    # the same function names lets legacy-row probes work; protected rows still
+    # fail on every DML statement, including after a raw reopen.
+    conn.create_function("recovery_row_guard", 2, lambda _session_id, _mutation: 0)
+    conn.create_function("recovery_store_guard", 0, lambda: 0)
     _reapply_durability_barriers(conn)
     return conn
+
+
+def _contains_protected_recovery(db_path: Path) -> bool:
+    """Look for the opted trigger marker even when unrelated schema objects are malformed."""
+    if not db_path.exists():
+        return False
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            # The named trigger is installed in the same transaction as the first
+            # member. writable_schema is connection-local and permits this read when
+            # an unrelated FTS sqlite_master entry is malformed.
+            conn.execute("PRAGMA writable_schema=ON")
+            marker = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='recovery_guard_recovery_sessions_insert' LIMIT 1",
+            ).fetchone()
+            if marker is not None:
+                return True
+            try:
+                return conn.execute("SELECT 1 FROM recovery_sessions LIMIT 1").fetchone() is not None
+            except sqlite3.DatabaseError:
+                return False
+    except sqlite3.DatabaseError:
+        # Legacy corruption may make even sqlite_master unreadable; it needs the
+        # pre-repair forensic backup. An opted store's guard marker is checked again
+        # before promotion when the scratch copy becomes readable.
+        return False
 
 
 def _repair_conn(db_path: Path, *, timeout: float = 5.0):
@@ -666,6 +698,8 @@ def _copy_database_snapshot(source_path: Path, destination_path: Path, *,
     """Copy one complete SQLite snapshot without replacing either file inode: the online backup API folds
     committed WAL frames into the source snapshot and writes the destination in one transaction (rolled
     back if interrupted), so ``state.db`` is never swapped out from under handles that refer to it."""
+    if _contains_protected_recovery(source_path) or _contains_protected_recovery(destination_path):
+        raise sqlite3.DatabaseError("protected recovery store refuses repair backup")
     # Deadline first: a sidecar vanishing mid-stat must not leak a just-opened descriptor.
     deadline_seconds = _repair_snapshot_timeout_seconds(source_path)
     deadline = time.monotonic() + deadline_seconds
@@ -978,6 +1012,8 @@ def _repair_state_db_schema_locked(
     so recovery still depends on a human noticing a ``.malformed-backup-*`` file and knowing what to do with
     it. Not mutating the original in the first place is the property that holds without a human in the loop.
     """
+    if _contains_protected_recovery(db_path):
+        return _repair_skip(report, "aborted", "protected recovery store refuses schema repair")
     scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
     if (cleanup_error := _unlink_db_triple(scratch)) is not None:
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")

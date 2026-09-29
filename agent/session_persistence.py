@@ -2,10 +2,12 @@
 with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, explicit
 trajectory export."""
 import hashlib
+import json
+import uuid
 
 import logging
 import re
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -213,13 +215,81 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
-    agent._session_db.append_messages_batch(
-        session_id=agent.session_id, messages=batch_rows,
-        compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
-        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
-    )
+    protected = _is_protected_session(agent)
+    recovery_kwargs = {}
+    if protected:
+        from agent.recovery_context import current_write_permit
+        from hermes_state_recovery import RecoveryRefused
+
+        permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
+        if permit is None:
+            raise RecoveryRefused("untracked_write")
+        # Repair may annotate private _row_id/_canonical_content fields while
+        # retrying a transaction; those are not part of the submitted row payload.
+        submitted = [{k: v for k, v in row.items() if k not in {"_row_id", "_canonical_content"}}
+                     for row in batch_rows]
+        encoded = json.dumps(submitted, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        pending = getattr(agent, "_recovery_pending_message_batch", None)
+        if pending is not None:
+            if pending[0] != agent.session_id or pending[2] != digest:
+                raise RecoveryRefused("write_payload_conflict")
+            write_id = pending[1]
+        else:
+            write_id = f"message_{uuid.uuid4().hex}"
+            agent._recovery_pending_message_batch = (agent.session_id, write_id, digest)
+        recovery_kwargs = {
+            "recovery_permit": permit, "recovery_write_id": write_id,
+            "recovery_payload_sha256": digest,
+        }
+    with _protected_write_binding(agent):
+        try:
+            agent._session_db.append_messages_batch(
+                session_id=agent.session_id, messages=batch_rows,
+                compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+                **recovery_kwargs,
+            )
+        except Exception:
+            if not protected:
+                raise
+            registry = getattr(agent, "_recovery_registry", None)
+            if registry is None:
+                raise
+            ack = agent._session_db.read_write_ack(registry.scope, write_id)
+            if ack.state != "committed" or ack.payload_sha256 != digest:
+                raise
+    if protected:
+        agent._recovery_pending_message_batch = None
     sync_flushed_message_markers(batch_msgs, batch_rows)
+
+
+def _is_protected_session(agent) -> bool:
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return False
+    if getattr(agent, "_recovery_registry", None) is not None:
+        return True
+    if not hasattr(db, "_read_one"):
+        return False  # non-SQLite test capture or external persistence adapter
+    return db._read_one("SELECT 1 FROM recovery_sessions WHERE session_id=?", (session_id,)) is not None
+
+
+@contextmanager
+def _protected_write_binding(agent):
+    if not _is_protected_session(agent):
+        yield
+        return
+    from agent.recovery_context import bind_write_permit, current_write_permit
+    from hermes_state_recovery import RecoveryRefused
+
+    permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
+    if permit is None:
+        raise RecoveryRefused("untracked_write")
+    with bind_write_permit(permit):
+        yield
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -248,6 +318,13 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
 def _db_flush_failed(agent, e: Exception, batch_rows: List[Dict[str, Any]], adoption_budget: int) -> bool:
     """Classify a failed flush; True when the caller should retry once on an adopted compression tip."""
     agent._db_flush_scan_prefix = None  # full re-scan next flush: an exception mid-loop leaves mixed dispositions
+    if _is_protected_session(agent):
+        from hermes_state_recovery import RecoveryRefused
+
+        registry = getattr(agent, "_recovery_registry", None)
+        if registry is not None:
+            registry.mark_unsupported("untracked_write")
+        raise RecoveryRefused("protected_transcript_write_failed") from e
     # The only place the SQLite error is visible before it becomes a bare False — classify it so the turn-end
     # explanation can distinguish lock contention from disk-full/read-only.
     from hermes_state import StateDbCorruptError, StateDbReplacedError, classify_persistence_error, divert_session_transcript_jsonl
@@ -361,7 +438,8 @@ class SessionPersistenceMixin:
         batch_rows: List[Dict[str, Any]] = []
         try:
             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently
-                self._ensure_db_session()
+                with _protected_write_binding(self):
+                    self._ensure_db_session()
             batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history)
             _db_flush_write(self, batch_rows, batch_msgs)
             # Markers are now the sole truth; reset the one-shot seed so no id() outlives this flush.
