@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import math
+import sqlite3
 import threading
 import time
 import weakref
@@ -151,6 +152,54 @@ _USAGE_OPTIONAL_STRINGS = (
     "cost_status", "cost_source", "pricing_version", "billing_base_url", "billing_mode",
 )
 _MAX_USAGE_PAYLOAD_BYTES = 65536
+
+
+def _validate_protected_usage_totals(
+    conn: sqlite3.Connection, session_id: str, delta: UsageDelta,
+) -> None:
+    """Refuse inexact cumulative totals before the protected write is acknowledged."""
+    from hermes_state_recovery import RecoveryRefused
+
+    def _valid_totals(
+        row: tuple[object, ...] | sqlite3.Row | None, *, nullable_actual: bool,
+    ) -> bool:
+        if row is None:
+            return False
+        counters = row[:6]
+        if any(type(value) is not int or not 0 <= value <= 2**63 - 1
+               for value in counters):
+            return False
+        for index in (6, 7):
+            value = row[index]
+            if value is None and index == 7 and nullable_actual:
+                continue
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                return False
+        return True
+
+    session = conn.execute(
+        "SELECT model,billing_provider,billing_base_url,billing_mode,"
+        "api_call_count,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,"
+        "reasoning_tokens,estimated_cost_usd,actual_cost_usd FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    if session is None or not _valid_totals(session[4:], nullable_actual=True):
+        raise RecoveryRefused("invalid_usage_totals")
+    route = (
+        delta.model or session[0] or "unknown",
+        delta.billing_provider or session[1] or "",
+        delta.billing_base_url or session[2] or "",
+        delta.billing_mode or session[3] or "",
+    )
+    model = conn.execute(
+        "SELECT api_call_count,input_tokens,output_tokens,cache_read_tokens,"
+        "cache_write_tokens,reasoning_tokens,estimated_cost_usd,actual_cost_usd "
+        "FROM session_model_usage WHERE session_id=? AND model=? AND billing_provider=? "
+        "AND billing_base_url=? AND billing_mode=? AND task=''",
+        (session_id, *route),
+    ).fetchone()
+    if not _valid_totals(model, nullable_actual=False):
+        raise RecoveryRefused("invalid_usage_totals")
 
 
 def _token_update_sql(delta: bool) -> str:

@@ -83,6 +83,132 @@ def _read_all(store: RecoveryStore, scope: RecoveryScope):
     return store._write(lambda conn: tuple(store.iter_committed_usage_payloads(scope, conn=conn)))
 
 
+def _another_send(registry: ProducerRegistry, store: RecoveryStore, attempt_id: str):
+    def _invoke():
+        send = registry.sends.begin(registry.permit, attempt_id)
+        send.invoke(lambda: None)
+        return send
+
+    send = registry.enter(registry.permit, "sdk").run(_invoke)
+    return send, issue_usage_write_permit(store, send.completion)
+
+
+@pytest.mark.parametrize("stage", ["reserve", "apply", "read"])
+def test_mismatched_send_and_slot_delta_refuses_at_every_seam(tmp_path: Path, stage: str) -> None:
+    db, store, scope, _, send, permit = _pending_send(tmp_path)
+    delta = _delta(send)
+    try:
+        if stage != "reserve":
+            store.reserve_usage_payload(permit, delta, delta.digest())
+        if stage == "read":
+            store.apply_usage_delta(permit, delta, delta.digest())
+        store._write(lambda conn: conn.execute(
+            "UPDATE recovery_sends SET delta_id='other-delta' WHERE attempt_id=?",
+            (send.attempt_id,),
+        ))
+        if stage == "reserve":
+            with pytest.raises(RecoveryRefused):
+                store.reserve_usage_payload(permit, delta, delta.digest())
+        elif stage == "apply":
+            with pytest.raises(RecoveryRefused):
+                store.apply_usage_delta(permit, delta, delta.digest())
+            assert db.get_session(scope.session_id)["input_tokens"] == 0
+        else:
+            with pytest.raises(RecoveryRefused):
+                _read_all(store, scope)
+    finally:
+        db.close()
+
+
+def test_reservation_refuses_producer_bound_to_different_member(tmp_path: Path) -> None:
+    db, store, scope, _, send, permit = _pending_send(tmp_path)
+    delta = _delta(send)
+    try:
+        def _tamper(conn):
+            conn.execute(
+                "INSERT INTO recovery_members(run_id,session_id,generation,parent_run_id,"
+                "profile,scope_digest,idempotency_key,request_sha256,owner_incarnation,"
+                "producer_state,status_json) "
+                "SELECT 'other-run',session_id,1,run_id,profile,scope_digest,"
+                "'byf-recovery-v1:other',request_sha256,owner_incarnation,'open','{}' "
+                "FROM recovery_members WHERE run_id='root'"
+            )
+            conn.execute(
+                "UPDATE recovery_producers SET run_id='other-run' WHERE producer_id="
+                "(SELECT producer_id FROM recovery_sends WHERE attempt_id=?)",
+                (send.attempt_id,),
+            )
+
+        store._write(_tamper)
+        with pytest.raises(RecoveryRefused, match="invalid_usage_permit"):
+            store.reserve_usage_payload(permit, delta, delta.digest())
+        assert tuple(db._read_one(
+            "SELECT payload_sha256,payload_json FROM recovery_usage_slots WHERE delta_id=?",
+            (delta.write_id,),
+        )) == (None, None)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("overrides,field", [
+    ({"input_tokens": 2**63 - 1}, "input_tokens"),
+    ({"estimated_cost_usd": 1e308, "actual_cost_usd": 1e308}, "estimated_cost_usd"),
+])
+def test_cumulative_overflow_rolls_back_both_rows_and_ack(
+    tmp_path: Path, overrides: dict, field: str,
+) -> None:
+    db, store, scope, registry, first_send, first_permit = _pending_send(tmp_path)
+    second_send, second_permit = _another_send(registry, store, "attempt-overflow")
+    first = _delta(first_send, **overrides)
+    second = _delta(
+        second_send,
+        input_tokens=1 if field == "input_tokens" else 0,
+        output_tokens=0, cache_read_tokens=0, cache_write_tokens=0, reasoning_tokens=0,
+        estimated_cost_usd=1e308 if field == "estimated_cost_usd" else 0,
+        actual_cost_usd=1e308 if field == "estimated_cost_usd" else None,
+    )
+    try:
+        store.reserve_usage_payload(first_permit, first, first.digest())
+        store.apply_usage_delta(first_permit, first, first.digest())
+        first_send.finish(SendOutcome(
+            kind="accounted", attempt_id=first_send.attempt_id,
+            acknowledged_delta_ids=(first_send.delta_id,),
+        ))
+        session_before = db._read_one(
+            "SELECT input_tokens,estimated_cost_usd,actual_cost_usd,api_call_count "
+            "FROM sessions WHERE id=?", (scope.session_id,),
+        )
+        model_before = db._read_one(
+            "SELECT input_tokens,estimated_cost_usd,actual_cost_usd,api_call_count "
+            "FROM session_model_usage WHERE session_id=? AND task=''", (scope.session_id,),
+        )
+        assert type(session_before[0 if field == "input_tokens" else 1]) is (
+            int if field == "input_tokens" else float
+        )
+        store.reserve_usage_payload(second_permit, second, second.digest())
+        with pytest.raises(RecoveryRefused, match="invalid_usage_totals"):
+            store.apply_usage_delta(second_permit, second, second.digest())
+        assert tuple(db._read_one(
+            "SELECT input_tokens,estimated_cost_usd,actual_cost_usd,api_call_count "
+            "FROM sessions WHERE id=?", (scope.session_id,),
+        )) == tuple(session_before)
+        assert tuple(db._read_one(
+            "SELECT input_tokens,estimated_cost_usd,actual_cost_usd,api_call_count "
+            "FROM session_model_usage WHERE session_id=? AND task=''", (scope.session_id,),
+        )) == tuple(model_before)
+        assert tuple(db._read_one(
+            "SELECT state,ack_revision FROM recovery_usage_slots WHERE delta_id=?",
+            (second.write_id,),
+        )) == ("pending", None)
+        store.fail_usage_delta(second_permit)
+        assert tuple(db._read_one(
+            "SELECT state,ack_revision FROM recovery_usage_slots WHERE delta_id=?",
+            (second.write_id,),
+        )) == ("abandoned", None)
+    finally:
+        db.close()
+
+
 def test_complete_canonical_delta_survives_closing_reopen_and_new_process(tmp_path: Path) -> None:
     db, store, scope, _, send, permit = _pending_send(tmp_path)
     delta = _delta(send)
@@ -99,6 +225,7 @@ def test_complete_canonical_delta_survives_closing_reopen_and_new_process(tmp_pa
         )
         assert db.queue_recovery_usage(permit, delta) == delta.write_id
         assert db.wait_recovery_write_ack(scope, delta.write_id, timeout=5).state == "committed"
+        assert db.get_session(scope.session_id)["actual_cost_usd"] is None
         send.finish(SendOutcome(
             kind="accounted", attempt_id=send.attempt_id,
             acknowledged_delta_ids=(send.delta_id,),
