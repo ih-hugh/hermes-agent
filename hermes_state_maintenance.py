@@ -358,7 +358,7 @@ class SessionMaintenanceMixin:
             self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
             # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
             # write-path generation guard does not halt this connection.
-            self._record_db_file_identity()
+            self._record_db_file_identity_locked(self._conn)
         return optimized
 
     def maybe_auto_prune_and_vacuum(

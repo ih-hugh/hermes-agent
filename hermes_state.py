@@ -1600,25 +1600,33 @@ class SessionDB(
             logger.debug("state.db generation stamp skipped: %s", exc)
 
     def _record_db_file_identity(self) -> None:
-        """Snapshot inode plus the on-disk generation header when present."""
+        """Snapshot identity on the selected writer before sharing this handle."""
+        with self._lock:
+            self._record_db_file_identity_locked(self._conn)
+
+    def _record_db_file_identity_locked(self, conn: sqlite3.Connection | None) -> None:
+        """Capture identity while the caller holds the writer lock.
+
+        VACUUM already owns that non-reentrant lock and must use this entry
+        point after its checkpoint replaces sidecars.
+        """
         self._db_file_identity = _stat_db_file_identity(self.db_path)
         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
-        if not self.read_only and self._conn is not None:
-            with self._lock:
-                store = self._conn.execute(
-                    "SELECT store_id FROM recovery_store WHERE singleton=1"
-                ).fetchone()
-                generation = self._conn.execute(
-                    "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
-                ).fetchone()
+        if not self.read_only and conn is not None:
+            store = conn.execute(
+                "SELECT store_id FROM recovery_store WHERE singleton=1"
+            ).fetchone()
+            generation = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+            ).fetchone()
             self._opened_store_id = str(store[0]) if store and store[0] else None
             self._opened_generation_token = str(generation[0]) if generation and generation[0] else None
         disk_id = _read_sqlite_application_id(self.db_path)
         if disk_id:
             self._db_file_application_id = disk_id
-        elif self._conn is not None and not self._db_file_application_id:
+        elif conn is not None and not self._db_file_application_id:
             try:
-                pragma_row = self._read_one("PRAGMA application_id")
+                pragma_row = conn.execute("PRAGMA application_id").fetchone()
             except sqlite3.Error:
                 pragma_row = None
             if pragma_row and pragma_row[0]:
