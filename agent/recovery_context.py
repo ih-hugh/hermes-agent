@@ -8,6 +8,7 @@ import uuid
 import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
@@ -18,6 +19,8 @@ _PROCESS_NONCE = uuid.uuid4().hex
 _ISSUER = object()
 _REGISTRY: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
 _HANDOFFS: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
+_USAGE_COMPLETIONS: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
+_USAGE_WRITES: weakref.WeakKeyDictionary[object, tuple] = weakref.WeakKeyDictionary()
 _ISSUE_LOCK = threading.Lock()
 _ACTIVE_WRITE: ContextVar[WritePermit | None] = ContextVar("recovery_write_permit", default=None)
 
@@ -59,6 +62,85 @@ class AdmissionHandoff:
 
     def __reduce_ex__(self, protocol: int):
         raise TypeError("admission handoffs cannot be copied or serialized")
+
+
+class UsageCompletion:
+    """One-use authority for the usage slot registered before one physical SDK send."""
+
+    __slots__ = ("__weakref__",)
+
+    def __init__(self, issuer: object):
+        if issuer is not _ISSUER:
+            raise TypeError("usage completions are issued internally")
+
+    def __reduce_ex__(self, protocol: int):
+        raise TypeError("usage completions cannot be copied or serialized")
+
+
+def _register_usage_completion(store: RecoveryStore, scope: RecoveryScope, run_id: str,
+                               generation: int, producer_id: str, attempt_id: str,
+                               delta_id: str) -> UsageCompletion:
+    """Called only after SendLedger.begin durably registered this exact slot."""
+    completion = UsageCompletion(_ISSUER)
+    with _ISSUE_LOCK:
+        _USAGE_COMPLETIONS[completion] = (
+            os.getpid(), _PROCESS_NONCE, id(store.db), store.store_id, scope,
+            run_id, generation, producer_id, attempt_id, delta_id)
+    return completion
+
+
+def issue_usage_write_permit(store: RecoveryStore, completion: UsageCompletion) -> WritePermit:
+    """Consume one exact pre-send completion slot; the resulting permit supports idempotent retries."""
+    from hermes_state_recovery import RecoveryRefused
+
+    if type(completion) is not UsageCompletion:
+        raise RecoveryRefused("invalid_usage_completion")
+    with _ISSUE_LOCK:
+        binding = _USAGE_COMPLETIONS.pop(completion, None)
+    if binding is None:
+        raise RecoveryRefused("usage_completion_consumed")
+    pid, nonce, db_id, store_id, scope, run_id, generation, producer_id, attempt_id, delta_id = binding
+    if (pid, nonce, db_id, store_id) != (os.getpid(), _PROCESS_NONCE, id(store.db), store.store_id):
+        raise RecoveryRefused("foreign_usage_completion")
+    row = store.db._read_one(
+        "SELECT a.producer_id,s.state,m.owner_incarnation,m.producer_state,a.state "
+        "FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
+        "JOIN recovery_members m ON m.run_id=a.run_id "
+        "WHERE s.delta_id=? AND s.attempt_id=? AND a.run_id=?",
+        (delta_id, attempt_id, run_id))
+    if (row is None or row[0] != producer_id or row[1] != "pending" or
+            row[2] != current_incarnation() or row[3] != "open" or row[4] != "invoking"):
+        raise RecoveryRefused("invalid_usage_completion")
+    permit = WritePermit(_ISSUER)
+    with _ISSUE_LOCK:
+        _REGISTRY[permit] = (os.getpid(), _PROCESS_NONCE, id(store.db), scope, run_id, generation)
+        _USAGE_WRITES[permit] = binding
+    return permit
+
+
+@dataclass(frozen=True, slots=True)
+class UsageWriteBinding:
+    scope: RecoveryScope
+    run_id: str
+    generation: int
+    producer_id: str
+    attempt_id: str
+    delta_id: str
+    mutation: str = "usage"
+
+
+def usage_write_binding(permit: WritePermit, store: RecoveryStore) -> UsageWriteBinding | None:
+    """Return exact pre-send authority for Task 3's guarded usage writer."""
+    if type(permit) is not WritePermit:
+        return None
+    try:
+        binding = _USAGE_WRITES.get(permit)
+    except TypeError:
+        return None
+    if binding is None or binding[:4] != (os.getpid(), _PROCESS_NONCE, id(store.db), store.store_id):
+        return None
+    _, _, _, _, scope, run_id, generation, producer_id, attempt_id, delta_id = binding
+    return UsageWriteBinding(scope, run_id, generation, producer_id, attempt_id, delta_id)
 
 
 def _register_admission_handoff(store: RecoveryStore, identity: AdmissionIdentity,
@@ -135,8 +217,13 @@ def issue_write_permit(permit: ProducerPermit, store: RecoveryStore, scope: Reco
 
 
 def validate_write_permit(permit: WritePermit, store: RecoveryStore, scope: RecoveryScope,
-                          run_id: str, generation: int) -> bool:
-    return _validate_permit(permit, WritePermit, store, scope, run_id, generation)
+                          run_id: str, generation: int, *, mutation: str | None = None) -> bool:
+    if not _validate_permit(permit, WritePermit, store, scope, run_id, generation):
+        return False
+    usage = usage_write_binding(permit, store)
+    if usage is not None:
+        return mutation == "usage" and usage.scope == scope and usage.run_id == run_id
+    return mutation != "usage"
 
 
 @contextmanager

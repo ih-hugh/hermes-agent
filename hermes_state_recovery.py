@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -321,3 +322,247 @@ class RecoveryStore:
                 (json.dumps(codes), scope.session_id))
 
         self.db._execute_write(_tx)
+
+    def _owned_member(self, conn, scope: RecoveryScope, run_id: str) -> None:
+        from agent.recovery_context import current_incarnation
+
+        row = conn.execute(
+            "SELECT owner_incarnation,producer_state FROM recovery_members "
+            "WHERE run_id=? AND session_id=? AND profile=? AND scope_digest=?",
+            (run_id, scope.session_id, scope.profile, scope.scope_digest)).fetchone()
+        if row is None or row[0] != current_incarnation() or row[1] != "open":
+            raise RecoveryRefused("foreign_producer")
+
+    @staticmethod
+    def _add_reason(conn, scope: RecoveryScope, reason: str) -> None:
+        if reason not in INCOMPLETE_REASONS:
+            raise RecoveryRefused("invalid_reason")
+        row = conn.execute(
+            "SELECT reason_codes_json FROM recovery_sessions WHERE session_id=?",
+            (scope.session_id,)).fetchone()
+        if row is None:
+            raise RecoveryRefused("not_found")
+        reasons = list(json.loads(row[0]))
+        if reason not in reasons:
+            reasons.append(reason)
+            conn.execute("UPDATE recovery_sessions SET reason_codes_json=?,revision=revision+1 WHERE session_id=?",
+                         (json.dumps(reasons), scope.session_id))
+
+    @staticmethod
+    def _settle_member(conn, scope: RecoveryScope, run_id: str) -> None:
+        if conn.execute("SELECT 1 FROM recovery_root_done WHERE run_id=?", (run_id,)).fetchone() is None:
+            return
+        if conn.execute("SELECT 1 FROM recovery_producers WHERE run_id=? AND state IN ('queued','running') LIMIT 1",
+                        (run_id,)).fetchone() is not None:
+            return
+        if conn.execute("SELECT 1 FROM recovery_sends WHERE run_id=? AND state IN ('reserved','invoking') LIMIT 1",
+                        (run_id,)).fetchone() is not None:
+            return
+        if conn.execute("SELECT 1 FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
+                        "WHERE a.run_id=? AND s.state='pending' LIMIT 1", (run_id,)).fetchone() is not None:
+            return
+        reasons = conn.execute("SELECT reason_codes_json FROM recovery_sessions WHERE session_id=?",
+                               (scope.session_id,)).fetchone()
+        state = "incomplete" if reasons and json.loads(reasons[0]) else "closed"
+        changed = conn.execute("UPDATE recovery_members SET producer_state=? "
+                               "WHERE run_id=? AND session_id=? AND producer_state='open'",
+                               (state, run_id, scope.session_id)).rowcount
+        if changed:
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+
+    def register_producer(self, scope: RecoveryScope, run_id: str, permit: object,
+                          producer_id: str, kind: str) -> None:
+        from agent.recovery_context import current_incarnation, validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+        if kind not in {"executor", "tool", "sdk", "callback", "usage_write"}:
+            raise RecoveryRefused("invalid_producer_kind")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            session = self._session(conn, scope)
+            if session is None or session[1] != "open":
+                raise RecoveryRefused("session_closing")
+            conn.execute("INSERT INTO recovery_producers(producer_id,run_id,kind,state,owner_incarnation) "
+                         "VALUES(?,?,?,'queued',?)", (producer_id, run_id, kind, current_incarnation()))
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+
+        self.db._execute_write(_tx)
+
+    def start_registered_producer(self, scope: RecoveryScope, run_id: str, permit: object,
+                                  producer_id: str) -> None:
+        self._transition_producer(scope, run_id, permit, producer_id, "running", "queued")
+
+    def close_registered_producer(self, scope: RecoveryScope, run_id: str, permit: object,
+                                  producer_id: str) -> None:
+        self._transition_producer(scope, run_id, permit, producer_id, "closed", "running")
+
+    def cancel_registered_producer(self, scope: RecoveryScope, run_id: str, permit: object,
+                                   producer_id: str) -> None:
+        self._transition_producer(scope, run_id, permit, producer_id, "cancelled", "queued")
+
+    def _transition_producer(self, scope: RecoveryScope, run_id: str, permit: object,
+                             producer_id: str, destination: str, source: str) -> None:
+        from agent.recovery_context import current_incarnation, validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            changed = conn.execute("UPDATE recovery_producers SET state=? WHERE producer_id=? AND run_id=? "
+                                   "AND owner_incarnation=? AND state=?",
+                                   (destination, producer_id, run_id, current_incarnation(), source)).rowcount
+            if changed != 1:
+                raise RecoveryRefused("producer_transition_refused")
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+            self._settle_member(conn, scope, run_id)
+
+        self.db._execute_write(_tx)
+
+    def request_producer_close(self, scope: RecoveryScope, run_id: str, permit: object) -> None:
+        from agent.recovery_context import validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            conn.execute("INSERT OR IGNORE INTO recovery_root_done(run_id) VALUES(?)", (run_id,))
+            self._settle_member(conn, scope, run_id)
+
+        self.db._execute_write(_tx)
+
+    def note_producer_incomplete(self, scope: RecoveryScope, run_id: str, permit: object,
+                                 reason: str) -> None:
+        """Record a sticky refusal while retaining authority to drain registered workers."""
+        from agent.recovery_context import validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            self._add_reason(conn, scope, reason)
+            self._settle_member(conn, scope, run_id)
+
+        self.db._execute_write(_tx)
+
+    def begin_send(self, scope: RecoveryScope, run_id: str, permit: object, producer_id: str,
+                   attempt_id: str, delta_id: str) -> None:
+        from agent.recovery_context import validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            session = self._session(conn, scope)
+            if session is None or session[1] != "open":
+                raise RecoveryRefused("session_closing")
+            owner = conn.execute("SELECT kind,state FROM recovery_producers WHERE producer_id=? AND run_id=?",
+                                 (producer_id, run_id)).fetchone()
+            if owner is None or owner[0] != "sdk" or owner[1] != "running":
+                raise RecoveryRefused("invalid_send_producer")
+            ordinal = conn.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM recovery_sends WHERE run_id=?",
+                                   (run_id,)).fetchone()[0]
+            conn.execute("INSERT INTO recovery_sends(attempt_id,run_id,producer_id,sequence,state,delta_id) "
+                         "VALUES(?,?,?,?,'reserved',?)",
+                         (attempt_id, run_id, producer_id, ordinal, delta_id))
+            conn.execute("INSERT INTO recovery_usage_slots(delta_id,attempt_id,state) VALUES(?,?,'pending')",
+                         (delta_id, attempt_id))
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+
+        try:
+            self.db._execute_write(_tx)
+        except sqlite3.IntegrityError as exc:
+            raise RecoveryRefused("send_attempt_reused") from exc
+
+    def invoke_send(self, scope: RecoveryScope, run_id: str, permit: object, attempt_id: str) -> None:
+        from agent.recovery_context import validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            changed = conn.execute("UPDATE recovery_sends SET state='invoking' WHERE attempt_id=? AND run_id=? "
+                                   "AND state='reserved'", (attempt_id, run_id)).rowcount
+            if changed != 1:
+                raise RecoveryRefused("send_attempt_consumed")
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+
+        self.db._execute_write(_tx)
+
+    def finish_send(self, scope: RecoveryScope, run_id: str, permit: object, attempt_id: str,
+                    outcome: str, reason: str | None = None) -> None:
+        from agent.recovery_context import validate_producer_permit
+
+        self._check_scope(scope)
+        row = self.db._read_one("SELECT generation FROM recovery_members WHERE run_id=? AND session_id=?",
+                                (run_id, scope.session_id))
+        if row is None or not validate_producer_permit(permit, self, scope, run_id, int(row[0])):
+            raise RecoveryRefused("invalid_producer_permit")
+
+        def _tx(conn):
+            self._owned_member(conn, scope, run_id)
+            send = conn.execute("SELECT state,delta_id FROM recovery_sends WHERE attempt_id=? AND run_id=?",
+                                (attempt_id, run_id)).fetchone()
+            if send is None or send[0] not in {"reserved", "invoking"}:
+                raise RecoveryRefused("send_attempt_consumed")
+            if outcome == "accounted":
+                slot = conn.execute("SELECT state FROM recovery_usage_slots WHERE delta_id=? AND attempt_id=?",
+                                    (send[1], attempt_id)).fetchone()
+                if send[0] != "invoking" or slot is None or slot[0] != "committed":
+                    raise RecoveryRefused("usage_ack_required")
+            elif outcome == "no_charge_proved":
+                if send[0] != "reserved" or reason != "sdk_not_entered":
+                    raise RecoveryRefused("no_charge_proof_required")
+                conn.execute("UPDATE recovery_usage_slots SET state='no_charge' WHERE delta_id=?", (send[1],))
+            elif outcome == "unknown":
+                conn.execute("UPDATE recovery_usage_slots SET state='abandoned' WHERE delta_id=? AND state='pending'",
+                             (send[1],))
+                self._add_reason(conn, scope, "unknown_send_outcome")
+            else:
+                raise RecoveryRefused("invalid_send_outcome")
+            conn.execute("UPDATE recovery_sends SET state=?,reason=? WHERE attempt_id=?",
+                         (outcome, reason, attempt_id))
+            conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                         (scope.session_id,))
+            self._settle_member(conn, scope, run_id)
+
+        self.db._execute_write(_tx)
+
+    def send_inventory(self, scope: RecoveryScope, run_id: str) -> tuple[tuple[str, int, str, str], ...]:
+        self._check_scope(scope)
+        def _read(conn):
+            return tuple(tuple(row) for row in conn.execute(
+                "SELECT a.attempt_id,a.sequence,a.state,a.delta_id FROM recovery_sends a "
+                "JOIN recovery_members m ON m.run_id=a.run_id WHERE a.run_id=? AND m.session_id=? "
+                "AND m.profile=? AND m.scope_digest=? ORDER BY a.sequence",
+                (run_id, scope.session_id, scope.profile, scope.scope_digest)).fetchall())
+        return self.db._read_retrying_ioerr(_read)

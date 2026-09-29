@@ -941,6 +941,36 @@ class SessionSchemaMixin:
                 status_json TEXT NOT NULL,
                 UNIQUE (session_id, generation), UNIQUE (profile, scope_digest, idempotency_key)
             );
+            CREATE TABLE IF NOT EXISTS recovery_producers (
+                producer_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                kind TEXT NOT NULL CHECK (kind IN ('executor','tool','sdk','callback','usage_write')),
+                state TEXT NOT NULL CHECK (state IN ('queued','running','closed','cancelled')),
+                owner_incarnation TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_recovery_producers_run_state
+                ON recovery_producers(run_id,state);
+            CREATE TABLE IF NOT EXISTS recovery_root_done (
+                run_id TEXT PRIMARY KEY REFERENCES recovery_members(run_id)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sends (
+                attempt_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                producer_id TEXT NOT NULL REFERENCES recovery_producers(producer_id),
+                sequence INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN
+                    ('reserved','invoking','accounted','no_charge_proved','unknown')),
+                delta_id TEXT NOT NULL UNIQUE,
+                reason TEXT,
+                UNIQUE (run_id,sequence)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_usage_slots (
+                delta_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL UNIQUE REFERENCES recovery_sends(attempt_id),
+                state TEXT NOT NULL CHECK (state IN ('pending','committed','abandoned','no_charge')),
+                payload_sha256 TEXT,
+                ack_revision INTEGER
+            );
         """)
         # A settled open must not take the writer lock just to restamp the UUID.
         if cursor.execute("SELECT 1 FROM recovery_store WHERE singleton=1").fetchone() is None:
