@@ -87,6 +87,9 @@ def _enable_managed_nous_tools(monkeypatch):
 def _install_fake_tools_package():
     _reset_modules(("tools", "agent"))
 
+    class _AuxiliaryExplicitCancellation(BaseException):
+        pass
+
     tools_package = types.ModuleType("tools")
     tools_package.__path__ = [str(TOOLS_DIR)]  # type: ignore[attr-defined]
     sys.modules["tools"] = tools_package
@@ -100,6 +103,7 @@ def _install_fake_tools_package():
     sys.modules["agent"] = agent_package
     sys.modules["agent.auxiliary_client"] = types.SimpleNamespace(
         call_llm=lambda *args, **kwargs: "",
+        AuxiliaryExplicitCancellation=_AuxiliaryExplicitCancellation,
     )
     # Keep unrelated imports real; only replace the collaborators this fixture
     # isolates. tools.browser_tool imports redact_cdp_url;
@@ -107,6 +111,7 @@ def _install_fake_tools_package():
     # tool_backend_helpers) imports sanitize_borrowed_credential_payload.
     sys.modules["agent.redact"] = types.SimpleNamespace(
         redact_cdp_url=lambda value: str(value),
+        redact_sensitive_text=lambda value: str(value),
     )
     sys.modules["agent.credential_persistence"] = types.SimpleNamespace(
         sanitize_borrowed_credential_payload=lambda entry, provider_id=None: entry,
