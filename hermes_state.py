@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -54,6 +55,9 @@ from hermes_state_dbfile import (
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
 from hermes_state_messages import SessionMessagesMixin
+from hermes_state_recovery_deadline import (
+    acquire_recovery_lock, bounded_sqlite_busy, current_deadline, require_time,
+)
 from hermes_state_rewind import SessionRewindMixin
 from hermes_state_wal import (
     _WAL_INCOMPAT_MARKERS, _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback,
@@ -72,6 +76,274 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+_SETTLED_INIT_KEY = "ordinary_init_settled_v1"
+_INIT_SOURCE_FILES = (
+    "hermes_state.py", "hermes_state_schema.py", "hermes_state_common.py",
+    "hermes_state_fts.py", "hermes_state_recovery_guard.py",
+    "hermes_state_recovery_exclusions.py",
+)
+
+
+def _read_init_source_epoch() -> str | None:
+    """Digest the bounded installed initializer sources, never their contents in logs."""
+    digest = hashlib.sha256(b"hermes/ordinary-init/v1\n")
+    try:
+        for name in _INIT_SOURCE_FILES:
+            path = Path(__file__).resolve().parent / name
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576:
+                    return None
+                chunks = []
+                remaining = 1_048_577
+                while remaining:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                if len(data) > 1_048_576 or len(data) != info.st_size:
+                    return None
+            finally:
+                os.close(fd)
+            digest.update(name.encode("ascii") + b"\x00" + len(data).to_bytes(8, "big") + data)
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+# Frozen at import: a running older initializer cannot bless a changed install.
+_LOADED_INIT_SOURCE_EPOCH = _read_init_source_epoch()
+
+
+def _current_init_source_epoch() -> str | None:
+    current = _read_init_source_epoch()
+    return current if current is not None and current == _LOADED_INIT_SOURCE_EPOCH else None
+
+
+def _canonical_ordinary_store_ids(store_id: object, generation: object) -> bool:
+    if type(store_id) is not str or type(generation) is not str:
+        return False
+    try:
+        store_uuid = uuid.UUID(store_id)
+        generation_uuid = uuid.UUID(hex=generation)
+    except (ValueError, AttributeError):
+        return False
+    return (
+        store_uuid.version == 4 and str(store_uuid) == store_id
+        and generation_uuid.version == 4 and generation_uuid.hex == generation
+    )
+
+
+def _bounded_ordinary_store_ids(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    store = conn.execute(
+        "SELECT typeof(store_id),substr(CAST(store_id AS BLOB),1,65) "
+        "FROM recovery_store WHERE singleton=1"
+    ).fetchone()
+    generation = conn.execute(
+        "SELECT typeof(value),substr(CAST(value AS BLOB),1,33) "
+        "FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+    ).fetchone()
+    if (store is None or generation is None or store[0] != "text" or generation[0] != "text"
+            or type(store[1]) is not bytes or type(generation[1]) is not bytes):
+        return None
+    try:
+        values = store[1].decode("ascii"), generation[1].decode("ascii")
+    except UnicodeError:
+        return None
+    return values if _canonical_ordinary_store_ids(*values) else None
+
+
+def _fts_trigger_catalog_settled(conn: sqlite3.Connection, *, cjk_loaded: bool) -> bool:
+    from hermes_state_common import _FTS_CJK_TRIGGERS, _FTS_TRIGGERS
+
+    trigram = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_trigram'"
+    ).fetchone() is not None
+    cjk = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts_cjk'"
+    ).fetchone() is not None
+    if cjk != cjk_loaded:
+        return False
+    try:
+        if trigram:
+            conn.execute("SELECT rowid FROM messages_fts_trigram LIMIT 0").fetchone()
+        if cjk:
+            conn.execute("SELECT rowid FROM messages_fts_cjk LIMIT 0").fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    expected = set(_FTS_TRIGGERS[:3])
+    if trigram:
+        expected.update(_FTS_TRIGGERS[3:])
+    if cjk:
+        expected.update(_FTS_CJK_TRIGGERS)
+    names = conn.execute(
+        "SELECT typeof(name),substr(CAST(name AS BLOB),1,129) "
+        "FROM sqlite_master WHERE type='trigger' AND name GLOB 'messages_fts_*' LIMIT 10"
+    ).fetchall()
+    return (
+        len(names) == len(expected)
+        and all(row[0] == "text" and type(row[1]) is bytes and len(row[1]) <= 128 for row in names)
+        and {row[1] for row in names} == {name.encode("ascii") for name in expected}
+    )
+
+
+def _ordinary_journal_mode_settled(conn: sqlite3.Connection) -> bool:
+    from hermes_state_wal import resolve_journal_mode
+
+    actual = _on_disk_journal_mode(conn)
+    return actual in {"wal", "delete"} and (actual == "wal" or resolve_journal_mode() == "delete")
+
+
+def _ordinary_reconciliation_complete(conn: sqlite3.Connection) -> bool:
+    """Cheap bounded probes for repairs _init_schema may defer or soft-fail."""
+    from hermes_state_common import FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY
+    from hermes_state_schema import schema_read_probe_statements
+
+    primary_keys = (
+        ("gateway_routing", ("scope", "session_key")),
+        ("session_model_usage", (
+            "session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task",
+        )),
+    )
+    for table, expected in primary_keys:
+        rows = conn.execute(
+            "SELECT typeof(name),substr(CAST(name AS BLOB),1,65),pk "
+            "FROM pragma_table_info(?) WHERE pk>0 ORDER BY pk LIMIT 7", (table,),
+        ).fetchall()
+        if (len(rows) != len(expected)
+                or any(row[0] != "text" or type(row[1]) is not bytes
+                       or row[1] != name.encode("ascii") or row[2] != i
+                       for i, (row, name) in enumerate(zip(rows, expected), 1))):
+            return False
+    for name in ("idx_messages_platform_msg_id", "idx_sessions_title_unique"):
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1", (name,),
+        ).fetchone() is None:
+            return False
+    if conn.execute(
+        "SELECT 1 FROM state_meta WHERE key=? LIMIT 1",
+        (FTS_TOOL_FULL_CONTENT_HIGH_WATER_KEY,),
+    ).fetchone() is None:
+        return False
+    if conn.execute("SELECT 1 FROM messages WHERE active IS NULL LIMIT 1").fetchone() is not None:
+        return False
+    if (conn.execute("SELECT 1 FROM messages LIMIT 1").fetchone() is not None
+            and conn.execute("SELECT 1 FROM messages_fts_docsize LIMIT 1").fetchone() is None):
+        return False
+    for statement in schema_read_probe_statements():
+        conn.execute(statement).fetchone()
+    return True
+
+
+def _settled_ordinary_stamp_valid(conn: sqlite3.Connection, *, cjk_loaded: bool) -> bool:
+    """A no-DDL optimization hint, checked again on the actual writer connection."""
+    from hermes_state_common import SCHEMA_VERSION, FTS_STORAGE_VERSION
+    from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+    epoch = _current_init_source_epoch()
+    if (epoch is None or _catalog(conn) != "full" or _protected_exists(conn, "full")
+            or not _ordinary_journal_mode_settled(conn)):
+        return False
+    if conn.execute(
+        "SELECT 1 FROM recovery_exclusions WHERE kind='raw_schema' LIMIT 1"
+    ).fetchone() is not None:
+        return False
+    version = conn.execute(
+        "SELECT typeof(version),substr(CAST(version AS BLOB),1,21) "
+        "FROM schema_version LIMIT 2"
+    ).fetchall()
+    if len(version) != 1 or tuple(version[0]) != ("integer", str(SCHEMA_VERSION).encode("ascii")):
+        return False
+    cookie = conn.execute("PRAGMA schema_version").fetchone()
+    if cookie is None or type(cookie[0]) is not int or cookie[0] < 0:
+        return False
+    # Fetch only a bounded prefix after checking the stored byte size.  A
+    # malformed/unbounded stamp goes through claimed reconciliation.
+    size = conn.execute(
+        "SELECT typeof(value),length(substr(CAST(value AS BLOB),1,129)) "
+        "FROM state_meta WHERE key=?",
+        (_SETTLED_INIT_KEY,),
+    ).fetchone()
+    if size is None or size[0] != "text" or type(size[1]) is not int or size[1] > 128:
+        return False
+    stamp = conn.execute(
+        "SELECT substr(CAST(value AS BLOB),1,129) FROM state_meta WHERE key=?",
+        (_SETTLED_INIT_KEY,),
+    ).fetchone()
+    from hermes_state_common import (
+        FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY,
+    )
+    layout = conn.execute(
+        "SELECT typeof(value),substr(CAST(value AS BLOB),1,9) "
+        "FROM state_meta WHERE key='fts_storage_version'"
+    ).fetchone()
+    if layout is None or tuple(layout) != ("text", str(FTS_STORAGE_VERSION).encode("ascii")):
+        return False
+    expected = f"v1:{epoch}:{SCHEMA_VERSION}:{cookie[0]}:{FTS_STORAGE_VERSION}".encode("ascii")
+    if stamp is None or type(stamp[0]) is not bytes or stamp[0] != expected:
+        return False
+    pending = (
+        FTS_STALE_KEY, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY,
+        "fts_rebuild_high_water", "fts_rebuild_progress",
+        "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
+    )
+    if conn.execute(
+        "SELECT 1 FROM state_meta WHERE key IN (?,?,?,?,?,?,?) LIMIT 1", pending,
+    ).fetchone() is not None:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name GLOB 'fts_v22_trash_*' LIMIT 1"
+    ).fetchone() is not None:
+        return False
+    try:
+        conn.execute("SELECT rowid FROM messages_fts LIMIT 0").fetchone()
+        if not _ordinary_reconciliation_complete(conn):
+            return False
+    except sqlite3.DatabaseError:
+        return False
+    if not _fts_trigger_catalog_settled(conn, cjk_loaded=cjk_loaded):
+        return False
+    return True
+
+
+def _inspect_settled_ordinary_store(path: Path) -> tuple[tuple[int, int], str, str] | None:
+    """Read-only hint.  The writer repeats every check on its opened inode."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+    if _current_init_source_epoch() is None:
+        return None
+    try:
+        identity = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    if not stat.S_ISREG(identity.st_mode) or has_invalid_sqlite_header_preopen(path):
+        raise RecoveryRefused("protected_session_authority_unavailable")
+    try:
+        with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            if _catalog(conn) != "full" or _protected_exists(conn, "full"):
+                return None
+            if not _settled_ordinary_stamp_valid(
+                conn, cjk_loaded=load_fts5_cjk_extension(conn),
+            ):
+                return None
+            values = _bounded_ordinary_store_ids(conn)
+            current = path.lstat()
+            if (values is None
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            return (identity.st_dev, identity.st_ino), *values
+    except (sqlite3.DatabaseError, OSError) as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
 
 _MAX_SAFE_MESSAGES = 20_000  # resume/export guard default
 
@@ -515,6 +787,8 @@ class SessionDB(
         # replace cannot limp through in-place surgery (inode: mv/new-file; application_id: cp).
         self._db_file_identity: Optional[tuple] = None
         self._db_file_application_id: int = 0
+        self._opened_store_id: Optional[str] = None
+        self._opened_generation_token: Optional[str] = None
         self._db_sidecar_identity: Dict[str, tuple] = {}
         self._db_replaced = self._db_wal_generation_lost = False
         # Durable capture of a lost WAL generation (see _capture_retired_generation): once per handle.
@@ -536,6 +810,11 @@ class SessionDB(
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = self._token_writer_busy = False
         self._token_atexit_hook: Optional[Callable[[], None]] = None
+        # Protected usage keeps each physical send's permit and durable delta ID.
+        self._recovery_queue = deque()
+        self._recovery_queue_cond = threading.Condition(threading.Lock())
+        self._recovery_writer_thread: Optional[threading.Thread] = None
+        self._recovery_writer_stop = self._recovery_writer_busy = False
         # Opened via hermes_state_registry.acquire(): close() releases a refcount instead.
         # Set True when this instance is opened via hermes_state_registry.acquire(). Makes close() a no-op so the
         # registry (not individual callers) controls the connection lifecycle (#90837).
@@ -563,8 +842,136 @@ class SessionDB(
                 self._close_connection_quietly(conn)
 
     def _open_writer(self) -> None:
-        """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
-        malformed sqlite_master), generation stamp."""
+        """Choose a claimed schema initializer or the validated no-DDL protected path."""
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery_exclusions import (
+            begin_raw_schema_claim, finish_raw_schema_claim, inspect_protected_store,
+        )
+
+        # This must precede even the protected/ordinary read-only catalog
+        # probes: a deleted WAL generation is not safe to reopen as a fresh
+        # sidecar pair on the same state.db path.
+        refuse_deleted_wal_generation(self.db_path)
+        protected_identity = inspect_protected_store(self.db_path)
+        if protected_identity is not None:
+            self._open_writer_existing_schema(*protected_identity)
+            return
+        ordinary_identity = _inspect_settled_ordinary_store(self.db_path)
+        if ordinary_identity is not None:
+            self._open_writer_existing_schema(*ordinary_identity, ordinary_settled=True)
+            return
+        try:
+            lease = begin_raw_schema_claim(self.db_path)
+        except RecoveryRefused as exc:
+            # A protected root may have won between the read-only branch hint
+            # and the claim. Its committed guard/schema is now the only path.
+            if exc.code != "protected_session_dispatch":
+                raise
+            protected_identity = inspect_protected_store(self.db_path)
+            if protected_identity is None:
+                raise RecoveryRefused("protected_session_authority_unavailable") from exc
+            self._open_writer_existing_schema(*protected_identity)
+            return
+        # Failed or uncertain schema work intentionally leaves this exact raw
+        # claim sticky. Only known successful initialization releases it.
+        self._open_writer_reconcile(lease)
+        finish_raw_schema_claim(lease, conn=self._conn)
+
+    def _open_writer_existing_schema(self, expected_identity: tuple[int, int],
+                                     expected_store_id: str,
+                                     expected_generation: str | None = None,
+                                     *, ordinary_settled: bool = False) -> None:
+        """Attach a validated existing store without schema DDL or repair."""
+        from hermes_recovery_refusal import require_compatible_recovery_connection
+        from hermes_state_schema import schema_read_probe_statements
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery_guard import register_connection_guard
+        from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+        preflight_db_writability(self.db_path, db_label="state.db")
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (not stat.S_ISREG(observed.st_mode)
+                or (observed.st_dev, observed.st_ino) != expected_identity):
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        conn = _connect_tracked_db(
+            self.db_path.absolute().as_uri() + "?mode=rw", tracking_path=self.db_path,
+            uri=True, check_same_thread=False, timeout=1.0, isolation_level=None,
+        )
+        self._conn = conn
+        conn.row_factory = sqlite3.Row
+        register_connection_guard(conn, self)
+        require_compatible_recovery_connection(conn)
+        if ordinary_settled:
+            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+        try:
+            observed = self.db_path.lstat()
+            catalog = _catalog(conn)
+            authority_matches = (
+                catalog == "full" and not _protected_exists(conn, catalog)
+                and _settled_ordinary_stamp_valid(conn, cjk_loaded=self._fts_cjk_loaded)
+                if ordinary_settled else _protected_exists(conn, catalog)
+            )
+            if ((observed.st_dev, observed.st_ino) != expected_identity
+                    or not authority_matches):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            if ordinary_settled:
+                if _bounded_ordinary_store_ids(conn) != (expected_store_id, expected_generation):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+            else:
+                row = conn.execute("SELECT store_id FROM recovery_store WHERE singleton=1").fetchone()
+                if row is None or row[0] != expected_store_id:
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        try:
+            for statement in schema_read_probe_statements():
+                conn.execute(statement).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        # Keep ordinary writer file-permission hardening after validating the
+        # exact protected catalog, without changing its on-disk journal mode.
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (observed.st_dev, observed.st_ino) != expected_identity:
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        _secure_state_db_files(self.db_path)
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        if (observed.st_dev, observed.st_ino) != expected_identity:
+            raise RecoveryRefused("protected_session_authority_unavailable")
+        self._wal_active = _on_disk_journal_mode(conn) == "wal"
+        if ordinary_settled and self._wal_active:
+            from hermes_state_wal import _apply_wal_companions
+
+            _apply_wal_companions(conn)
+        apply_database_pragmas(conn, db_label="state.db")
+        conn.execute("PRAGMA foreign_keys=ON")
+        if not ordinary_settled:
+            self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+        cursor = conn.cursor()
+        self._fts_enabled = self._fts_table_probe(cursor, "messages_fts") is True
+        if self._fts_enabled:
+            self._trigram_available = self._fts_table_probe(cursor, "messages_fts_trigram") is True
+        if ordinary_settled and self._fts_cjk_loaded:
+            # The fast predicate already proved the CJK family complete and
+            # free of stale/backfill markers. Restore the derived read-route
+            # bit that _ensure_fts_cjk_schema sets on a claimed open.
+            self._fts_cjk_available = self._fts_table_probe(cursor, "messages_fts_cjk") is True
+        if self._wal_active:
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
+
+    def _open_writer_reconcile(self, lease) -> None:
+        """Initialize only the already claimed file; uncertain work retains its raw claim."""
+        from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+        assert_raw_schema_lease_target(lease)
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
         mkdir_under_hermes_home(self.db_path.parent)
@@ -572,25 +979,13 @@ class SessionDB(
         # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
         preflight_db_writability(self.db_path, db_label="state.db")
         try:
-            # Serialize zero-byte check, quarantine, connect and schema commit so concurrent
-            # openers don't race the absent-path -> schema-commit window.
-            if not self.db_path.exists() or has_invalid_sqlite_header_preopen(self.db_path):
-                with quarantine_cross_process_lock(self.db_path) as lock_acquired:
-                    if not lock_acquired:
-                        logger.warning(
-                            "startup quarantine lock for %s not acquired within 5s; proceeding",
-                            self.db_path,
-                        )
-                    self._handle_quarantine_if_invalid(already_locked=lock_acquired)
-                    self._connect_and_init_with_lock_patience()
-            else:
-                self._handle_quarantine_if_invalid(already_locked=False)
-                self._connect_and_init_with_lock_patience()
+            self._connect_and_init_with_lock_patience(lease)
         except sqlite3.DatabaseError as exc:
             # A malformed schema fails on the very first statement (before _init_schema), so the
             # FTS-rebuild layer never sees it: repair sqlite_master in place (backup first), reopen once.
             if not is_malformed_schema_error(exc) or not _claim_repair_attempt(self.db_path):
                 raise
+            assert_raw_schema_lease_target(lease)
             logger.error(
                 "state.db schema is malformed (%s) — attempting automatic "
                 "repair (a backup copy is made first).", exc,
@@ -598,7 +993,8 @@ class SessionDB(
             self._close_connection_quietly(self._conn)
             if not repair_state_db_schema(self.db_path).get("repaired"):
                 raise
-            self._connect_and_init_with_lock_patience()
+            assert_raw_schema_lease_target(lease)
+            self._connect_and_init_with_lock_patience(lease)
         # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
         self._ensure_db_file_generation()
         if self._wal_active:
@@ -606,6 +1002,64 @@ class SessionDB(
             # generation: any in-process open()/close() of state.db or -shm cancels SQLite's own
             # (howtocorrupt §2.2); these survive it. Lifted in close().
             self._wal_lock_guard = _lockguard.hold(self.db_path)
+        self._stamp_settled_ordinary_init()
+
+    def _stamp_settled_ordinary_init(self) -> None:
+        """Record successful ordinary reconciliation under its existing raw claim."""
+        from hermes_state_common import SCHEMA_VERSION, FTS_STORAGE_VERSION
+        from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+        conn = self._conn
+        epoch = _current_init_source_epoch()
+        if (conn is None or epoch is None or _catalog(conn) != "full"
+                or not _ordinary_journal_mode_settled(conn)):
+            return
+        if _protected_exists(conn, "full"):
+            return
+        version = conn.execute(
+            "SELECT typeof(version),substr(CAST(version AS BLOB),1,21) "
+            "FROM schema_version LIMIT 2"
+        ).fetchall()
+        if len(version) != 1 or tuple(version[0]) != ("integer", str(SCHEMA_VERSION).encode("ascii")):
+            return
+        from hermes_state_common import FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY
+        pending = (
+            FTS_STALE_KEY, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY,
+            "fts_rebuild_high_water", "fts_rebuild_progress",
+            "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
+        )
+        if conn.execute(
+            "SELECT 1 FROM state_meta WHERE key IN (?,?,?,?,?,?,?) LIMIT 1", pending,
+        ).fetchone() is not None:
+            return
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name GLOB 'fts_v22_trash_*' LIMIT 1"
+        ).fetchone() is not None:
+            return
+        if not self._fts_enabled or not _fts_trigger_catalog_settled(
+            conn, cjk_loaded=self._fts_cjk_loaded,
+        ):
+            return
+        try:
+            if not _ordinary_reconciliation_complete(conn):
+                return
+        except sqlite3.DatabaseError:
+            return
+        cookie = conn.execute("PRAGMA schema_version").fetchone()
+        if cookie is None or type(cookie[0]) is not int or cookie[0] < 0:
+            return
+        layout = conn.execute(
+            "SELECT typeof(value),substr(CAST(value AS BLOB),1,9) "
+            "FROM state_meta WHERE key='fts_storage_version'"
+        ).fetchone()
+        if layout is None or tuple(layout) != ("text", str(FTS_STORAGE_VERSION).encode("ascii")):
+            return
+        stamp = f"v1:{epoch}:{SCHEMA_VERSION}:{cookie[0]}:{FTS_STORAGE_VERSION}"
+        conn.execute(
+            "INSERT INTO state_meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_SETTLED_INIT_KEY, stamp),
+        )
 
     def _open_read_only(self) -> None:
         """Read-only attach for cross-profile aggregation: no schema init, NO write
@@ -643,7 +1097,7 @@ class SessionDB(
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
         are borrowed by whichever thread reads next; exclusive ownership is enforced by pool checkout."""
         conn = _connect_tracked_db(
-            f"file:{self.db_path}?mode=ro", tracking_path=self.db_path, uri=True,
+            self.db_path.absolute().as_uri() + "?mode=ro", tracking_path=self.db_path, uri=True,
             check_same_thread=False, timeout=timeout, isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
@@ -672,14 +1126,42 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self) -> sqlite3.Connection:
+    def _open_writer_conn(self, lease=None, *, reopen: bool = False) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
-        conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
-        )
+        if lease is None and not reopen:
+            conn = _connect_tracked_db(
+                str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            )
+        else:
+            conn = _connect_tracked_db(
+                self.db_path.absolute().as_uri() + "?mode=rw", tracking_path=self.db_path,
+                uri=True, check_same_thread=False, timeout=1.0, isolation_level=None,
+            )
         try:
+            if lease is not None:
+                from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+                assert_raw_schema_lease_target(lease, conn=conn)
+            if reopen:
+                from hermes_state_recovery import RecoveryRefused
+                from hermes_state_recovery_exclusions import _catalog
+
+                if (_catalog(conn) != "full" or not self._opened_store_id
+                        or not self._opened_generation_token):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+                store = conn.execute(
+                    "SELECT store_id FROM recovery_store WHERE singleton=1"
+                ).fetchone()
+                generation = conn.execute(
+                    "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+                ).fetchone()
+                if (store is None or store[0] != self._opened_store_id
+                        or generation is None or generation[0] != self._opened_generation_token
+                        or (self._db_file_identity is not None
+                            and _stat_db_file_identity(self.db_path) != self._db_file_identity)):
+                    raise RecoveryRefused("protected_session_authority_unavailable")
             conn.row_factory = sqlite3.Row
             mode = apply_wal_with_fallback(conn, db_label="state.db")
             # "wal" is also the *assumed* mode when the on-disk probe was blocked by a concurrent opener
@@ -692,23 +1174,30 @@ class SessionDB(
             _secure_state_db_files(self.db_path)
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
+            from hermes_state_recovery_guard import register_connection_guard
+            register_connection_guard(conn, self)
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
         except BaseException:
             self._close_connection_quietly(conn)
             raise
         return conn
 
-    def _connect_and_init(self) -> None:
+    def _connect_and_init(self, lease) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
-        _secure_state_db_files(self.db_path, create_main=True)
-        self._conn = self._open_writer_conn()
+        from hermes_state_recovery_exclusions import assert_raw_schema_lease_target
+
+        assert_raw_schema_lease_target(lease)
+        _secure_state_db_files(self.db_path)
+        assert_raw_schema_lease_target(lease)
+        self._conn = self._open_writer_conn(lease)
+        assert_raw_schema_lease_target(lease, conn=self._conn)
         self._init_schema()
 
-    def _connect_and_init_with_lock_patience(self) -> None:
+    def _connect_and_init_with_lock_patience(self, lease) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
         _init_schema's DDL runs on a 1s-timeout connection, so a sibling's VACUUM
         or checkpoint used to fail the ENTIRE open and callers disabled
@@ -722,7 +1211,7 @@ class SessionDB(
         deadline = time.monotonic() + self._WRITE_PATIENCE_S
         while True:
             try:
-                self._connect_and_init()
+                self._connect_and_init(lease)
                 return
             except sqlite3.OperationalError as exc:
                 err = str(exc).lower()
@@ -811,6 +1300,19 @@ class SessionDB(
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
         degradation: slower beats EMFILE, which the supervisor cannot see."""
+        if current_deadline() is not None:
+            # Recovery's two-worker HTTP path deliberately serializes reads on
+            # the writer connection: no pooled-reader open/return lock or
+            # independent five-second SQLite busy wait can escape its budget.
+            with acquire_recovery_lock(self._lock):
+                if self._conn is None:
+                    self._reopen_after_close_locked(context="read")
+                conn = cast(sqlite3.Connection, self._conn)
+                with bounded_sqlite_busy(conn):
+                    require_time()
+                    yield conn
+                    require_time()
+            return
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
@@ -858,7 +1360,7 @@ class SessionDB(
             "flight — reopening (teardown/worker race, #94736)", self.db_path, context,
         )
         try:
-            self._conn = self._open_writer_conn()
+            self._conn = self._open_writer_conn(reopen=True)
         except Exception as exc:
             raise sqlite3.OperationalError(
                 f"state.db connection was closed while a {context} was still "
@@ -875,10 +1377,14 @@ class SessionDB(
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        Recovery work does not retry locked/busy after *fn* starts."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        recovery_limit = current_deadline()
+        if recovery_limit is not None:
+            deadline = min(deadline, recovery_limit)
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -888,6 +1394,7 @@ class SessionDB(
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
         while True:
+            require_time()
             self._raise_if_db_corrupt()
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
             # not here. close() mutates _conn and _db_sidecar_identity under that
@@ -901,27 +1408,37 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
+                with acquire_recovery_lock(self._lock):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                    conn = cast(sqlite3.Connection, self._conn)
+                    with bounded_sqlite_busy(conn):
+                        require_time()
+                        conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(conn)
+                            require_time()
+                            conn.commit()
+                        except BaseException:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                        # A successful COMMIT is the settlement boundary. Its
+                        # result must reach the caller even if the deadline
+                        # passes inside SQLite's non-preemptible commit.
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                if current_deadline() is None:
+                    # Both opportunistic tasks can take unrelated locks after
+                    # commit. Recovery's one budget cannot wait on them.
+                    if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                        self._try_wal_checkpoint()
+                    if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
+                        self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
@@ -938,15 +1455,22 @@ class SessionDB(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
                     continue
+                require_time()
                 raise
             except sqlite3.Error as exc:
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                require_time()
                 err_msg = str(exc).lower()
                 if isinstance(exc, sqlite3.OperationalError):
                     if "locked" in err_msg or "busy" in err_msg:
+                        if current_deadline() is not None and fn_started:
+                            # The callback may have non-idempotent effects outside
+                            # SQLite. Rollback already ran; let its caller decide
+                            # whether to retry the durable recovery request.
+                            raise
                         if self._sleep_before_write_retry(deadline, patience_s):
                             continue
                         # Say what actually happened, not disk/permission damage.
@@ -1020,13 +1544,18 @@ class SessionDB(
         closed and reopened (close() cancels this process's POSIX locks for every sibling connection),
         never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+            require_time()
             try:
                 with self._read_ctx() as conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
+                require_time()
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
                     raise
-                time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                remaining = require_time()
+                time.sleep(min(_READ_ONLY_IOERR_RETRY_BACKOFF_S, remaining)
+                           if remaining is not None else _READ_ONLY_IOERR_RETRY_BACKOFF_S)
+                require_time()
 
     def _ensure_db_file_generation(self) -> None:
         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
@@ -1071,15 +1600,33 @@ class SessionDB(
             logger.debug("state.db generation stamp skipped: %s", exc)
 
     def _record_db_file_identity(self) -> None:
-        """Snapshot inode plus the on-disk generation header when present."""
+        """Snapshot identity on the selected writer before sharing this handle."""
+        with self._lock:
+            self._record_db_file_identity_locked(self._conn)
+
+    def _record_db_file_identity_locked(self, conn: sqlite3.Connection | None) -> None:
+        """Capture identity while the caller holds the writer lock.
+
+        VACUUM already owns that non-reentrant lock and must use this entry
+        point after its checkpoint replaces sidecars.
+        """
         self._db_file_identity = _stat_db_file_identity(self.db_path)
         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
+        if not self.read_only and conn is not None:
+            store = conn.execute(
+                "SELECT store_id FROM recovery_store WHERE singleton=1"
+            ).fetchone()
+            generation = conn.execute(
+                "SELECT value FROM state_meta WHERE key=?", (_STATE_DB_GENERATION_KEY,)
+            ).fetchone()
+            self._opened_store_id = str(store[0]) if store and store[0] else None
+            self._opened_generation_token = str(generation[0]) if generation and generation[0] else None
         disk_id = _read_sqlite_application_id(self.db_path)
         if disk_id:
             self._db_file_application_id = disk_id
-        elif self._conn is not None and not self._db_file_application_id:
+        elif conn is not None and not self._db_file_application_id:
             try:
-                pragma_row = self._read_one("PRAGMA application_id")
+                pragma_row = conn.execute("PRAGMA application_id").fetchone()
             except sqlite3.Error:
                 pragma_row = None
             if pragma_row and pragma_row[0]:
@@ -1378,6 +1925,7 @@ class SessionDB(
             from hermes_state_registry import release
             release(self)
             return
+        self._stop_recovery_writer()
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:

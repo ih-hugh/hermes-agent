@@ -2,10 +2,12 @@
 with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, explicit
 trajectory export."""
 import hashlib
+import json
+import uuid
 
 import logging
 import re
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -213,13 +215,96 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
-    agent._session_db.append_messages_batch(
-        session_id=agent.session_id, messages=batch_rows,
-        compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
-        turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
-    )
+    protected = _is_protected_session(agent)
+    recovery_kwargs = {}
+    if protected:
+        from agent.recovery_context import current_write_permit, write_binding
+        from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery import RecoveryStore
+
+        permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
+        if permit is None:
+            raise RecoveryRefused("untracked_write")
+        binding = write_binding(permit, RecoveryStore(agent._session_db))
+        if binding is None or binding[0].session_id != agent.session_id:
+            raise RecoveryRefused("invalid_write_permit")
+        from hermes_state_recovery_message_result import prepare_message_batch
+
+        pending = getattr(agent, "_recovery_pending_message_batch", None)
+        if pending is not None:
+            if not isinstance(pending, tuple) or len(pending) != 5:
+                raise RecoveryRefused("write_payload_conflict")
+            pending_scope, pending_run, pending_generation, write_id, prepared = pending
+            if ((pending_scope, pending_run, pending_generation) != binding
+                    or not prepared.matches_input(batch_rows)):
+                raise RecoveryRefused("write_payload_conflict")
+        else:
+            prepared = prepare_message_batch(batch_rows)
+            write_id = f"message_{uuid.uuid4().hex}"
+            agent._recovery_pending_message_batch = (*binding, write_id, prepared)
+        digest = prepared.payload_sha256
+        recovery_kwargs = {
+            "recovery_permit": permit, "recovery_write_id": write_id,
+            "recovery_payload_sha256": digest, "recovery_prepared_batch": prepared,
+        }
+        # The callback and the response path may annotate rows. Keep the caller's
+        # pending preimage untouched until a committed acknowledgement is read.
+        write_rows = prepared.fresh_rows()
+    with _protected_write_binding(agent):
+        try:
+            agent._session_db.append_messages_batch(
+                session_id=agent.session_id, messages=write_rows if protected else batch_rows,
+                compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
+                turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
+                turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+                **recovery_kwargs,
+            )
+        except Exception as flush_error:
+            if not protected:
+                raise
+            try:
+                agent._session_db.restore_committed_message_batch(
+                    permit, write_id, digest, prepared, batch_rows)
+            except RecoveryRefused as read_error:
+                if str(read_error) == "write_payload_conflict":
+                    raise flush_error
+                raise
+            except Exception:
+                raise flush_error
+        else:
+            if protected:
+                agent._session_db.restore_committed_message_batch(
+                    permit, write_id, digest, prepared, batch_rows)
+    if protected:
+        agent._recovery_pending_message_batch = None
     sync_flushed_message_markers(batch_msgs, batch_rows)
+
+
+def _is_protected_session(agent) -> bool:
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return False
+    if getattr(agent, "_recovery_registry", None) is not None:
+        return True
+    if not hasattr(db, "_read_one"):
+        return False  # non-SQLite test capture or external persistence adapter
+    return db._read_one("SELECT 1 FROM recovery_sessions WHERE session_id=?", (session_id,)) is not None
+
+
+@contextmanager
+def _protected_write_binding(agent):
+    if not _is_protected_session(agent):
+        yield
+        return
+    from agent.recovery_context import bind_write_permit, current_write_permit
+    from hermes_state_recovery import RecoveryRefused
+
+    permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
+    if permit is None:
+        raise RecoveryRefused("untracked_write")
+    with bind_write_permit(permit):
+        yield
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -239,6 +324,11 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
         tip_row = None
     if tip_row is None or tip_row.get("ended_at") is not None:
         return False
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+
+    claimed = claim_exact_ordinary(selected_state_db_path(agent._session_db), (old_id, tip))
+    if claimed.resolved_ids[-1] != tip:
+        return False
     logger.warning("Adopted live compression tip %s for closed session %s; retrying flush once", tip, old_id)
     agent.session_id, agent._flushed_db_message_ids, agent._last_flushed_db_idx = tip, set(), 0
     agent._compression_adoption_failed = False
@@ -248,6 +338,13 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
 def _db_flush_failed(agent, e: Exception, batch_rows: List[Dict[str, Any]], adoption_budget: int) -> bool:
     """Classify a failed flush; True when the caller should retry once on an adopted compression tip."""
     agent._db_flush_scan_prefix = None  # full re-scan next flush: an exception mid-loop leaves mixed dispositions
+    if _is_protected_session(agent):
+        from hermes_state_recovery import RecoveryRefused
+
+        registry = getattr(agent, "_recovery_registry", None)
+        if registry is not None:
+            registry.mark_unsupported("untracked_write")
+        raise RecoveryRefused("protected_transcript_write_failed") from e
     # The only place the SQLite error is visible before it becomes a bare False — classify it so the turn-end
     # explanation can distinguish lock contention from disk-full/read-only.
     from hermes_state import StateDbCorruptError, StateDbReplacedError, classify_persistence_error, divert_session_transcript_jsonl
@@ -361,7 +458,8 @@ class SessionPersistenceMixin:
         batch_rows: List[Dict[str, Any]] = []
         try:
             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently
-                self._ensure_db_session()
+                with _protected_write_binding(self):
+                    self._ensure_db_session()
             batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history)
             _db_flush_write(self, batch_rows, batch_msgs)
             # Markers are now the sole truth; reset the one-shot seed so no id() outlives this flush.

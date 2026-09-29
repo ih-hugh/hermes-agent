@@ -26,6 +26,219 @@ from pathlib import Path
 import pytest
 
 import hermes_state_registry as registry
+from hermes_state_recovery_deadline import RecoveryDeadlineExceeded, recovery_deadline
+
+
+def test_recovery_registry_waiter_times_out_without_owning_open_marker(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    marker = threading.Event()
+    with registry._lock:
+        registry._opening[path] = marker
+
+    def finish_owner():
+        time.sleep(0.12)
+        with registry._lock:
+            registry._opening.pop(path, None)
+            marker.set()
+
+    owner = threading.Thread(target=finish_owner)
+    owner.start()
+    acquired = None
+    try:
+        with recovery_deadline(time.monotonic() + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                acquired = registry.acquire(path)
+        with registry._lock:
+            assert registry._opening.get(path) is marker
+    finally:
+        if acquired is not None:
+            registry.release(acquired)
+        owner.join(timeout=1)
+    assert not owner.is_alive()
+
+
+def test_recovery_registry_global_lock_wait_is_bounded(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with registry._lock:
+            entered.set()
+            release.wait(timeout=2)
+
+    owner = threading.Thread(target=hold)
+    owner.start()
+    assert entered.wait(timeout=1)
+    try:
+        began = time.monotonic()
+        with recovery_deadline(began + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                registry.acquire(path)
+        assert time.monotonic() - began < 0.5
+    finally:
+        release.set()
+        owner.join(timeout=1)
+    assert not owner.is_alive()
+
+
+def test_recovery_registry_teardown_wait_times_out_without_settling_owner(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    barrier = registry._TeardownBarrier()
+    barrier.pending = 1
+    with registry._lock:
+        registry._tearing_down[path] = barrier
+
+    def finish_owner():
+        time.sleep(0.12)
+        registry._finish_teardown(path, barrier)
+
+    owner = threading.Thread(target=finish_owner)
+    owner.start()
+    try:
+        with recovery_deadline(time.monotonic() + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                registry.acquire(path)
+        with registry._lock:
+            assert registry._tearing_down.get(path) is barrier
+            assert path not in registry._opening
+    finally:
+        owner.join(timeout=1)
+    assert not owner.is_alive()
+
+
+def test_recovery_registry_elected_opener_times_out_on_lifecycle_lock(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    lifecycle = threading.Lock()
+    with registry._lock:
+        registry._path_lifecycle_locks[path] = lifecycle
+    lifecycle.acquire()
+
+    def unblock():
+        time.sleep(0.12)
+        lifecycle.release()
+
+    owner = threading.Thread(target=unblock)
+    owner.start()
+    acquired = None
+    try:
+        with recovery_deadline(time.monotonic() + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                acquired = registry.acquire(path)
+        with registry._lock:
+            assert path not in registry._opening
+            assert path not in registry._generations
+    finally:
+        if acquired is not None:
+            registry.release(acquired)
+        owner.join(timeout=1)
+    assert not owner.is_alive()
+
+
+def test_recovery_registry_discards_late_constructed_handle(tmp_path, monkeypatch):
+    path = (tmp_path / "state.db").resolve()
+    opened = []
+    real_open = registry._open_session_db
+
+    def slow_open(candidate):
+        db = real_open(candidate)
+        opened.append(db)
+        time.sleep(0.07)
+        return db
+
+    monkeypatch.setattr(registry, "_open_session_db", slow_open)
+    acquired = None
+    try:
+        with recovery_deadline(time.monotonic() + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                acquired = registry.acquire(path)
+    finally:
+        if acquired is not None:
+            registry.release(acquired)
+    assert len(opened) == 1
+    assert opened[0]._conn is None
+    with registry._lock:
+        assert path not in registry._opening
+        assert path not in registry._generations
+
+
+def test_recovery_registry_constructor_failure_clears_its_open_marker(tmp_path, monkeypatch):
+    path = (tmp_path / "state.db").resolve()
+
+    def fail_open(candidate):
+        raise RuntimeError("constructor failed")
+
+    monkeypatch.setattr(registry, "_open_session_db", fail_open)
+    with recovery_deadline(time.monotonic() + 1):
+        with pytest.raises(RuntimeError, match="constructor failed"):
+            registry.acquire(path)
+    with registry._lock:
+        assert path not in registry._opening
+        assert path not in registry._generations
+
+
+def test_recovery_registry_releases_new_generation_if_deadline_expires_after_publish(tmp_path, monkeypatch):
+    path = (tmp_path / "state.db").resolve()
+    from hermes_state import SessionDB
+
+    prepared = SessionDB(db_path=path)
+    monkeypatch.setattr(registry, "_open_session_db", lambda candidate: prepared)
+    original_finish = registry._finish_opening
+
+    def slow_finish(candidate, marker):
+        original_finish(candidate, marker)
+        time.sleep(0.07)
+
+    monkeypatch.setattr(registry, "_finish_opening", slow_finish)
+    acquired = None
+    try:
+        with recovery_deadline(time.monotonic() + 0.05):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                acquired = registry.acquire(path)
+    finally:
+        if acquired is not None:
+            registry.release(acquired)
+    with registry._lock:
+        assert path not in registry._opening
+        assert path not in registry._generations
+    assert prepared._conn is None
+
+
+def test_recovery_registry_rolls_back_ref_increment_if_deadline_expires(tmp_path):
+    path = (tmp_path / "state.db").resolve()
+    initial = registry.acquire(path)
+    generation = registry._generations[path]
+
+    class SlowRef:
+        def __init__(self):
+            self.path = generation.path
+            self.db = generation.db
+            self.identity = generation.identity
+            self.retired = generation.retired
+            self._refcount = generation.refcount
+
+        @property
+        def refcount(self):
+            return self._refcount
+
+        @refcount.setter
+        def refcount(self, value):
+            self._refcount = value
+            if value == 2:
+                time.sleep(0.06)
+
+    slow = SlowRef()
+    registry._generations[path] = slow
+    acquired = None
+    try:
+        with recovery_deadline(time.monotonic() + 0.03):
+            with pytest.raises(RecoveryDeadlineExceeded):
+                acquired = registry.acquire(path)
+        assert slow.refcount == 1
+    finally:
+        if acquired is not None:
+            registry.release(acquired)
+        registry.release(initial)
 
 
 @pytest.fixture(autouse=True)

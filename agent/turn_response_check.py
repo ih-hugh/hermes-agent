@@ -20,6 +20,23 @@ from agent.turn_usage import record_response_usage
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _settle_rejected_protected_send(agent: Any, response: Any) -> None:
+    """A returned but unusable payload still proves a physical SDK invocation."""
+    registry = getattr(agent, "_recovery_registry", None)
+    if registry is None:
+        return
+    from agent.recovery_producers import SendOutcome
+    from hermes_state_recovery import RecoveryRefused
+
+    send = registry.claim_response_send(response)
+    if send is None:
+        registry.mark_unsupported("untracked_producer")
+        raise RecoveryRefused("untracked_send_response")
+    send.finish(SendOutcome(
+        kind="unknown", attempt_id=send.attempt_id, reason="rejected_response",
+    ))
+
+
 @dataclass
 class ResponseCheckVerdict:
     """``action``: ``"break"`` (leave the retry loop — success, or a fallback/refusal restart
@@ -122,6 +139,7 @@ def check_api_response(
 
     response_invalid, error_details = validate_response_shape(agent, response)
     if response_invalid:
+        _settle_rejected_protected_send(agent, response)
         _iv = retry_invalid_response(
             agent, response=response, error_details=error_details, _retry=_retry,
             thinking_spinner=thinking_spinner, messages=messages, api_messages=api_messages,
@@ -144,6 +162,7 @@ def check_api_response(
 
     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.
     if finish_reason == "content_filter":
+        _settle_rejected_protected_send(agent, response)
         _rv = handle_content_policy_refusal(
             agent, response, _retry, thinking_spinner=thinking_spinner, messages=messages,
             api_messages=api_messages, api_kwargs=api_kwargs,
@@ -178,6 +197,7 @@ def check_api_response(
         retry_count = _tv.retry_count
         compression_attempts = _tv.compression_attempts
         if _tv.action in ("return", "break", "continue"):
+            _settle_rejected_protected_send(agent, response)
             return _verdict(_tv.action, _tv.result)
 
     # Fold provider usage into compressor / anchors / session counters / state.db

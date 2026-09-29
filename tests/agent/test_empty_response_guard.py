@@ -16,7 +16,11 @@ Fail-open contract under test:
 from decimal import Decimal
 from types import SimpleNamespace
 
+from openai._models import construct_type
+from openai.types.completion_usage import CompletionUsage
+
 from agent import empty_response_guard as guard
+from agent import usage_pricing
 
 
 def _agent(**overrides):
@@ -251,6 +255,58 @@ class TestEmptyRetryBudget:
             guard.empty_retry_budget(agent, resp)
             == guard.DEFAULT_EMPTY_RETRY_BUDGET
         )
+
+    def test_protected_empty_retry_never_fetches_remote_metadata(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            usage_pricing, "fetch_endpoint_model_metadata",
+            lambda base_url, api_key="": calls.append(base_url) or {},
+        )
+        agent = _agent(
+            model="future-unpriced-model", provider="openai-api",
+            base_url="https://api.openai.com/v1", _recovery_registry=object(),
+        )
+        response = SimpleNamespace(
+            usage=CompletionUsage(prompt_tokens=2, completion_tokens=0, total_tokens=2)
+        )
+        guard.record_empty_attempt(agent, finish_reason="stop", response=response)
+        assert guard.empty_retry_budget(agent, response) == guard.DEFAULT_EMPTY_RETRY_BUDGET
+        assert guard.streak_cost_usd(agent) is None
+        assert calls == []
+
+    def test_protected_malformed_native_usage_is_not_retry_cost_evidence(self):
+        agent = _agent(
+            model="gpt-4.1", provider="openai-api", _recovery_registry=object(),
+        )
+        usage = construct_type(
+            value={"prompt_tokens": "100000000", "completion_tokens": 0,
+                   "total_tokens": 100000000}, type_=CompletionUsage,
+        )
+        response = SimpleNamespace(usage=usage)
+        guard.record_empty_attempt(agent, finish_reason="stop", response=response)
+        assert guard.empty_retry_budget(agent, response) == guard.DEFAULT_EMPTY_RETRY_BUDGET
+        assert guard.streak_cost_usd(agent) is None
+        assert guard._attempts(agent)[0].usage_present is False
+
+    def test_ordinary_empty_retry_keeps_endpoint_pricing(self, monkeypatch):
+        calls = []
+
+        def metadata(base_url, api_key=""):
+            calls.append(base_url)
+            return {"future-unpriced-model": {
+                "pricing": {"prompt": "0.000001", "completion": "0.000001"}
+            }}
+
+        monkeypatch.setattr(usage_pricing, "fetch_endpoint_model_metadata", metadata)
+        agent = _agent(
+            model="future-unpriced-model", provider="openai-api",
+            base_url="https://api.openai.com/v1",
+        )
+        response = _response(prompt_tokens=1_000_000)
+        guard.record_empty_attempt(agent, finish_reason="stop", response=response)
+        assert guard.empty_retry_budget(agent, response) == guard.REDUCED_EMPTY_RETRY_BUDGET
+        assert guard.streak_cost_usd(agent) == Decimal("1")
+        assert len(calls) == 2
 
 
 class TestStreakCost:

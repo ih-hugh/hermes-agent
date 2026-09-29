@@ -154,6 +154,11 @@ _UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
 
 def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     """Kick off auto-titling for the session's first user message; never fatal."""
+    # The title generator runs a separate model request outside the protected
+    # send ledger. Refuse its dispatch before lazy DB creation or worker launch.
+    from agent.recovery_producers import current_registry
+    if getattr(agent, "_recovery_registry", None) is not None or current_registry() is not None:
+        return
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:

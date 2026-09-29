@@ -178,7 +178,15 @@ def get_active_env(task_id: str):
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup) or _active_environments.get(task_id)
+    from agent.recovery_producers import current_registry
+    if current_registry() is not None and env is not None:
+        from hermes_state_recovery import RecoveryRefused
+        from tools.terminal_tool_recovery import ProtectedWorkspaceEnvironment
+        if not isinstance(env, ProtectedWorkspaceEnvironment):
+            raise RecoveryRefused("provider_environment_mismatch")
+        env.validate_current(task_id)
+    return env
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -195,6 +203,7 @@ def ensure_task_env(task_id: Optional[str] = None):
     #62825). vision reads such paths inside the sandbox (see ``tools.image_source``), so it calls this to
     bring the env up on demand, reusing the same creation machinery as the terminal tool.
     """
+    from hermes_state_recovery import RecoveryRefused
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
         _get_env_config, _last_activity, _resolve_container_task_id,
@@ -202,6 +211,11 @@ def ensure_task_env(task_id: Optional[str] = None):
     )
     config = _get_env_config()
     env_type = config["env_type"]
+    from agent.recovery_producers import current_registry, refuse_untracked_work
+    protected = current_registry()
+    if protected is not None and (
+            env_type != "byf_workspace" or task_id != protected.scope.session_id):
+        refuse_untracked_work()
     if env_type == "local":
         return None
 
@@ -230,6 +244,8 @@ def ensure_task_env(task_id: Optional[str] = None):
                 timeout=config["timeout"], task_id=effective_task_id,
                 host_cwd=_resolve_task_host_cwd(config, task_id),
             )
+        except RecoveryRefused:
+            raise
         except Exception as exc:  # noqa: BLE001 — best-effort bring-up
             logger.warning(
                 "Lazy %s environment init failed for task %s: %s",

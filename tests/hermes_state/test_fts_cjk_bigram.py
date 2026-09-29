@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_state_recovery_exclusions as exclusions
 from hermes_state import SessionDB
 from hermes_state_common import FTS_CJK_STALE_KEY
 
@@ -64,6 +65,26 @@ def test_two_char_korean_hits_cjk_index(db):
     assert rows and "웅기" in rows[0]["snippet"]
     rows = db.search_messages("일본", limit=10)
     assert rows
+
+
+def test_settled_reopen_keeps_cjk_search_route(db, monkeypatch):
+    path = db.db_path
+    db.close()
+    second = SessionDB(db_path=path)  # completes the ordinary FTS layout marker
+    second.close()
+
+    def no_raw_claim(_path):
+        pytest.fail("settled CJK store should attach without schema reconciliation")
+
+    monkeypatch.setattr(exclusions, "begin_raw_schema_claim", no_raw_claim)
+    reopened = SessionDB(db_path=path)
+    try:
+        assert reopened._fts_cjk_loaded
+        assert reopened._fts_cjk_available
+        assert reopened._describe_search_path("일본") == "fts_cjk"
+        assert reopened.search_messages("일본", limit=10)
+    finally:
+        reopened.close()
 
 
 def test_mixed_and_ascii_queries(db):

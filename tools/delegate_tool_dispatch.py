@@ -417,6 +417,17 @@ def _dispatch_background(batch: _Batch) -> str:
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
         _restore_parent_cancellation(unit)
+        if dispatch.get("status") != "rejected" or dispatch.get("code") != "capacity":
+            refusal = {"status": dispatch.get("status", "unknown"), "mode": "background",
+                       "error": dispatch.get("error") or "background dispatch unavailable",
+                       "code": dispatch.get("code") or "background_dispatch_unavailable",
+                       "delegation_id": dispatch.get("delegation_id")}
+            if dispatched:
+                payload = _dispatched_payload(batch, dispatched)
+                payload["unaccepted_unit"] = {"task_indexes": [i for i, _, _ in unit.children],
+                                               **refusal}
+                return json.dumps(payload, ensure_ascii=False)
+            return json.dumps(refusal, ensure_ascii=False)
         if not dispatched:
             logger.info(
                 "delegate_task: async pool at capacity (%s); running the whole batch synchronously instead.",

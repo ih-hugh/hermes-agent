@@ -23,6 +23,22 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
 # Logger parity with the origin module (moved log records keep their name).
 logger = logging.getLogger("gateway.platforms.api_server")
 
+
+async def _claim_recovery_session(adapter, *session_ids: str):
+    """Commit exact original and resolved identities before route or writer effects."""
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    return await asyncio.to_thread(claim_exact_ordinary, path, tuple(session_ids))
+
+
+async def _declared_recovery_identity(adapter, value: str) -> str | None:
+    from hermes_recovery_dispatch import resolve_declared_ordinary, selected_state_db_path
+
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    return await asyncio.to_thread(resolve_declared_ordinary, path, value)
+
+
 async def _iter_stream_items(stream_q, agent_task, response):
     """Yield agent stream items until EOS, writing SSE keepalives while idle.
 
@@ -413,6 +429,7 @@ class OpenAICompatRoutesMixin:
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
             _multimodal_validation_error, _normalize_chat_content, _normalize_multimodal_content,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
+        from hermes_state_recovery import RecoveryRefused
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -473,25 +490,34 @@ class OpenAICompatRoutesMixin:
                 return _invalid_request("Session ID too long")
             session_id = provided_session_id
             try:
+                claim = await _claim_recovery_session(self, provided_session_id)
+                session_id = claim.resolved_ids[0]
+            except Exception:
+                return _error_response("Protected session cannot use chat completions", 409)
+            try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
                     # #98619/#13437: a client-addressed id from before a compression rotation
                     # must adopt the live continuation tip — history loads from it, the turn and
                     # the wake target bind it, and a detached delegation delivery row persisted
-                    # on the tip is what this continuation consumes. Same canonical resolution
-                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
-                    from gateway.platforms.api_server_runs import _resolve_live_session_id
-                    session_id = await _resolve_live_session_id(self, provided_session_id)
+                    # on the tip is what this continuation consumes. The read-only resolver
+                    # above checked both identities before this writable DB acquisition.
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            except RecoveryRefused:
+                return _error_response("Protected session cannot use chat completions", 409)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
+                return _error_response("Session protection state unavailable", 503)
         else:
             # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
             # one Hermes session.
             first_user = next(
                 (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
             session_id = _derive_chat_session_id(system_prompt, first_user)
+            try:
+                await _claim_recovery_session(self, session_id)
+            except Exception:
+                return _error_response("Protected session cannot use chat completions", 409)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -847,10 +873,15 @@ class OpenAICompatRoutesMixin:
         # id. Binding the declared key follows the same precedence: a chain-selected session must
         # not have its routing key rewritten to this header.
         _declared_selected = not stored_session_id and bool(gateway_session_key)
-        session_id = (
-            stored_session_id
-            or self._declared_conversation_session(gateway_session_key)
-            or str(uuid.uuid4()))
+        try:
+            declared_session_id = (
+                await _declared_recovery_identity(self, gateway_session_key)
+                if _declared_selected else None)
+            session_id = stored_session_id or declared_session_id or str(uuid.uuid4())
+            claim = await _claim_recovery_session(self, session_id)
+            session_id = claim.resolved_ids[0]
+        except Exception:
+            return _error_response("Protected session cannot use responses", 409)
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route, agent_overrides, selection_error = self._select_request_route(
             body, session_id=session_id, gateway_session_key=gateway_session_key,

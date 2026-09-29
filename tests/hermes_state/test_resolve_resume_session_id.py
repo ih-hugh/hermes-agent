@@ -11,6 +11,7 @@ and redirects to the first descendant that actually has messages. These
 tests pin that behaviour.
 """
 import time
+import sqlite3
 
 import pytest
 
@@ -99,6 +100,58 @@ def test_prefers_most_recent_child_when_fork_exists(db):
     assert db.resolve_resume_session_id("parent") == "newer_fork"
 
 
+def test_strict_resolver_propagates_broken_child_query_while_legacy_falls_back(db):
+    db.create_session("parent", source="api_server")
+    db.end_session("parent", "compression")
+    db.create_session("child", source="api_server", parent_session_id="parent")
+    db._conn.execute("ALTER TABLE sessions RENAME COLUMN source TO source_broken")
+    assert db.resolve_resume_session_id("parent") == "parent"
+    with pytest.raises(sqlite3.OperationalError):
+        db.resolve_resume_session_id("parent", strict=True)
+
+
+def test_strict_resolver_rejects_compression_cycle_and_depth_exhaustion(db):
+    db.create_session("a", source="api_server")
+    db.create_session("b", source="api_server")
+    for sid in ("a", "b"):
+        db.end_session(sid, "compression")
+    db._conn.execute("UPDATE sessions SET parent_session_id='b' WHERE id='a'")
+    db._conn.execute("UPDATE sessions SET parent_session_id='a' WHERE id='b'")
+    db._conn.commit()
+    assert db.resolve_resume_session_id("a") in {"a", "b"}
+    with pytest.raises(RuntimeError, match="cycle"):
+        db.resolve_resume_session_id("a", strict=True)
+
+    db._conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE id='a'")
+    db._conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE id='b'")
+    db._conn.commit()
+    parent = "a"
+    for i in range(101):
+        child = f"depth-{i}"
+        db.create_session(child, source="api_server", parent_session_id=parent)
+        db.end_session(child, "compression")
+        parent = child
+    with pytest.raises(RuntimeError, match="depth"):
+        db.resolve_resume_session_id("a", strict=True)
+
+
+def test_strict_resolver_rejects_message_child_cycle_and_depth_exhaustion(db):
+    db.create_session("a", source="api_server")
+    db.create_session("b", source="api_server", parent_session_id="a")
+    db._conn.execute("UPDATE sessions SET parent_session_id='b' WHERE id='a'")
+    db._conn.commit()
+    with pytest.raises(RuntimeError, match="cycle"):
+        db.resolve_resume_session_id("a", strict=True)
+
+    db._conn.execute("UPDATE sessions SET parent_session_id=NULL WHERE id='a'")
+    db._conn.commit()
+    parent = "b"
+    for i in range(33):
+        child = f"message-depth-{i}"
+        db.create_session(child, source="api_server", parent_session_id=parent)
+        parent = child
+    with pytest.raises(RuntimeError, match="depth"):
+        db.resolve_resume_session_id("a", strict=True)
 
 
 

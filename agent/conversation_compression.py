@@ -1407,6 +1407,12 @@ def _adopt_live_compression_child(
     confirmed = resolver(session_db, parent_session_id)
     if not confirmed or str(confirmed) != child_session_id:
         return None
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+
+    claimed = claim_exact_ordinary(
+        selected_state_db_path(session_db), (parent_session_id, child_session_id))
+    if claimed.resolved_ids[-1] != child_session_id:
+        return None
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
     agent._session_db_created = True
@@ -2982,6 +2988,10 @@ def _publish_rotated_compaction(
         _profile_for_child = None
     old_title = agent._session_db.get_session_title(agent.session_id)
     new_session_id = mint_session_id()
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+
+    claim_exact_ordinary(
+        selected_state_db_path(agent._session_db), (old_session_id, new_session_id))
     from agent.context_compressor import _DB_PERSISTED_MARKER
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
@@ -3588,6 +3598,8 @@ def compress_context(
     cooperative fence for executor callers that may time out. It prevents a late worker from mutating
     session state after its caller has moved on.
     """
+    from agent.recovery_producers import refuse_untracked_work
+    refuse_untracked_work()
     attempt = _begin_compression_attempt(agent, force=force, defer_notification=defer_context_engine_notification)
 
     # Codex owns the real thread; route compaction to its own compact (config

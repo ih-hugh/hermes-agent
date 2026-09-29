@@ -36,6 +36,33 @@ def _make_unrepairable_db(tmp_path: Path) -> Path:
     return db
 
 
+def _make_classifiable_damaged_db(tmp_path: Path) -> Path:
+    """Keep ordinary authority inspectable while a duplicate FTS entry breaks opens."""
+    db = tmp_path / "state.db"
+    hermes_state.SessionDB(db).close()
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type,name,tbl_name,rootpage,sql) "
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master "
+            "WHERE name='messages_fts'"
+        )
+    finally:
+        conn.close()
+    assert hermes_state_repair._recovery_repair_classification(db) == "legacy"
+    return db
+
+
+def _failed_repair(db: Path) -> dict:
+    """Run real backup/snapshot/attempt accounting, then fail scratch surgery."""
+    def fail_strategy(_scratch: Path, report: dict) -> None:
+        report["error"] = "injected scratch surgery failure"
+
+    with patch.object(hermes_state_repair, "_run_repair_strategies", side_effect=fail_strategy):
+        return repair_state_db_schema(db)
+
+
 def _make_healthy_db(tmp_path: Path) -> Path:
     db = tmp_path / "state.db"
     conn = sqlite3.connect(str(db))
@@ -53,16 +80,18 @@ def _make_healthy_db(tmp_path: Path) -> Path:
 
 class TestPersistentAttemptCap:
     def test_failed_repairs_accumulate_in_ledger(self, tmp_path):
-        db = _make_unrepairable_db(tmp_path)
-        report = repair_state_db_schema(db)
+        db = _make_classifiable_damaged_db(tmp_path)
+        report = _failed_repair(db)
         assert report["repaired"] is False
+        assert report["backup_path"] is not None
+        assert report["error"] == "injected scratch surgery failure"
         ledger = json.loads(_repair_ledger_path(db).read_text())
         assert ledger["failed_attempts"] == 1
 
     def test_repair_refuses_after_cap_with_terminal_error(self, tmp_path):
-        db = _make_unrepairable_db(tmp_path)
+        db = _make_classifiable_damaged_db(tmp_path)
         for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
-            report = repair_state_db_schema(db)
+            report = _failed_repair(db)
             assert report["repaired"] is False
         # Budget burned: the next call must refuse WITHOUT running surgery
         # (and without taking another backup).
@@ -83,12 +112,22 @@ class TestPersistentAttemptCap:
         assert len(_existing_malformed_backups(db)) == backups_before
 
     def test_changed_file_resets_the_budget(self, tmp_path):
-        db = _make_unrepairable_db(tmp_path)
+        db = _make_classifiable_damaged_db(tmp_path)
         for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
-            repair_state_db_schema(db)
+            _failed_repair(db)
         assert _persistent_repair_attempts_exhausted(db)
-        # A restored/replaced file (different size+mtime) gets fresh attempts.
-        db.write_bytes(b"SQLite format 3\x00" + os.urandom(8192))
+        # A genuine catalog-content change gets a fresh budget while the
+        # ordinary authority remains classifiable and the FTS damage remains.
+        conn = sqlite3.connect(str(db), isolation_level=None)
+        try:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql=sql||' ' WHERE rowid=("
+                "SELECT MAX(rowid) FROM sqlite_master WHERE name='messages_fts')"
+            )
+        finally:
+            conn.close()
+        assert hermes_state_repair._recovery_repair_classification(db) == "legacy"
         assert not _persistent_repair_attempts_exhausted(db)
 
     def test_successful_repair_clears_the_ledger(self, tmp_path):
@@ -99,11 +138,11 @@ class TestPersistentAttemptCap:
         assert not _repair_ledger_path(db).exists()
 
     def test_corrupt_ledger_is_ignored_not_fatal(self, tmp_path):
-        db = _make_unrepairable_db(tmp_path)
+        db = _make_classifiable_damaged_db(tmp_path)
         _repair_ledger_path(db).write_text("{not json")
         assert not _persistent_repair_attempts_exhausted(db)
         # And a repair pass overwrites it cleanly.
-        repair_state_db_schema(db)
+        _failed_repair(db)
         assert json.loads(_repair_ledger_path(db).read_text())["failed_attempts"] == 1
 
 
@@ -155,7 +194,7 @@ class TestBackupDedupeAndCap:
 
     def test_backup_via_repair_path_does_not_accumulate(self, tmp_path):
         """End-to-end: repeated failed repairs on the same file keep ONE backup."""
-        db = _make_unrepairable_db(tmp_path)
+        db = _make_classifiable_damaged_db(tmp_path)
         for _ in range(_MAX_PERSISTENT_REPAIR_ATTEMPTS):
-            repair_state_db_schema(db)
+            _failed_repair(db)
         assert len(_existing_malformed_backups(db)) == 1

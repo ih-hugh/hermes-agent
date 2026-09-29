@@ -27,6 +27,21 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
+async def _claim_wake(adapter: Any, *session_ids: str):
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    if any(sid and type(sid) is not str for sid in session_ids):
+        raise RecoveryRefused("invalid_ordinary_identity")
+    exact = tuple(sid for sid in session_ids if type(sid) is str and sid)
+    if exact:
+        return await asyncio.to_thread(claim_exact_ordinary, path, exact)
+    await asyncio.to_thread(claim_unscoped_ordinary, path)
+    return None
+
+
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends. Reads
     ``supports_async_delivery`` off the adapter class rather than the request-scoped contextvar
@@ -45,6 +60,10 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
+    # Push adapters route from event.source inside handle_message, where the
+    # target may be created or rotated before the eventual agent guard. An
+    # optional event.session_id is not evidence of that effective target.
+    await _claim_wake(adapter)
     event._gateway_accepted = False
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
@@ -59,6 +78,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
+        # The synthesized event has no stable session ID: the adapter may derive
+        # or rotate its target only inside handle_message.
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True)
         await admit_internal_event(adapter, synth_event)
@@ -105,25 +126,15 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     if not session_id:
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
+    claim = await _claim_wake(adapter, session_id)
+    session_id = claim.resolved_ids[0]
     ensure = getattr(adapter, "_ensure_session_db", None)
     db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
-    # #98619: the parent run may have compressed/rotated between dispatch and this detached
-    # completion — the captured origin id is then a closed parent and the append below is
-    # rejected with CompressionSessionClosedError forever (the watcher retries the same stale
-    # id). Adopt the live continuation tip first, the same canonical resolution
-    # /api/sessions/{id}/messages reads use, so the delivery row lands where the next run and
-    # the messages endpoint both resolve. Fails open to the original id.
-    resolver = getattr(db, "resolve_resume_session_id", None)
-    if callable(resolver):
-        try:
-            resolved = await asyncio.to_thread(resolver, session_id)
-            if resolved:
-                session_id = str(resolved)
-        except Exception:
-            logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
+    # The original and live tip were resolved with a read-only handle before this
+    # writable SessionDB acquisition. The later append is still row-guarded.
     await asyncio.to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
@@ -137,6 +148,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches."""
+    claim = await _claim_wake(adapter, session_id)
+    session_id = claim.resolved_ids[0]
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):

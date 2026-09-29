@@ -183,8 +183,18 @@ def _build_ssh_env(*, cwd, timeout, ssh_config, probe_only=False, **_):
 def _build_plugin_env(*, env_type, image, cwd, timeout, cc, task_id, **_):
     provider = _get_plugin_env_provider(env_type)
     if provider is not None:
-        env_obj = provider.create_environment(cwd=cwd, timeout=timeout, task_id=task_id, image=image,
-                                              container_config=cc)
+        from agent.recovery_producers import current_registry
+        if current_registry() is not None:
+            from hermes_state_recovery import RecoveryRefused
+            from tools.terminal_tool_recovery import build_protected_plugin_env
+            if env_type != "byf_workspace":
+                raise RecoveryRefused("unsupported_provider")
+            env_obj = build_protected_plugin_env(
+                provider, task_id=task_id, cwd=cwd, timeout=timeout,
+                image=image, container_config=cc)
+        else:
+            env_obj = provider.create_environment(cwd=cwd, timeout=timeout, task_id=task_id, image=image,
+                                                  container_config=cc)
         # Stamp the backend name so path-resolution and progress surfaces can identify plugin
         # backends without class-name sniffing. Test doubles may reject attributes.
         try:
@@ -192,6 +202,9 @@ def _build_plugin_env(*, env_type, image, cwd, timeout, cc, task_id, **_):
         except AttributeError:
             pass
         return env_obj
+    from agent.recovery_producers import current_registry, refuse_untracked_work
+    if current_registry() is not None:
+        refuse_untracked_work()
     try:
         from agent.terminal_env_registry import plugin_backend_names
         plugin_names = plugin_backend_names()
@@ -215,6 +228,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     for local/ssh/vercel; ``container_config`` carries the container_*/docker_* resource keys; ``host_cwd`` is
     the host dir bound into Docker when cwd mounting is enabled. ``probe_only`` asks ssh for a throwaway
     connection with no remote setup/sync (the prompt-time probe). Unknown types fall through to plugin backends."""
+    from agent.recovery_producers import current_registry
+    if current_registry() is not None and env_type != "byf_workspace":
+        from agent.recovery_producers import refuse_untracked_work
+        refuse_untracked_work()
     builder = _ENV_BUILDERS.get(env_type, _build_plugin_env)
     return builder(env_type=env_type, image=image, cwd=cwd, timeout=timeout, cc=container_config or {},
                    task_id=task_id, ssh_config=ssh_config, host_cwd=host_cwd, probe_only=probe_only)

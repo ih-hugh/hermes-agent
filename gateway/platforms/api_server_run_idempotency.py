@@ -16,6 +16,12 @@ from hermes_cli.sqlite_util import add_column_if_missing
 # Keep the extracted store's log records on the API server logger.
 logger = logging.getLogger("gateway.platforms.api_server")
 
+
+def _reject_protected_key(key: str) -> None:
+    if key.startswith("byf-recovery-v1:"):
+        from hermes_state_recovery import RecoveryRefused
+        raise RecoveryRefused("reserved_key")
+
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 
 _SELECT_BY_KEY = (
@@ -133,6 +139,7 @@ class RunIdempotencyStore:
     def reserve(self, scope: str, key: str, fingerprint: str, run_id: str, status: Dict[str, Any], *,
                 owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0):
         """Atomically reserve a key; return ``(outcome, stored_record)``."""
+        _reject_protected_key(key)
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
         encoded = _encode_status(status)
@@ -156,6 +163,7 @@ class RunIdempotencyStore:
 
     def lookup(self, scope: str, key: str, fingerprint: str, *, retention_until: float = 0):
         """Return ``missing``, ``reused`` or ``conflict`` without reserving."""
+        _reject_protected_key(key)
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
         with self._immediate_txn():
@@ -165,6 +173,13 @@ class RunIdempotencyStore:
             row = self._conn.execute(_SELECT_BY_KEY, (scope, key)).fetchone()
             self._conn.commit()
         return ("missing", None) if row is None else _outcome(row, fingerprint)
+
+    def has_key(self, scope: str, key: str) -> bool:
+        """Detect a historical protected-prefix collision without adopting that row."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM run_idempotency WHERE scope=? AND idempotency_key=?",
+                (scope, key)).fetchone() is not None
 
     def _prune_stale_terminal_locked(self, now: float) -> None:
         """Prune aged replay records only once their stored run is terminal (caller holds the

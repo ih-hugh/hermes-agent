@@ -534,3 +534,42 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_protected_api_turn_skips_auxiliary_title_before_db_or_worker():
+    from agent import turn_context
+
+    agent = _TitlingAgent("api_server")
+    agent._recovery_registry = object()
+    agent._session_db_created = False
+    agent._ensure_db_session = MagicMock(side_effect=AssertionError("db effect"))
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            agent, [{"role": "user", "content": "Fix the login button"}],
+        )
+    agent._ensure_db_session.assert_not_called()
+    titler.assert_not_called()
+
+
+def test_ordinary_api_turn_keeps_auto_title():
+    assert _title_turn("api_server").called
+
+
+def test_protected_executor_context_skips_title_before_agent_marker(tmp_path):
+    from agent import turn_context
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _, _, registry = _admitted(tmp_path)
+    agent = _TitlingAgent("api_server")
+    agent._session_db_created = False
+    agent._ensure_db_session = MagicMock(side_effect=AssertionError("db effect"))
+    lease = registry.enter(registry.permit, "executor")
+    try:
+        with patch("agent.title_generator.maybe_auto_title") as titler:
+            lease.run(lambda: turn_context._maybe_title_session_at_turn_start(
+                agent, [{"role": "user", "content": "Fix the login button"}],
+            ))
+        agent._ensure_db_session.assert_not_called()
+        titler.assert_not_called()
+    finally:
+        db.close()

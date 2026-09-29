@@ -316,7 +316,15 @@ class AIAgent(
 
     def _ensure_db_session(self) -> None:
         """Create the session DB row on first use; a transient failure leaves it to retry next turn."""
-        if getattr(self, "_persist_disabled", False) or self._session_db_created or not self._session_db:
+        from agent.recovery_context import current_write_permit
+        from agent.recovery_producers import current_registry
+        protected = current_registry() is not None or getattr(self, "_recovery_registry", None) is not None
+        if self._session_db_created:
+            return
+        if protected and (getattr(self, "_persist_disabled", False) or not self._session_db):
+            from hermes_state_recovery import RecoveryRefused
+            raise RecoveryRefused("session_init_unavailable")
+        if getattr(self, "_persist_disabled", False) or not self._session_db:
             return
         source = _session_source_for_agent(self.platform)
         try:
@@ -334,7 +342,10 @@ class AIAgent(
                 profile_for_session = None
             # Carry the gateway routing identity: when the gateway SessionStore degraded to JSONL (corrupt
             # state.db) this lazy create is the ONLY durable write, and an identity-less row is unrecoverable.
-            self._session_db.create_session(
+            create = (self._session_db.initialize_protected_session if protected
+                      else self._session_db.create_session)
+            protected_args = {"recovery_permit": current_write_permit()} if protected else {}
+            create(
                 session_id=self.session_id, source=source, model=self.model,
                 model_config=self._session_row_model_config(), system_prompt=self._cached_system_prompt,
                 user_id=getattr(self, "_user_id", None), session_key=getattr(self, "_gateway_session_key", None),
@@ -343,9 +354,14 @@ class AIAgent(
                 display_name=getattr(self, "_chat_name", None) or getattr(self, "_user_name", None),
                 origin_json=_gateway_origin_json(self), parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source), profile_name=profile_for_session,
+                **protected_args,
             )
             self._session_db_created = True
         except Exception as e:
+            if protected:
+                # A protected turn cannot continue after an unknown or failed
+                # first source-row write; its durable ack is part of sealing.
+                raise
             # Transient failure (e.g. SQLite lock): _session_db_created stays False so the next turn retries.
             logger.warning("Session DB creation failed (will retry next turn): %s", e)
 

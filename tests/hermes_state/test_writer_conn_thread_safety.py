@@ -23,12 +23,89 @@ Two independent layers are asserted here:
 """
 
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from hermes_state import SessionDB
+
+
+def test_vacuum_recaptures_identity_without_nested_writer_lock(tmp_path):
+    """A real VACUUM must finish after it calls the already-locked recorder."""
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "import hermes_state as hs\n"
+        "from hermes_state import SessionDB\n"
+        "db = SessionDB(db_path=Path(sys.argv[1]))\n"
+        "before = (db._opened_store_id, db._opened_generation_token)\n"
+        "hs._read_sqlite_application_id = lambda path: None\n"
+        "db._db_file_application_id = 0\n"
+        "db.vacuum()\n"
+        "assert before == (db._opened_store_id, db._opened_generation_token)\n"
+        "assert db._db_file_application_id > 0\n"
+        "db.close()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "state.db")],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_identity_capture_locked_helper_has_only_locked_callers():
+    """Keep the helper's transitive lock proof local to both source files."""
+    import ast
+
+    root = Path(__file__).resolve().parents[2]
+    wrapper_calls = []
+    calls = []
+    locked_calls = []
+    for path in sorted(root.glob("hermes_state*.py")):
+        name = path.name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if (node.func.attr == "_record_db_file_identity"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"):
+                    wrapper_calls.append((name, fn.name))
+                if (node.func.attr == "_record_db_file_identity_locked"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"):
+                    calls.append((name, fn.name, node.lineno))
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.With):
+                    continue
+                if not any(
+                    isinstance(item.context_expr, ast.Attribute)
+                    and item.context_expr.attr == "_lock"
+                    and isinstance(item.context_expr.value, ast.Name)
+                    and item.context_expr.value.id == "self"
+                    for item in node.items
+                ):
+                    continue
+                for inner in ast.walk(node):
+                    if (isinstance(inner, ast.Call)
+                            and isinstance(inner.func, ast.Attribute)
+                            and inner.func.attr == "_record_db_file_identity_locked"
+                            and isinstance(inner.func.value, ast.Name)
+                            and inner.func.value.id == "self"):
+                        locked_calls.append((name, fn.name, inner.lineno))
+    assert calls == locked_calls
+    assert wrapper_calls == [("hermes_state.py", "__init__")]
+    assert [(name, fn) for name, fn, _ in calls] == [
+        ("hermes_state.py", "_record_db_file_identity"),
+        ("hermes_state_maintenance.py", "vacuum"),
+    ]
 
 
 @pytest.fixture
@@ -140,7 +217,7 @@ class TestConcurrentReadersDoNotRaceTheWriter:
             # Lifecycle: run before the instance is shared / after readers
             # are drained. Not reachable concurrently with writers.
             "__init__", "_open_writer", "_connect_and_init",
-            "_connect_and_init_with_lock_patience", "close",
+            "_connect_and_init_with_lock_patience", "_open_writer_reconcile", "close",
             # Lost-generation settlement: called only from close()'s
             # `with self._lock` body (locked transitively, not lexically).
             "_settle_lost_generation_locked",
@@ -154,6 +231,15 @@ class TestConcurrentReadersDoNotRaceTheWriter:
                             and ctx.attr == "_lock"
                             and isinstance(ctx.value, ast.Name)
                             and ctx.value.id == "self"):
+                        return True
+                    if (isinstance(ctx, ast.Call)
+                            and isinstance(ctx.func, ast.Name)
+                            and ctx.func.id == "acquire_recovery_lock"
+                            and len(ctx.args) == 1
+                            and isinstance(ctx.args[0], ast.Attribute)
+                            and ctx.args[0].attr == "_lock"
+                            and isinstance(ctx.args[0].value, ast.Name)
+                            and ctx.args[0].value.id == "self"):
                         return True
             return False
 

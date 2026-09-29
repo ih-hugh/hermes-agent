@@ -441,18 +441,18 @@ def _pricing_entry_from_metadata(
 
 def get_pricing_entry(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None, *, allow_remote_metadata: bool = True,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
         return _INCLUDED_ENTRY
     if route.provider == "openrouter":
-        return _openrouter_pricing_entry(route)
+        return _openrouter_pricing_entry(route) if allow_remote_metadata else None
 
     bundled_entry = _lookup_official_docs_pricing(route)
     if bundled_entry:
         return bundled_entry
-    if route.base_url:
+    if route.base_url and allow_remote_metadata:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""), route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
@@ -545,6 +545,85 @@ def normalize_usage(
     )
 
 
+def validated_protected_chat_usage(response_usage: object) -> CanonicalUsage | None:
+    """Decode only complete native Chat Completions usage for an attested send.
+
+    Ordinary sessions retain the permissive cross-provider normalizer above.
+    The protected OpenAI route must not turn absent or coerced counters into a
+    provider-proved zero, or silently subtract impossible cache buckets.
+    """
+    from openai.types.completion_usage import (
+        CompletionTokensDetails, CompletionUsage, PromptTokensDetails,
+    )
+
+    maximum = 2**63 - 1
+
+    def counter(value: object, limit: int = maximum) -> int | None:
+        return value if type(value) is int and 0 <= value <= limit else None
+
+    if type(response_usage) is not CompletionUsage or response_usage.model_extra:
+        return None
+    prompt = counter(getattr(response_usage, "prompt_tokens", None))
+    completion = counter(getattr(response_usage, "completion_tokens", None))
+    total = counter(getattr(response_usage, "total_tokens", None))
+    if (prompt is None or completion is None or total is None
+            or prompt + completion != total):
+        return None
+
+    cache_read = 0
+    cache_write = 0
+    prompt_details = getattr(response_usage, "prompt_tokens_details", None)
+    if prompt_details is not None:
+        if type(prompt_details) is not PromptTokensDetails:
+            return None
+        for value in (
+            getattr(prompt_details, "audio_tokens", None),
+            getattr(prompt_details, "cached_tokens", None),
+        ):
+            if value is not None and counter(value, prompt) is None:
+                return None
+        cache_read = getattr(prompt_details, "cached_tokens", None) or 0
+        extras = prompt_details.model_extra or {}
+        aliases = {"cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens"}
+        if set(extras) - aliases:
+            return None
+        writes = []
+        for name in aliases:
+            if name in extras and extras[name] is not None:
+                value = counter(extras[name], prompt)
+                if value is None:
+                    return None
+                writes.append(value)
+        if writes:
+            if len(set(writes)) != 1:
+                return None
+            cache_write = writes[0]
+    if cache_read + cache_write > prompt:
+        return None
+
+    reasoning = 0
+    completion_details = getattr(response_usage, "completion_tokens_details", None)
+    if completion_details is not None:
+        if type(completion_details) is not CompletionTokensDetails or completion_details.model_extra:
+            return None
+        for value in (
+            getattr(completion_details, "accepted_prediction_tokens", None),
+            getattr(completion_details, "audio_tokens", None),
+            getattr(completion_details, "reasoning_tokens", None),
+            getattr(completion_details, "rejected_prediction_tokens", None),
+        ):
+            if value is not None and counter(value, completion) is None:
+                return None
+        reasoning = getattr(completion_details, "reasoning_tokens", None) or 0
+    return CanonicalUsage(
+        input_tokens=prompt - cache_read - cache_write,
+        output_tokens=completion,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
+        reasoning_tokens=reasoning,
+    )
+
+
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
 
@@ -552,6 +631,7 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
+    allow_remote_metadata: bool = True,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -560,7 +640,10 @@ def estimate_usage_cost(
             pricing_version="included-route", notes=(_INCLUDED_NOTE,),
         )
 
-    entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
+    entry = get_pricing_entry(
+        model_name, provider=provider, base_url=base_url, api_key=api_key,
+        allow_remote_metadata=allow_remote_metadata,
+    )
     if not entry:
         return _unknown_cost("none")
 

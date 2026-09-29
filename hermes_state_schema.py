@@ -28,6 +28,7 @@ from hermes_state_common import (
 )
 from hermes_state_fts import _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
+from hermes_state_recovery_exclusions import install_exclusion_schema
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -917,6 +918,125 @@ class SessionSchemaMixin:
         report_startup_progress(600.0, phase="state_db_init_schema")
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
+        install_exclusion_schema(self._conn)
+        # Protected recovery has its own non-prunable authority. These rows intentionally
+        # do not reference ordinary sessions: admission precedes session creation and
+        # transport/session retention must never erase the member inventory.
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS recovery_store (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), store_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sessions (
+                session_id TEXT PRIMARY KEY, profile TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN ('open','closing','sealed')),
+                revision INTEGER NOT NULL, root_run_id TEXT NOT NULL UNIQUE,
+                close_request_id TEXT, close_request_json TEXT, reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                receipt_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS recovery_members (
+                run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES recovery_sessions(session_id),
+                generation INTEGER NOT NULL CHECK (generation IN (0,1)), parent_run_id TEXT,
+                profile TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, request_sha256 TEXT NOT NULL,
+                owner_incarnation TEXT NOT NULL,
+                producer_state TEXT NOT NULL CHECK (producer_state IN ('open','closed','incomplete')),
+                status_json TEXT NOT NULL,
+                UNIQUE (session_id, generation), UNIQUE (profile, scope_digest, idempotency_key)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_producers (
+                producer_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                kind TEXT NOT NULL CHECK (kind IN ('executor','tool','sdk','callback','usage_write')),
+                state TEXT NOT NULL CHECK (state IN ('queued','running','closed','cancelled')),
+                owner_incarnation TEXT NOT NULL,
+                parent_producer_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_recovery_producers_run_state
+                ON recovery_producers(run_id,state);
+            CREATE TABLE IF NOT EXISTS recovery_root_done (
+                run_id TEXT PRIMARY KEY REFERENCES recovery_members(run_id)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sends (
+                attempt_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                producer_id TEXT NOT NULL REFERENCES recovery_producers(producer_id),
+                sequence INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN
+                    ('reserved','invoking','accounted','no_charge_proved','unknown')),
+                delta_id TEXT NOT NULL UNIQUE,
+                reason TEXT,
+                UNIQUE (run_id,sequence)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_usage_slots (
+                delta_id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL UNIQUE REFERENCES recovery_sends(attempt_id),
+                state TEXT NOT NULL CHECK (state IN ('pending','committed','abandoned','no_charge')),
+                payload_sha256 TEXT,
+                payload_json BLOB,
+                ack_revision INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS recovery_write_acks (
+                write_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES recovery_sessions(session_id),
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                generation INTEGER NOT NULL,
+                mutation TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending','committed','failed')),
+                ack_revision INTEGER,
+                result_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS recovery_provider_admissions (
+                session_id TEXT PRIMARY KEY REFERENCES recovery_sessions(session_id),
+                provider TEXT NOT NULL CHECK (provider='byf_workspace'),
+                hermes_revision TEXT NOT NULL, source_sha256 TEXT NOT NULL,
+                provider_sha256 TEXT NOT NULL, lease_id TEXT NOT NULL,
+                grant_sha256 TEXT NOT NULL, admission_json BLOB NOT NULL,
+                admission_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_provider_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES recovery_provider_admissions(session_id),
+                run_id TEXT NOT NULL REFERENCES recovery_members(run_id),
+                generation INTEGER NOT NULL CHECK (generation IN (0,1)),
+                producer_id TEXT NOT NULL REFERENCES recovery_producers(producer_id),
+                sequence INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('create_environment','execute')),
+                state TEXT NOT NULL CHECK (state IN ('invoking','returned','unknown')),
+                create_invocation_id TEXT REFERENCES recovery_provider_invocations(invocation_id),
+                container_id TEXT, container_attestation_sha256 TEXT,
+                exit_code INTEGER, outcome_reason TEXT,
+                UNIQUE (session_id, sequence)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_recovery_provider_create_per_session
+                ON recovery_provider_invocations(session_id) WHERE kind='create_environment';
+            CREATE INDEX IF NOT EXISTS idx_recovery_write_acks_session_revision
+                ON recovery_write_acks(session_id,ack_revision,write_id);
+            CREATE TABLE IF NOT EXISTS recovery_seal_documents (
+                session_id TEXT PRIMARY KEY REFERENCES recovery_sessions(session_id),
+                result_json BLOB NOT NULL, receipt_json BLOB NOT NULL,
+                receipt_sha256 TEXT NOT NULL, page_count INTEGER NOT NULL
+                    CHECK (page_count BETWEEN 1 AND 4096)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_sealed_pages (
+                session_id TEXT NOT NULL REFERENCES recovery_seal_documents(session_id),
+                route_page INTEGER NOT NULL CHECK (route_page BETWEEN 0 AND 4095),
+                page_bytes BLOB NOT NULL, PRIMARY KEY (session_id,route_page)
+            );
+        """)
+        # Task 2a's first checkout may already have the producer table without parentage.
+        if not any(row[1] == "parent_producer_id" for row in
+                   cursor.execute("PRAGMA table_info(recovery_producers)").fetchall()):
+            cursor.execute("ALTER TABLE recovery_producers ADD COLUMN parent_producer_id TEXT")
+        # Old, unqualified slots cannot be reconstructed from their digest. They
+        # remain NULL and the protected read/apply seam explicitly refuses them.
+        if not any(row[1] == "payload_json" for row in
+                   cursor.execute("PRAGMA table_info(recovery_usage_slots)").fetchall()):
+            cursor.execute("ALTER TABLE recovery_usage_slots ADD COLUMN payload_json BLOB")
+        # A settled open must not take the writer lock just to restamp the UUID.
+        if cursor.execute("SELECT 1 FROM recovery_store WHERE singleton=1").fetchone() is None:
+            cursor.execute("INSERT OR IGNORE INTO recovery_store(singleton, store_id) VALUES (1, ?)",
+                           (str(uuid.uuid4()),))
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
         self._reconcile_columns(cursor)
@@ -1290,6 +1410,7 @@ def reconcile_state_schema(conn: sqlite3.Connection) -> None:
     hand-maintained shape for the same durable tables.
     """
     conn.executescript(SCHEMA_SQL)
+    install_exclusion_schema(conn)
     # _reconcile_columns only touches the staticmethod _parse_schema_columns,
     # so a bare instance works; reusing it keeps one reconciliation
     # implementation (one authority) instead of a near-copy on raw

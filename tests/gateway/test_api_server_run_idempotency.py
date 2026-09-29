@@ -6,6 +6,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server
+from gateway.platforms.api_server_recovery import RecoveryWorkerPool
 
 
 @pytest.mark.asyncio
@@ -30,6 +31,8 @@ async def test_disconnect_tolerates_bare_fixture_without_run_idempotency_store()
     adapter._mark_disconnected = MagicMock()
     adapter._close_cached_session_dbs = MagicMock()
     adapter._response_store = MagicMock()
+    adapter._protected_admission_tasks = set()
+    adapter._recovery_workers = RecoveryWorkerPool()
     adapter._site = None
     adapter._runner = None
     adapter._app = object()

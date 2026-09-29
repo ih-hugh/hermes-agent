@@ -42,6 +42,89 @@ def test_flush_writes_string_pending_to_file(tmp_path, monkeypatch):
     assert "telegram" not in files[0].name
 
 
+def test_idless_pending_claim_precedes_flush_directory_creation(tmp_path, monkeypatch):
+    from gateway import shutdown_flush
+
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    flush_dir = tmp_path / "pending_messages"
+
+    def claimed_before_directory():
+        assert not flush_dir.exists()
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "state.db") as raw:
+            assert raw.execute(
+                "SELECT kind FROM recovery_exclusions WHERE kind='unscoped_ordinary'"
+            ).fetchone() == ("unscoped_ordinary",)
+        flush_dir.mkdir()
+        return flush_dir
+
+    monkeypatch.setattr(shutdown_flush, "_get_flush_dir", claimed_before_directory)
+    assert flush_pending_to_file({"routing-key": "hello"}) == 1
+
+
+def test_exact_overflow_claim_precedes_flush_directory_creation(tmp_path, monkeypatch):
+    from gateway import shutdown_flush
+
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    flush_dir = tmp_path / "pending_messages"
+    sid = "event-session"
+
+    def claimed_before_directory():
+        assert not flush_dir.exists()
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "state.db") as raw:
+            assert raw.execute(
+                "SELECT session_id FROM recovery_exclusions WHERE kind='ordinary_session'"
+            ).fetchone() == (sid,)
+        flush_dir.mkdir()
+        return flush_dir
+
+    monkeypatch.setattr(shutdown_flush, "_get_flush_dir", claimed_before_directory)
+    assert flush_overflow_to_file({"route": [_overflow_event("hello", sid)]}) == 1
+
+
+def test_idless_pending_refuses_protected_store_before_directory_creation(tmp_path, monkeypatch):
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, _scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    try:
+        assert flush_pending_to_file({"route": "unidentified message"}) == 0
+        assert not (tmp_path / "pending_messages").exists()
+    finally:
+        db.close()
+
+
+def test_protected_transcript_is_neither_spooled_nor_replayed(tmp_path, monkeypatch):
+    from gateway import shutdown_flush
+    from hermes_state_recovery import RecoveryRefused
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, scope, _registry = _admitted(tmp_path)
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(shutdown_flush, "_get_flush_dir", lambda: flush_dir)
+    try:
+        assert shutdown_flush.spool_dropped_transcript_message(
+            scope.session_id, {"role": "user", "content": "private"}) is None
+        assert shutdown_flush.flush_pending_to_file({
+            "routing-key": {"session_id": scope.session_id, "text": "private"}}) == 0
+        assert not list(flush_dir.glob("*.json"))
+        with pytest.raises(RecoveryRefused):
+            shutdown_flush.drain_transcript_spool(scope.session_id, lambda _: pytest.fail("replayed"))
+        payload = {"session_key": "routing-key", "data": {
+            "session_id": scope.session_id, "text": "private"}}
+        pending = flush_dir / "pending-protected.json"
+        pending.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr("hermes_state_registry.acquire", lambda: pytest.fail("SessionDB opened"))
+        assert shutdown_flush.recover_pending_to_db() == 0
+        assert pending.exists()
+    finally:
+        db.close()
+
+
 def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     flush_dir = _make_flush_dir(tmp_path)
     monkeypatch.setattr(
@@ -68,6 +151,7 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
 
 def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypatch):
     flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
     )
@@ -86,6 +170,7 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
     flush_file.write_text(json.dumps(payload), encoding="utf-8")
 
     mock_db = MagicMock()
+    mock_db.db_path = tmp_path / "state.db"
     count = recover_pending_to_db(mock_db)
 
     assert count == 1
@@ -103,6 +188,7 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
 ):
     """Owned SessionDB must close even when recovery is interrupted."""
     flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(
         "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
     )
@@ -118,6 +204,7 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
 
     class InterruptingDB:
         released = False
+        db_path = tmp_path / "state.db"
 
         def append_message(self, **_kwargs):
             raise KeyboardInterrupt
@@ -132,6 +219,23 @@ def test_recover_closes_owned_db_when_unexpected_exception_escapes(
         recover_pending_to_db()
 
     assert db.released is True
+
+
+def test_replay_retains_file_if_acquired_db_differs_from_claimed_store(tmp_path, monkeypatch):
+    from gateway import shutdown_flush
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    pending = flush_dir / "pending.json"
+    pending.write_text(json.dumps({"session_key": "route", "data": {
+        "text": "message", "session_id": "sid"}}), encoding="utf-8")
+    db = MagicMock()
+    db.db_path = tmp_path / "different.db"
+    monkeypatch.setattr("hermes_state_registry.acquire", lambda: db)
+    monkeypatch.setattr("hermes_state_registry.release_or_close", lambda _db: None)
+    assert shutdown_flush.recover_pending_to_db() == 0
+    assert pending.exists()
+    db.append_message.assert_not_called()
 
 
 def test_serialise_object_with_text():
@@ -221,10 +325,12 @@ def test_flushed_overflow_is_replayed_by_recover_pending_to_db(tmp_path, monkeyp
     """Round-trip: overflow payloads use the slot-flush shape, so the existing
     startup recovery inserts them as user rows without any new reader."""
     flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
     flush_overflow_to_file({"agent:main:telegram:dm:1": [_overflow_event("orphan-1")]})
 
     db = MagicMock()
+    db.db_path = tmp_path / "state.db"
     recovered = recover_pending_to_db(session_db=db)
     assert recovered == 1
     db.append_message.assert_called_once()

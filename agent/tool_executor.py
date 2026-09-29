@@ -57,6 +57,20 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _protected_tool_lease(function_name: str):
+    from agent.recovery_producers import current_registry, require_unmanaged_dispatch
+    from hermes_state_recovery import RecoveryRefused
+
+    registry = current_registry()
+    if registry is None:
+        return None
+    require_unmanaged_dispatch()
+    if function_name != "terminal":
+        registry.mark_unsupported("unsupported_configuration")
+        raise RecoveryRefused("unsupported_configuration")
+    return registry.enter(registry.permit, "tool")
+
+
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
 
 
@@ -587,18 +601,31 @@ def _run_tool_activity_heartbeat(
 def _run_with_activity_heartbeat(agent, function_name: str, fn):
     """Run ``fn()`` under the activity heartbeat; covers both executor paths."""
     stop = threading.Event()
+    from agent.recovery_producers import current_lease
+    parent = current_lease()
+    callback_lease = parent.registry.enter(parent, "callback") if parent is not None else None
+    def _protected_heartbeat():
+        callback_lease.run(lambda: _run_tool_activity_heartbeat(
+            agent, stop, f"tool running: {function_name}", _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S))
+
+    target = _protected_heartbeat if callback_lease is not None else _run_tool_activity_heartbeat
     thread = threading.Thread(
         # Keep the gateway turn-inactivity watchdog from abandoning a turn whose tool call runs silently for
         # longer than the inactivity timeout (#84491): stamp activity periodically while the tool is in
         # flight, not just at start/completion. Both the sequential and the concurrent paths funnel through
         # here, so a single heartbeat covers every tool.
-        target=_run_tool_activity_heartbeat,
-        args=(agent, stop, f"tool running: {function_name}"),
-        kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
+        target=target,
+        args=() if callback_lease is not None else (agent, stop, f"tool running: {function_name}"),
+        kwargs={} if callback_lease is not None else {"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S},
         daemon=True,
         name=f"tool-activity-hb-{function_name[:24]}",
     )
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        if callback_lease is not None:
+            callback_lease.cancel_before_start()
+        raise
     try:
         return fn()
     finally:
@@ -840,8 +867,10 @@ def _run_sequential_tool_execution_middleware(
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+    recovery_lease = _protected_tool_lease(function_name)
     if function_name in _NEVER_PARALLEL_TOOLS:
-        return _run_agent_tool_execution_middleware(agent, **kwargs)
+        call = lambda: _run_agent_tool_execution_middleware(agent, **kwargs)
+        return call() if recovery_lease is None else recovery_lease.run(call)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
@@ -849,14 +878,21 @@ def _run_sequential_tool_execution_middleware(
     worker_tid: list[int] = []
 
     def _run() -> _ManagedToolResult:
-        with _registered_tool_worker(agent) as tid:
-            worker_tid.append(tid)
-            return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+        def _body() -> _ManagedToolResult:
+            with _registered_tool_worker(agent) as tid:
+                worker_tid.append(tid)
+                return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+        return _body() if recovery_lease is None else recovery_lease.run(_body)
 
     if ref.trace is None:
         ref.trace = []
-    executor = DaemonThreadPoolExecutor(max_workers=1)
-    future = executor.submit(propagate_context_to_thread(_run))
+    try:
+        executor = DaemonThreadPoolExecutor(max_workers=1)
+        future = executor.submit(propagate_context_to_thread(_run))
+    except BaseException:
+        if recovery_lease is not None:
+            recovery_lease.cancel_before_start()
+        raise
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     started = time.monotonic()
     abandoned = False
@@ -889,7 +925,8 @@ def _run_sequential_tool_execution_middleware(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
             )
         abandoned = True
-        future.cancel()
+        if future.cancel() and recovery_lease is not None:
+            recovery_lease.cancel_before_start()
         if state == "timeout":
             _interrupt_worker_tids(agent, worker_tid)
         return _abandoned_sequential_result(agent, ref, message, result_cls, **outcome)
@@ -1242,10 +1279,21 @@ class _ConcurrentBatch:
         carries turn ContextVars and thread-local approval/sudo callbacks into the worker."""
         futures = []
         future_to_index = {}
+        self._recovery_future_leases = {}
         for submit_index, i in enumerate(runnable):
+            recovery_lease = _protected_tool_lease(self.parsed_calls[i].name)
             try:
-                f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index)
+                worker = self.run_worker
+                if recovery_lease is not None:
+                    worker = lambda index, order, _worker=worker, _lease=recovery_lease: _lease.run(
+                        lambda: _worker(index, order))
+                # Enter the copied turn context first, then the exact tool lease;
+                # callbacks from a surviving worker must retain that parent.
+                worker = propagate_context_to_thread(worker)
+                f = executor.submit(worker, i, submit_index)
             except RuntimeError as submit_error:
+                if recovery_lease is not None:
+                    recovery_lease.cancel_before_start()
                 if not _is_interpreter_shutdown_submit_error(submit_error):
                     raise
                 skipped = runnable[submit_index:]
@@ -1258,8 +1306,14 @@ class _ConcurrentBatch:
                         result = f"Error executing tool '{ref.name}': Python interpreter is shutting down; tool was not started"
                         self.results[skipped_i] = _ToolOutcome(ref, result, 0.0, True, False)
                 break
+            except BaseException:
+                if recovery_lease is not None:
+                    recovery_lease.cancel_before_start()
+                raise
             futures.append(f)
             future_to_index[f] = i
+            if recovery_lease is not None:
+                self._recovery_future_leases[f] = recovery_lease
         return futures, future_to_index
 
     def _running_names(self, not_done, future_to_index) -> list[str]:
@@ -1310,7 +1364,10 @@ class _ConcurrentBatch:
                     )
                 continue
             for f in not_done:
-                f.cancel()
+                if f.cancel():
+                    lease = self._recovery_future_leases.get(f)
+                    if lease is not None:
+                        lease.cancel_before_start()
             # Release gate-parked workers BEFORE interrupt fan-out so none later
             # dispatches a tool the turn already reported as timed out / interrupted.
             self.gate.abandon()

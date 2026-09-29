@@ -581,8 +581,69 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     implicit transaction. Barriers are best-effort: on a malformed schema even ``PRAGMA synchronous=FULL`` raises,
     so whole-file rewrites call :func:`_reapply_durability_barriers` once the schema parses again."""
     conn = sqlite3.connect(str(db_path), timeout=timeout, isolation_level=None)
+    # Repair connections have no producer or RecoveryStore authority. Registering
+    # the same function names lets legacy-row probes work; protected rows still
+    # fail on every DML statement, including after a raw reopen.
+    conn.create_function("recovery_row_guard", 2, lambda _session_id, _mutation: 0)
+    conn.create_function("recovery_store_guard", 0, lambda: 0)
     _reapply_durability_barriers(conn)
     return conn
+
+
+def _recovery_repair_classification(
+    db_path: Path,
+    *,
+    connection: Optional[sqlite3.Connection] = None,
+) -> str:
+    """Prove legacy, or refuse when an admitted recovery ledger may be present.
+
+    Unreadable catalog or ledger state cannot establish that a backup or
+    promotion would preserve protected admission. A caller holding the repair
+    lock passes its existing connection so the probe does not block on itself.
+    """
+    if not db_path.exists():
+        return "legacy"  # a snapshot destination may not exist yet
+    try:
+        with contextlib.ExitStack() as owned:
+            conn = connection or owned.enter_context(
+                contextlib.closing(
+                    sqlite3.connect(f"{db_path.absolute().as_uri()}?mode=ro", uri=True)
+                )
+            )
+            # Guard triggers are installed in the same transaction as the first
+            # member. writable_schema permits catalog inspection when unrelated
+            # FTS entries are malformed; restore its connection-local value.
+            prior_writable = conn.execute("PRAGMA writable_schema").fetchone()[0]
+            conn.execute("PRAGMA writable_schema=ON")
+            try:
+                from hermes_state_recovery import RecoveryRefused
+                from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
+                try:
+                    catalog = _catalog(conn)
+                except RecoveryRefused:
+                    return "unknown"
+                if catalog in {"absent", "old_ordinary"}:
+                    return "legacy"
+                # Exclusion-only guards are now installed on every ordinary
+                # SessionDB. Their exact shape is checked by _catalog; claims
+                # themselves must survive, so repair cannot treat a claimed
+                # store as disposable ordinary data.
+                if conn.execute("SELECT 1 FROM recovery_exclusions LIMIT 1").fetchone():
+                    return "protected"
+                if catalog == "full" and _protected_exists(conn, catalog):
+                    return "protected"
+                return "legacy"
+            finally:
+                conn.execute(f"PRAGMA writable_schema={prior_writable}")
+    except (sqlite3.DatabaseError, OSError):
+        return "unknown"
+
+
+def _recovery_repair_refusal(classification: str) -> str:
+    if classification == "protected":
+        return "protected recovery store refuses schema repair"
+    return "unclassifiable recovery store refuses automatic schema repair"
 
 
 def _repair_conn(db_path: Path, *, timeout: float = 5.0):
@@ -666,6 +727,11 @@ def _copy_database_snapshot(source_path: Path, destination_path: Path, *,
     """Copy one complete SQLite snapshot without replacing either file inode: the online backup API folds
     committed WAL frames into the source snapshot and writes the destination in one transaction (rolled
     back if interrupted), so ``state.db`` is never swapped out from under handles that refer to it."""
+    source_class = _recovery_repair_classification(source_path, connection=source_connection)
+    destination_class = _recovery_repair_classification(destination_path, connection=destination_connection)
+    if source_class != "legacy" or destination_class != "legacy":
+        kind = "protected" if "protected" in (source_class, destination_class) else "unclassifiable"
+        raise sqlite3.DatabaseError(f"{kind} recovery store refuses repair backup")
     # Deadline first: a sidecar vanishing mid-stat must not leak a just-opened descriptor.
     deadline_seconds = _repair_snapshot_timeout_seconds(source_path)
     deadline = time.monotonic() + deadline_seconds
@@ -866,6 +932,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
         return report
+    classification = _recovery_repair_classification(db_path)
+    if classification != "legacy":
+        return _repair_skip(report, "aborted", _recovery_repair_refusal(classification))
     # Cross-restart cap: the in-memory claim bounds one process, but unhealable b-tree damage used to re-run
     # surgery + a fresh backup on EVERY restart.
     # Cross-restart attempt cap (#86747): the in-memory claim bounds one process, but a corruption class the
@@ -978,6 +1047,9 @@ def _repair_state_db_schema_locked(
     so recovery still depends on a human noticing a ``.malformed-backup-*`` file and knowing what to do with
     it. Not mutating the original in the first place is the property that holds without a human in the loop.
     """
+    classification = _recovery_repair_classification(db_path)
+    if classification != "legacy":
+        return _repair_skip(report, "aborted", _recovery_repair_refusal(classification))
     scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
     if (cleanup_error := _unlink_db_triple(scratch)) is not None:
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")

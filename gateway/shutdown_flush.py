@@ -63,29 +63,52 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
     return final_path
 
 
-def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
+def _flush_value(kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
         if serialised is None:
             return False
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
+        resolved = _claim_spool(serialised.get("session_id"))
+        if resolved is not None:
+            serialised["session_id"] = resolved
+        _write_payload(_get_flush_dir(), {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
         return False
 
 
+def _claim_spool(session_id: Optional[str], *, db_path: Path | None = None) -> str | None:
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = db_path if db_path is not None else selected_state_db_path(None)
+    if session_id is not None and type(session_id) is not str:
+        raise RecoveryRefused("invalid_ordinary_identity")
+    if session_id:
+        return claim_exact_ordinary(path, (session_id,)).resolved_ids[0]
+    claim_unscoped_ordinary(path)
+    return None
+
+
+def _session_db_path(session_db) -> Path:
+    from hermes_recovery_dispatch import selected_state_db_path
+
+    return selected_state_db_path(session_db)
+
+
 def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
     """Serialise non-empty ``_pending_messages`` slots (``MessageEvent`` or str); return count."""
     if not pending:
         return 0
-    flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
+    ts, flushed = int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
-            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts)
+            flushed += _flush_value("pending", session_key, value, reason=reason, ts=ts)
     if flushed:
-        logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
+        logger.info("Flushed %d pending message(s) (reason=%s)", flushed, reason)
     return flushed
 
 
@@ -98,17 +121,16 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
     """
     if not overflow_by_session:
         return 0
-    flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
+    ts, flushed = int(time.time()), 0
     for session_key, events in list(overflow_by_session.items()):
         if not session_key or not events:
             continue
         for seq, value in enumerate(list(events)):
             if value is not None:
-                flushed += _flush_value(flush_dir, "overflow", session_key, value, reason=reason,
+                flushed += _flush_value("overflow", session_key, value, reason=reason,
                                         ts=ts, seq=seq)
     if flushed:
-        logger.info("Flushed %d queued overflow message(s) to %s (reason=%s)", flushed, flush_dir,
-                    reason)
+        logger.info("Flushed %d queued overflow message(s) (reason=%s)", flushed, reason)
     return flushed
 
 
@@ -120,6 +142,7 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
     discards user data while the process stays up (#78182).
     """
     try:
+        session_id = _claim_spool(session_id)
         return _write_payload(_get_flush_dir(), {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
             "seq": next(_TRANSCRIPT_SPOOL_SEQ),
@@ -136,8 +159,15 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
     only after its replay succeeds. The first failure stops the drain (the DB is likely still
     unhealthy) and keeps the rest for retry.
     """
+    resolved = _claim_spool(session_id)
+    if resolved != session_id:
+        from hermes_state_recovery import RecoveryRefused
+
+        raise RecoveryRefused("protected_session_authority_unavailable")
     try:
-        candidates = list(_get_flush_dir().glob("pending-*.json"))
+        from hermes_constants import get_hermes_home
+
+        candidates = list((get_hermes_home() / "pending_messages").glob("pending-*.json"))
     except Exception as exc:
         logger.debug("Cannot scan transcript spool: %s", exc)
         return 0, 0
@@ -204,13 +234,13 @@ def recover_pending_to_db(session_db=None) -> int:
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
     Returns the number of messages recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
+    from hermes_constants import get_hermes_home
+
+    flush_files = sorted((get_hermes_home() / "pending_messages").glob("*.json"))
     if not flush_files:
         return 0
+    from hermes_state_recovery import RecoveryRefused
     own_db = session_db is None
-    if own_db:
-        from hermes_state_registry import acquire
-        session_db = acquire()
     recovered = 0
     try:
         for path in flush_files:
@@ -218,11 +248,30 @@ def recover_pending_to_db(session_db=None) -> int:
             # Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
-            if _recover_one_payload(session_db, path, payload):
-                recovered += 1
-                path.unlink(missing_ok=True)
+            data = payload.get("data") or {}
+            replay_id = (data.get("session_id") if isinstance(data, dict) else None)
+            if not isinstance(replay_id, str) or not replay_id:
+                logger.warning("Retaining transcript replay without an exact session ID: %s", path)
+                continue
+            try:
+                claimed_path = _session_db_path(session_db)
+                resolved_id = _claim_spool(replay_id, db_path=claimed_path)
+            except RecoveryRefused:
+                logger.warning("Refusing unsupported or unclassifiable transcript replay from %s", path)
+                continue  # The file is retained for a later operator decision.
+            if own_db and session_db is None:
+                from hermes_state_registry import acquire
+                session_db = acquire()
+            try:
+                if _session_db_path(session_db).resolve() != claimed_path.resolve():
+                    raise RecoveryRefused("protected_session_authority_unavailable")
+                if _recover_one_payload(session_db, path, payload, resolved_id=resolved_id):
+                    recovered += 1
+                    path.unlink(missing_ok=True)
+            except RecoveryRefused:
+                logger.warning("Refusing or deferring transcript replay from %s", path, exc_info=True)
     finally:
-        if own_db:  # shutdown cancellation/interrupt must not strand an owned DB
+        if own_db and session_db is not None:  # shutdown must not strand an owned DB
             with contextlib.suppress(Exception):
                 from hermes_state_registry import release_or_close
                 release_or_close(session_db)
@@ -231,7 +280,8 @@ def recover_pending_to_db(session_db=None) -> int:
     return recovered
 
 
-def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> bool:
+def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any],
+                         *, resolved_id: str) -> bool:
     """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
@@ -243,7 +293,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
             logger.warning("Cannot recover structurally invalid transcript spool "
                            "file %s; preserved for manual inspection", path)
             return False
-        session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
+        session_db.append_message(session_id=resolved_id, role=message.get("role", "unknown"),
                                   content=message.get("content") or "",
                                   timestamp=message.get("timestamp") or payload.get("ts"))
         return True
@@ -261,7 +311,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
                        "session_key-to-id resolution is not available at this recovery stage. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    session_db.append_message(session_id=session_id, role="user", content=text,
+    session_db.append_message(session_id=resolved_id, role="user", content=text,
                               timestamp=payload.get("ts", int(time.time())))
     return True
 
@@ -274,6 +324,7 @@ def flush_agent_history_to_file(session_id: Optional[str], history: list) -> Non
     if not history:
         return
     try:
+        _claim_spool(session_id)
         flush_dir = _get_flush_dir()
         snapshot = []
         for _m in history:

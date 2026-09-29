@@ -241,6 +241,8 @@ class _NonStreamRequest:
 
     def run(self):
         agent, wd = self.agent, self.wd
+        from agent.recovery_producers import current_registry
+        registry = current_registry()
         if wd.codex:
             # Reset before the worker starts so a marker left over from a previous
             # call on this agent can't be misread as the first event for this one.
@@ -250,14 +252,19 @@ class _NonStreamRequest:
                 self.codex_watchdog_state.retry_started_ts = None
         agent._touch_activity("waiting for non-streaming API response")
 
-        self.thread = t = h.threading.Thread(target=h._context_thread_target(self._call), daemon=True)
-        observer = getattr(self.agent, "_tool_send_observer", None)
-        self._tool_diagnostic_worker_registered = observer is not None
-        if observer is not None:
-            observer.register_worker()
+        sdk_lease = registry.enter(registry.permit, "sdk") if registry is not None else None
+        target = self._call if sdk_lease is None else lambda: sdk_lease.run(self._call)
+        observer = None
         try:
+            self.thread = t = h.threading.Thread(target=h._context_thread_target(target), daemon=True)
+            observer = getattr(self.agent, "_tool_send_observer", None)
+            self._tool_diagnostic_worker_registered = observer is not None
+            if observer is not None:
+                observer.register_worker()
             t.start()
         except BaseException:
+            if sdk_lease is not None:
+                sdk_lease.cancel_before_start()
             if observer is not None:
                 observer.close_worker()
             raise

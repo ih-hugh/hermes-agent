@@ -16,6 +16,8 @@ import json
 import threading
 from unittest.mock import patch
 
+import pytest
+
 from tools.cronjob_tools import (
     _try_dispatch_background_run,
     cronjob,
@@ -185,7 +187,7 @@ class TestSyncFallbacks:
         with _bound_session_key():
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("tools.async_delegation.dispatch_async_delegation",
-                       return_value={"status": "rejected", "error": "capacity"}), \
+                       return_value={"status": "rejected", "code": "capacity", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
@@ -193,6 +195,25 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+
+    @pytest.mark.parametrize("dispatch", [
+        {"status": "rejected", "code": "protected_session_dispatch",
+         "error": "protected_session_dispatch"},
+        {"status": "unknown", "code": "delegation_persistence_unknown",
+         "error": "delegation_persistence_unknown", "delegation_id": "deleg_uncertain"},
+    ])
+    def test_protection_or_unknown_dispatch_does_not_run_inline(self, dispatch):
+        with _bound_session_key():
+            with patch("tools.cronjob_tools.claim_job_for_fire",
+                       side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                 patch("tools.async_delegation.dispatch_async_delegation", return_value=dispatch), \
+                 patch("cron.scheduler.run_one_job") as m_run:
+                res = _try_dispatch_background_run(_job("job-bg-refused"))
+        assert res["dispatched"] is False
+        assert res["success"] is False
+        assert res["dispatch_status"] == dispatch["status"]
+        assert res["code"] == dispatch["code"]
+        m_run.assert_not_called()
 
 
 class TestInFlightDedupe:

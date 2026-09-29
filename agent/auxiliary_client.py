@@ -2430,6 +2430,8 @@ def _relay_auxiliary_call(callback):
     """Give every physical retry in one auxiliary call a shared Relay identity."""
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
+        from agent.recovery_producers import refuse_untracked_work
+        refuse_untracked_work()
         with _relay_aux_call_scope(args, kwargs):
             return callback(*args, **kwargs)
     return wrapped
@@ -2439,6 +2441,8 @@ def _relay_auxiliary_call_async(callback):
     """Async counterpart to :func:`_relay_auxiliary_call`."""
     @functools.wraps(callback)
     async def wrapped(*args, **kwargs):
+        from agent.recovery_producers import refuse_untracked_work
+        refuse_untracked_work()
         with _relay_aux_call_scope(args, kwargs):
             return await callback(*args, **kwargs)
     return wrapped
@@ -5053,6 +5057,8 @@ def resolve_provider_client(
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
+    from agent.recovery_producers import refuse_untracked_work
+    refuse_untracked_work()
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
@@ -7237,6 +7243,8 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    from agent.recovery_producers import refuse_untracked_work
+    refuse_untracked_work()
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -7535,6 +7543,8 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    from agent.recovery_producers import refuse_untracked_work
+    refuse_untracked_work()
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()

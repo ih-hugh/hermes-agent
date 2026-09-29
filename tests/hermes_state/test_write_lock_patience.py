@@ -139,12 +139,17 @@ class TestOpenLockPatience:
 
     def test_open_propagates_non_lock_errors_immediately(self, tmp_path):
         """A non-lock open failure must not sit in the patience loop."""
-        # A directory is not openable as a database file — raises an
-        # OperationalError that is NOT the locked/busy class.
+        from hermes_state_recovery import RecoveryRefused
+
+        # A directory cannot carry inspectable recovery authority. Refuse it
+        # before SQLite opens or the lock-patience loop can start.
         bad_path = tmp_path / "state.db"
         bad_path.mkdir()
+        before = set(tmp_path.iterdir())
         t0 = time.monotonic()
-        with pytest.raises(sqlite3.Error):
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
             SessionDB(db_path=bad_path)
         # Must fail well before a full patience window (loose bound).
         assert time.monotonic() - t0 < 15.0
+        assert set(tmp_path.iterdir()) == before
+        assert list(bad_path.iterdir()) == []

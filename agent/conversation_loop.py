@@ -1394,6 +1394,9 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
     while s.retry_count < s.max_retries:
+        from agent.recovery_producers import require_supported_chat_agent, require_unmanaged_dispatch
+        require_supported_chat_agent(agent)
+        require_unmanaged_dispatch()
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
@@ -1445,6 +1448,12 @@ def _run_conversation_turn(
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message
         )
+
+    # Protected work must refuse unsupported callbacks and MoA before turn context,
+    # prompt construction, MCP refresh, or request assembly can invoke them.
+    from agent.recovery_producers import require_supported_chat_agent, require_unmanaged_dispatch
+    require_supported_chat_agent(agent, moa_config=moa_config)
+    require_unmanaged_dispatch()
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.

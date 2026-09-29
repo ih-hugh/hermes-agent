@@ -340,26 +340,168 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, *, recovery_permit: object = None,
+        recovery_write_id: Optional[str] = None, recovery_payload_sha256: Optional[str] = None,
+        recovery_prepared_batch: object = None) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
         if not messages:
             return 0
+        protected_ack = any(value is not None for value in
+                            (recovery_permit, recovery_write_id, recovery_payload_sha256,
+                             recovery_prepared_batch))
+        if protected_ack and (recovery_permit is None or recovery_write_id is None
+                              or recovery_payload_sha256 is None or chunk_rows is not None):
+            from hermes_state_recovery import RecoveryRefused
+            raise RecoveryRefused("invalid_recovery_write")
         if chunk_rows is not None and len(messages) > chunk_rows:
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds)
                 for start in range(0, len(messages), chunk_rows))
+        prepared = None
+        validated_rows = messages
+        if protected_ack:
+            from agent.recovery_context import write_binding
+            from hermes_state_recovery import RecoveryRefused, RecoveryStore
+            from hermes_state_recovery_message_result import (
+                PreparedMessageBatch, prepare_message_batch, read_message_result,
+            )
+
+            binding = write_binding(recovery_permit, RecoveryStore(self))
+            if binding is None or binding[0].session_id != session_id:
+                raise RecoveryRefused("invalid_write_permit")
+            if recovery_prepared_batch is not None:
+                if not isinstance(recovery_prepared_batch, PreparedMessageBatch):
+                    raise RecoveryRefused("invalid_recovery_write")
+                prepared = recovery_prepared_batch
+                if (prepare_message_batch(prepared.fresh_rows()) != prepared
+                        or not prepared.matches_input(messages)):
+                    raise RecoveryRefused("write_payload_conflict")
+            else:
+                prepared = prepare_message_batch(messages)
+                if prepared.payload_sha256 != recovery_payload_sha256:
+                    # A committed direct retry may carry the exact output row ID.
+                    # Recover its original target only after the committed result
+                    # proves that this is the output for this input position.
+                    result = self._read_message_write_result(
+                        recovery_permit, recovery_write_id, recovery_payload_sha256)
+                    if len(result.outcomes) != len(messages):
+                        raise RecoveryRefused("write_payload_conflict")
+                    normalized = [dict(row) for row in messages]
+                    for row, outcome in zip(normalized, result.outcomes):
+                        if row.get("_row_id") != outcome.actual_message_id:
+                            raise RecoveryRefused("write_payload_conflict")
+                        if outcome.requested_target_id is None:
+                            row.pop("_row_id", None)
+                        else:
+                            row["_row_id"] = outcome.requested_target_id
+                    prepared = prepare_message_batch(normalized)
+                    validated_rows = normalized
+            if prepared.payload_sha256 != recovery_payload_sha256:
+                raise RecoveryRefused("write_payload_conflict")
+
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             from agent.transcript_repair import resolve_and_repair_transcript_batch
-            inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, messages,
+            rows = prepared.fresh_rows() if protected_ack else messages
+            requested_targets = [row.get("_row_id") for row in rows] if protected_ack else []
+            inserted_rows, dispositions = resolve_and_repair_transcript_batch(conn, session_id, rows,
                 encode_content_fn=self._encode_content, decode_content_fn=self._decode_content)
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
+            if protected_ack:
+                from hermes_state_recovery_message_result import MessageOutcomeV1, MessageWriteResultV1
+
+                outcomes = tuple(
+                    disposition if disposition is not None else MessageOutcomeV1(
+                        "inserted", requested_targets[i], row.get("_row_id"))
+                    for i, (row, disposition) in enumerate(zip(rows, dispositions))
+                )
+                return MessageWriteResultV1(outcomes).to_ack_value()
             return inserted
+        if protected_ack:
+            from hermes_state_recovery_guard import guarded_write
+            ack = guarded_write(self, recovery_permit, "message", recovery_write_id,
+                                recovery_payload_sha256, _do)
+            result = read_message_result(ack.result)
+            self.restore_committed_message_batch(
+                recovery_permit, recovery_write_id, recovery_payload_sha256, prepared, validated_rows)
+            if validated_rows is not messages:
+                for destination, source in zip(messages, validated_rows):
+                    destination["_row_id"] = source["_row_id"]
+                    if "_canonical_content" in source:
+                        destination["_canonical_content"] = source["_canonical_content"]
+            return result.inserted_count
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def _read_message_write_result(self, permit, write_id: str, digest: str):
+        """Read one exact-member committed result from a process-owned permit."""
+        from agent.recovery_context import write_binding
+        from hermes_state_recovery import RecoveryRefused, RecoveryStore
+        from hermes_state_recovery_message_result import read_message_result
+
+        binding = write_binding(permit, RecoveryStore(self))
+        if binding is None:
+            raise RecoveryRefused("invalid_write_permit")
+        scope, run_id, generation = binding
+        row = self._read_one(
+            "SELECT a.state,a.payload_sha256,a.result_json FROM recovery_write_acks a "
+            "JOIN recovery_sessions s ON s.session_id=a.session_id "
+            "WHERE a.write_id=? AND a.session_id=? AND s.profile=? AND s.scope_digest=? "
+            "AND a.run_id=? AND a.generation=? AND a.mutation='message'",
+            (write_id, scope.session_id, scope.profile, scope.scope_digest, run_id, generation),
+        )
+        if row is None or row[0] != "committed" or row[1] != digest:
+            raise RecoveryRefused("write_payload_conflict")
+        return read_message_result(row[2])
+
+    def restore_committed_message_batch(
+        self, permit, write_id: str, digest: str, prepared, messages: List[Dict[str, Any]],
+    ) -> int:
+        """Validate exact committed IDs/roles and restore markers after lost responses."""
+        from agent.recovery_context import write_binding
+        from hermes_state_recovery import RecoveryRefused, RecoveryStore
+        from hermes_state_recovery_message_result import read_message_result
+
+        binding = write_binding(permit, RecoveryStore(self))
+        if binding is None:
+            raise RecoveryRefused("invalid_write_permit")
+        scope, run_id, generation = binding
+        if not prepared.matches_input(messages):
+            raise RecoveryRefused("write_payload_conflict")
+        expected_rows = prepared.fresh_rows()
+        with self._read_ctx() as conn:
+            ack = conn.execute(
+                "SELECT a.state,a.payload_sha256,a.result_json FROM recovery_write_acks a "
+                "JOIN recovery_sessions s ON s.session_id=a.session_id "
+                "WHERE a.write_id=? AND a.session_id=? AND s.profile=? AND s.scope_digest=? "
+                "AND a.run_id=? AND a.generation=? AND a.mutation='message'",
+                (write_id, scope.session_id, scope.profile, scope.scope_digest, run_id, generation),
+            ).fetchone()
+            if ack is None or ack[0] != "committed" or ack[1] != digest:
+                raise RecoveryRefused("write_payload_conflict")
+            result = read_message_result(ack[2])
+            if len(result.outcomes) != len(expected_rows):
+                raise RecoveryRefused("invalid_message_write_result")
+            restored = []
+            for expected, outcome in zip(expected_rows, result.outcomes):
+                if expected.get("_row_id") != outcome.requested_target_id:
+                    raise RecoveryRefused("invalid_message_write_result")
+                row = conn.execute(
+                    "SELECT role,content FROM messages WHERE id=? AND session_id=?",
+                    (outcome.actual_message_id, scope.session_id),
+                ).fetchone()
+                if row is None or row[0] != expected.get("role", "unknown"):
+                    raise RecoveryRefused("invalid_message_write_result")
+                restored.append((outcome.actual_message_id,
+                                 self._decode_content(row[1]) if outcome.kind == "adopted" else None))
+        for message, (row_id, adopted_content) in zip(messages, restored):
+            message["_row_id"] = row_id
+            if adopted_content is not None:
+                message["_canonical_content"] = adopted_content
+        return result.inserted_count
 
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
                                                  display_kind: str,
@@ -848,7 +990,7 @@ class SessionMessagesMixin:
         # before_rows includes the anchor itself.
         return {"window": window_msgs, "messages_before": max(0, len(before_rows) - 1), "messages_after": len(after_rows)}
 
-    def resolve_resume_session_id(self, session_id: str) -> str:
+    def resolve_resume_session_id(self, session_id: str, *, strict: bool = False) -> str:
         """Redirect a resume target to the descendant holding the messages: follow the compression chain to
         the live tip (lineage-aware, so delegate/branch children never hijack it), then walk
         ``parent_session_id`` forward to the DEEPEST node with messages (a continuation may hold newer
@@ -862,9 +1004,10 @@ class SessionMessagesMixin:
         if not session_id:
             return session_id
         try:
-            session_id = self.get_compression_tip(session_id) or session_id
+            session_id = self.get_compression_tip(session_id, strict=strict) or session_id
         except Exception:
-            pass
+            if strict:
+                raise
         with self._read_ctx() as conn:
             current = session_id
             seen = {current}
@@ -882,11 +1025,20 @@ class SessionMessagesMixin:
                         "  AND COALESCE(child.source, '') != 'tool' "
                         "ORDER BY child.started_at DESC, child.id DESC LIMIT 1", (current,)).fetchone()
                 except Exception:
+                    if strict:
+                        raise
                     return session_id
-                if child_row is None or not child_row["id"] or child_row["id"] in seen:
+                if child_row is None:
+                    break
+                if not child_row["id"] or child_row["id"] in seen:
+                    if strict:
+                        raise RuntimeError("resume continuation cycle or missing child id")
                     break
                 current = child_row["id"]
                 seen.add(current)
+            else:
+                if strict:
+                    raise RuntimeError("resume continuation depth exhausted")
             return best if best is not None else session_id
 
     def _fetch_conversation_rows(self, session_ids: List[str], active_clause: str, *, with_session_id: bool):

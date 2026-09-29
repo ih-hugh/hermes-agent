@@ -147,19 +147,24 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
     (NUL byte) is not a script: feeding it to the guard tokenizes machine code
     into bogus paths and crashes the scanner, so it yields None."""
     if env is None:
+        from agent.recovery_producers import refuse_untracked_work
+        refuse_untracked_work()
         return None
-    try:
-        local_path = Path(script_path).expanduser()
-        if not local_path.is_absolute():
-            local_path = Path(guard_cwd) / local_path
-        if local_path.is_file():
-            metadata = local_path.stat()
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes:
-                data = local_path.read_bytes()
-                if len(data) <= max_bytes:
-                    return None if b"\x00" in data else data.decode("utf-8", errors="replace")
-    except Exception:
-        pass
+    from agent.recovery_producers import current_registry
+    protected = current_registry() is not None
+    if not protected:
+        try:
+            local_path = Path(script_path).expanduser()
+            if not local_path.is_absolute():
+                local_path = Path(guard_cwd) / local_path
+            if local_path.is_file():
+                metadata = local_path.stat()
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= max_bytes:
+                    data = local_path.read_bytes()
+                    if len(data) <= max_bytes:
+                        return None if b"\x00" in data else data.decode("utf-8", errors="replace")
+        except Exception:
+            pass
     # Remote backend: bound the read at the source with `head -c` so an
     # oversized binary never crosses the wire (an unbounded `cat` once
     # pinned the gateway's tool thread for 30+ min on a shlex scan). One
@@ -169,9 +174,18 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
         result = env.execute(f"head -c {max_bytes + 1} < {shlex.quote(script_path)}")
         if result.get("returncode", -1) == 0:
             output = result.get("output", "")
+            if protected and (not isinstance(output, str) or len(output.encode("utf-8")) > max_bytes
+                              or "\x00" in output):
+                from agent.recovery_producers import refuse_untracked_work
+                refuse_untracked_work()
             return None if output and "\x00" in output else output
     except Exception:
+        if protected:
+            raise
         pass
+    if protected:
+        from agent.recovery_producers import refuse_untracked_work
+        refuse_untracked_work()
     return None
 
 

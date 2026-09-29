@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 
@@ -41,31 +39,25 @@ def test_is_zeroed_never_probes_special_files(tmp_path):
     assert hs.is_zeroed_state_db(fifo) is False
 
 
-def test_sessiondb_opens_fresh_after_zeroed_quarantine(tmp_path, monkeypatch):
+def test_sessiondb_refuses_preexisting_zeroed_store_without_quarantine(tmp_path, monkeypatch):
     import hermes_state as hs
+    from hermes_state_recovery import RecoveryRefused
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
     db.write_bytes(bytes(4096))
 
-    sdb = hs.SessionDB(db_path=db)
-    try:
-        # Fresh DB should open and accept schema
-        assert db.exists()
-        assert not hs.is_zeroed_state_db(db)
-        # Quarantine retained
-        backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-        assert len(backups) == 1
-        assert backups[0].stat().st_size == 4096
-    finally:
-        sdb.close()
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        hs.SessionDB(db_path=db)
+    assert db.read_bytes() == bytes(4096)
+    assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
 
-def test_sessiondb_quarantines_page_zero_clobber_before_open(tmp_path, monkeypatch):
-    """#102198: preserve a non-SQLite page 0 instead of opening degraded."""
-    import sqlite3
+def test_sessiondb_refuses_page_zero_clobber_before_open(tmp_path, monkeypatch):
+    """Unknown prior authority keeps original bytes and sidecars untouched."""
 
     import hermes_state as hs
+    from hermes_state_recovery import RecoveryRefused
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
@@ -77,86 +69,45 @@ def test_sessiondb_quarantines_page_zero_clobber_before_open(tmp_path, monkeypat
     assert hs.has_invalid_sqlite_header_preopen(db) is True
     assert hs.is_zeroed_state_db(db) is False
 
-    sdb = hs.SessionDB(db_path=db)
-    try:
-        backups = list(tmp_path.glob("state.db.notadb-*.bak"))
-        assert len(backups) == 1
-        assert backups[0].read_bytes() == clobbered
-        assert Path(str(backups[0]) + "-wal").read_bytes() == b"wal evidence"
-        assert Path(str(backups[0]) + "-shm").read_bytes() == b"shm evidence"
-        assert db.read_bytes().startswith(b"SQLite format 3\x00")
-        sdb.create_session(session_id="after-quarantine", source="test")
-    finally:
-        sdb.close()
-
-    conn = sqlite3.connect(str(db))
-    try:
-        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        conn.close()
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        hs.SessionDB(db_path=db)
+    assert db.read_bytes() == clobbered
+    assert (tmp_path / "state.db-wal").read_bytes() == b"wal evidence"
+    assert (tmp_path / "state.db-shm").read_bytes() == b"shm evidence"
+    assert not list(tmp_path.glob("state.db.notadb-*.bak"))
 
 
-def test_is_zeroed_state_db_zero_byte_quarantine(tmp_path, monkeypatch):
-    """#97568: a 0-byte file must be detected as zeroed and quarantined."""
+def test_is_zeroed_state_db_zero_byte_refusal(tmp_path, monkeypatch):
+    """A pre-existing 0-byte file is not a newly created empty catalog."""
     import hermes_state as hs
+    from hermes_state_recovery import RecoveryRefused
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
     db.write_bytes(b"")  # 0-byte truncated file
     assert hs.is_zeroed_state_db(db) is True
 
-    sdb = hs.SessionDB(db_path=db)
-    try:
-        # Fresh DB should open and accept schema
-        assert db.exists()
-        assert not hs.is_zeroed_state_db(db)
-        # Quarantine retained for the 0-byte file
-        backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-        assert len(backups) == 1
-        assert backups[0].stat().st_size == 0
-        # Check store provenance was recorded in state_meta
-        row_instance = sdb._conn.execute(
-            "SELECT value FROM state_meta WHERE key = 'store_instance_id'"
-        ).fetchone()
-        row_created = sdb._conn.execute(
-            "SELECT value FROM state_meta WHERE key = 'store_created_at_utc'"
-        ).fetchone()
-        assert row_instance is not None and row_instance[0]
-        assert row_created is not None and row_created[0]
-    finally:
-        sdb.close()
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        hs.SessionDB(db_path=db)
+    assert db.exists() and db.stat().st_size == 0
+    assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
 
-def test_concurrent_quarantine_no_clobber(tmp_path):
-    """#68805: two concurrent startups must not race on quarantine.
-
-    Without the cross-process lock, the second process could move its
-    newly-created empty DB over the first process's quarantine backup,
-    erasing the original damaged-file evidence. With the lock, the
-    second process re-checks under the lock, finds the file no longer
-    zeroed (or gone), and returns without clobbering.
-    """
+def test_concurrent_openers_refuse_unknown_zeroed_store(tmp_path):
+    """Neither opener may replace an unclassifiable historical store."""
     import hermes_state as hs
     import threading
-    import sqlite3
+    from hermes_state_recovery import RecoveryRefused
 
     db = tmp_path / "state.db"
     db.write_bytes(bytes(4096))  # zeroed (all-NUL) 4 KB file
 
-    results: list = [None, None]
     errors: list = [None, None]
 
     def worker(idx):
         try:
-            # Each worker opens its own SessionDB on the same path.
-            # The first one quarantines the zeroed file and creates a
-            # fresh DB. The second one should find a valid DB (or no
-            # file) under the lock and NOT clobber the quarantine.
             sdb = hs.SessionDB(db_path=db)
-            try:
-                results[idx] = "ok"
-            finally:
-                sdb.close()
+            sdb.close()
         except Exception as exc:
             errors[idx] = exc
 
@@ -167,26 +118,10 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
     t1.join(timeout=10)
     t2.join(timeout=10)
 
-    # Both workers should complete without error
-    assert errors[0] is None, f"Worker 0 raised: {errors[0]}"
-    assert errors[1] is None, f"Worker 1 raised: {errors[1]}"
-
-    # The quarantine backup must survive — exactly one .bak file with
-    # the original 4096 zeroed bytes.
-    backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-    assert len(backups) >= 1, "At least one quarantine backup must exist"
-    for bak in backups:
-        assert bak.stat().st_size == 4096, (
-            f"Quarantine backup {bak} was clobbered: "
-            f"expected 4096 bytes, got {bak.stat().st_size}"
-        )
-
-    # The live state.db must be a valid (non-zeroed) SQLite database
-    assert db.exists()
-    assert not hs.is_zeroed_state_db(db)
-    conn = sqlite3.connect(str(db))
-    conn.execute("SELECT 1")
-    conn.close()
+    assert all(isinstance(error, RecoveryRefused) and
+               error.code == "protected_session_authority_unavailable" for error in errors)
+    assert db.read_bytes() == bytes(4096)
+    assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
 
 def test_quarantine_fails_closed_when_lock_held(tmp_path):
@@ -267,6 +202,7 @@ def test_concurrent_openers_zero_byte_startup_serialization(tmp_path, monkeypatc
     """
     import hermes_state as hs
     import threading
+    from hermes_state_recovery import RecoveryRefused
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
@@ -294,10 +230,13 @@ def test_concurrent_openers_zero_byte_startup_serialization(tmp_path, monkeypatc
     t1.join(timeout=10)
     t2.join(timeout=10)
 
-    assert errors[0] is None, f"Opener 0 failed: {errors[0]}"
-    assert errors[1] is None, f"Opener 1 failed: {errors[1]}"
-    assert results[0] == "ok"
-    assert results[1] == "ok"
+    assert results.count("ok") >= 1
+    assert all(error is None or (isinstance(error, RecoveryRefused) and
+               error.code == "protected_session_authority_unavailable") for error in errors)
+    # An opener seeing the first initializer's temporary empty inode may
+    # refuse; after its commit the same ordinary opener can retry.
+    retry = hs.SessionDB(db_path=db)
+    retry.close()
 
     # No spurious quarantine backups should have been created
     backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
@@ -306,12 +245,11 @@ def test_concurrent_openers_zero_byte_startup_serialization(tmp_path, monkeypatc
     assert not hs.is_zeroed_state_db(db)
 
 
-def test_live_connection_0_byte_not_quarantined_in_process(tmp_path, monkeypatch):
-    """#97580: A live 0-byte connection tracked in this process must not be
-    quarantined by is_zeroed_state_db / SessionDB.
-    """
+def test_live_connection_0_byte_is_not_sufficient_authority_proof(tmp_path, monkeypatch):
+    """A tracked connection prevents quarantine, but not authority refusal."""
     import hermes_state as hs
     from hermes_cli.sqlite_safe_read import connect_tracked
+    from hermes_state_recovery import RecoveryRefused
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
@@ -323,13 +261,10 @@ def test_live_connection_0_byte_not_quarantined_in_process(tmp_path, monkeypatch
         # is_zeroed_state_db must recognize the live connection and refuse to declare it zeroed
         assert hs.is_zeroed_state_db(db) is False
 
-        # SessionDB open must not quarantine this live file
-        sdb = hs.SessionDB(db_path=db)
-        try:
-            backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-            assert len(backups) == 0, f"Spurious quarantine occurred: {backups}"
-        finally:
-            sdb.close()
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            hs.SessionDB(db_path=db)
+        assert db.stat().st_size == 0
+        assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
         # The original connection can still write safely
         conn.execute("CREATE TABLE live_check (id INTEGER)")

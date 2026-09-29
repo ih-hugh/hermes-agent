@@ -1,0 +1,623 @@
+"""Physical SDK and callback runtime paths for protected runs."""
+
+from __future__ import annotations
+
+from tests.recovery_provider_fixture import provider_admission
+
+import asyncio
+from contextlib import nullcontext
+from pathlib import Path
+import sys
+from threading import Event, Thread
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from agent.recovery_context import (
+    bind_write_permit, current_incarnation, issue_producer_permit,
+    issue_usage_write_permit, issue_write_permit,
+)
+from agent.recovery_producers import (
+    ProducerRegistry,
+    SendOutcome,
+    begin_chat_send,
+    finish_unknown_if_active,
+)
+from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, SealRequest
+from hermes_state import SessionDB
+from hermes_state_recovery import AdmissionIdentity, RecoveryRefused, RecoveryScope, RecoveryStore, membership_sha256
+from hermes_state_usage import UsageDelta
+from hermes_state_recovery_provider import SelectedProviderCapture
+
+
+class _SelectedTestProvider:
+    pass
+
+
+def _admitted(tmp_path: Path):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
+    result = store.reserve(
+        RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "run_root", current_incarnation(), provider_admission(scope.session_id)),
+    )
+    registry = ProducerRegistry(
+        store, scope, "run_root", 0, issue_producer_permit(store, result.handoff))
+    return db, store, scope, registry
+
+
+def _close(store: RecoveryStore, scope: RecoveryScope):
+    return store.begin_close(scope, SealRequest(
+        request_id=str(uuid4()), session_id=scope.session_id, run_ids=["run_root"],
+        expected_membership_sha256=membership_sha256(["run_root"])))
+
+
+def _install_selected_plugin_fixture(registry: ProducerRegistry, monkeypatch):
+    """Represent the selected shim's one real registration, without loading Docker."""
+    from hermes_cli.plugins import LoadedPlugin, get_plugin_manager
+    from hermes_cli.plugins_ledger import PluginRegistration
+    from hermes_cli.plugins_manifest import PluginManifest
+    from tools import terminal_tool, terminal_tool_config
+
+    selected = _SelectedTestProvider()
+    registry.provider_capture = SelectedProviderCapture(
+        provider_admission(registry.scope.session_id), selected)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "byf_workspace"})
+    monkeypatch.setattr(terminal_tool_config, "_get_plugin_env_provider", lambda _: selected)
+    manager = get_plugin_manager()
+    manifest = PluginManifest(name="byf_workspace", source="user", kind="backend")
+    loaded = LoadedPlugin(manifest=manifest, module=sys.modules[__name__], enabled=True)
+    owned = PluginRegistration(
+        kind="terminal_environment_provider", key="byf_workspace",
+        release=lambda: None, plugin_key="byf_workspace")
+    monkeypatch.setattr(manager, "_plugins", {**manager._plugins, "byf_workspace": loaded})
+    monkeypatch.setattr(
+        manager, "_ownership_ledger", {**manager._ownership_ledger, "byf_workspace": [owned]})
+    monkeypatch.setattr(manager, "_discovered", True)
+    return manager, owned
+
+
+def _supported_send_stub(registry: ProducerRegistry, monkeypatch, **extra):
+    """Minimal sender for ledger tests; a separate test constructs the real AIAgent."""
+    from agent.context_compressor import ContextCompressor
+    from tools import terminal_tool
+    from tools.registry import registry as tool_registry
+
+    _install_selected_plugin_fixture(registry, monkeypatch)
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openai", model="test",
+        base_url="https://provider.invalid", is_subagent=False, _fallback_index=0,
+        _fallback_chain=[], enabled_toolsets=["terminal_only"],
+        tools=[{"type": "function", "function": terminal_tool.TERMINAL_SCHEMA}],
+        valid_tool_names={"terminal"},
+        _tool_snapshot_generation=tool_registry._generation,
+        context_compressor=ContextCompressor.__new__(ContextCompressor),
+        skip_background_review=True, _memory_manager=None, _memory_store=None,
+    )
+    for name, value in extra.items():
+        setattr(agent, name, value)
+    return agent
+
+
+def _request_kwargs(agent, *, stream=False):
+    kwargs = {"model": agent.model, "messages": [{"role": "user", "content": "scratch"}],
+              "tools": agent.tools}
+    if stream:
+        import httpx
+        kwargs["stream"] = True
+        kwargs["timeout"] = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+    return kwargs
+
+
+def test_nonstream_create_records_exact_send_and_response(tmp_path: Path, monkeypatch):
+    from openai import OpenAI
+    from agent import chat_completion_helpers as helpers
+    from agent import tool_diagnostic_transport
+
+    db, store, scope, registry = _admitted(tmp_path)
+    response = object()
+    client = OpenAI(api_key="test", max_retries=0)
+    monkeypatch.setattr(client.chat.completions, "create", lambda **kw: response)
+    agent = _supported_send_stub(registry, monkeypatch)
+    monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+        nonstream_kwargs = _request_kwargs(agent)
+        nonstream_kwargs["stream"] = False
+        sdk.run(lambda: helpers._dispatch_nonstreaming_api_request(
+            agent, nonstream_kwargs, make_client=lambda *_: client))
+        assert len(store.send_inventory(scope, "run_root")) == 1
+        send = registry.claim_response_send(response)
+        assert send is not None and registry.claim_response_send(response) is None
+        send.finish(SendOutcome(kind="unknown", attempt_id=send.attempt_id,
+                                reason="usage_unavailable"))
+        registry.request_close()
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        client.close()
+        db.close()
+
+
+def test_actual_nonstream_return_then_close_queues_exact_usage_ack(tmp_path: Path, monkeypatch):
+    from openai import OpenAI
+    from agent import chat_completion_helpers as helpers
+    from agent import tool_diagnostic_transport
+
+    db, store, scope, registry = _admitted(tmp_path)
+    client = OpenAI(api_key="test", max_retries=0)
+    response = SimpleNamespace(id="response", usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3))
+    monkeypatch.setattr(client.chat.completions, "create", lambda **kw: response)
+    monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
+    agent = _supported_send_stub(registry, monkeypatch)
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    with bind_write_permit(writer):
+        db.create_session(scope.session_id, "api_server")
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+        actual = sdk.run(lambda: helpers._dispatch_nonstreaming_api_request(
+            agent, _request_kwargs(agent), make_client=lambda *_: client))
+        assert actual is response
+        assert store.send_inventory(scope, "run_root")[0][2] == "invoking"
+        assert _close(store, scope).members[0].producer_state == "open"
+        send = registry.claim_response_send(response)
+        assert send is not None
+        usage_writer = issue_usage_write_permit(store, send.completion)
+        delta = UsageDelta(
+            write_id=send.delta_id, attempt_id=send.attempt_id,
+            generation=registry.generation, model="test", billing_provider="openai",
+            input_tokens=2, output_tokens=3, api_call_count=1)
+        db.queue_recovery_usage(usage_writer, delta)
+        assert db.wait_recovery_write_ack(scope, send.delta_id, timeout=5).state == "committed"
+        send.finish(SendOutcome(
+            kind="accounted", attempt_id=send.attempt_id,
+            acknowledged_delta_ids=(send.delta_id,)))
+        registry.request_close()
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        client.close()
+        db.close()
+
+
+@pytest.mark.parametrize("kind", ["nonzero", "custom", "transport"])
+def test_unknown_or_nonzero_sdk_retries_refuse_before_create(tmp_path: Path, kind):
+    import httpx
+    from openai import OpenAI
+
+    db, store, scope, registry = _admitted(tmp_path)
+    calls = []
+    if kind == "nonzero":
+        client = OpenAI(api_key="test", max_retries=1)
+    elif kind == "transport":
+        client = OpenAI(api_key="test", max_retries=0, http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda req: httpx.Response(200))))
+    else:
+        client = SimpleNamespace(max_retries=0, chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kw: calls.append(kw))))
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+        def attempt():
+            with pytest.raises(RecoveryRefused):
+                begin_chat_send(client)
+        sdk.run(attempt)
+        assert not calls and not store.send_inventory(scope, "run_root")
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        if kind != "custom":
+            client.close()
+        db.close()
+
+
+def test_stream_reopen_inventories_both_physical_sends(tmp_path: Path, monkeypatch):
+    from openai import OpenAI
+    from agent import chat_completion_helpers as helpers
+    from agent import tool_diagnostic_transport
+
+    db, store, scope, registry = _admitted(tmp_path)
+    calls = []
+    client = OpenAI(api_key="test", max_retries=0)
+    monkeypatch.setattr(client.chat.completions, "create",
+                        lambda **kw: calls.append(kw) or object())
+    agent = _supported_send_stub(
+        registry, monkeypatch,
+        _stream_options_unsupported=False,
+        _create_request_openai_client=lambda **kw: client,
+        _touch_activity=lambda *_: None,
+    )
+    driver = SimpleNamespace(agent=agent, clients=SimpleNamespace(set_client=lambda x: x),
+                             last_chunk_time={})
+    monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
+    try:
+        sdk = registry.enter(registry.permit, "sdk")
+        def attempt():
+            helpers._StreamingCall._open_chat_stream(driver, _request_kwargs(agent, stream=True))
+            first = driver._recovery_send
+            helpers._StreamingCall._open_chat_stream(driver, _request_kwargs(agent, stream=True))
+            assert driver._recovery_send is not first
+            finish_unknown_if_active(driver._recovery_send, "usage_unavailable")
+        sdk.run(attempt)
+        assert len(calls) == len(store.send_inventory(scope, "run_root")) == 2
+        registry.request_close()
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        client.close()
+        db.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("change", [
+    "extra_body_tools", "extra_body_model", "legacy_functions",
+    "legacy_function_call", "web_search_options", "extra_headers", "extra_query",
+    "unknown_kwarg", "wrong_tools", "wrong_model", "mode_mismatch",
+])
+def test_effective_request_refuses_before_any_physical_create(
+    tmp_path: Path, monkeypatch, streaming: bool, change: str
+):
+    from openai import OpenAI
+    from agent import chat_completion_helpers as helpers
+    from agent import tool_diagnostic_transport
+
+    db, store, scope, registry = _admitted(tmp_path)
+    client = OpenAI(api_key="test", max_retries=0)
+    create_calls, client_calls = [], []
+    monkeypatch.setattr(
+        client.chat.completions, "create", lambda **kw: create_calls.append(kw) or object()
+    )
+    monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
+    agent = _supported_send_stub(
+        registry, monkeypatch,
+        _stream_options_unsupported=False,
+        _create_request_openai_client=lambda **kw: client_calls.append(kw) or client,
+        _touch_activity=lambda *_: None,
+    )
+    kwargs = _request_kwargs(agent, stream=streaming)
+    if change == "extra_body_tools":
+        kwargs["extra_body"] = {"tools": []}
+    elif change == "extra_body_model":
+        kwargs["extra_body"] = {"model": "other"}
+    elif change == "legacy_functions":
+        kwargs["functions"] = [{"name": "hidden"}]
+    elif change == "legacy_function_call":
+        kwargs["function_call"] = {"name": "hidden"}
+    elif change == "web_search_options":
+        kwargs["web_search_options"] = {"search_context_size": "high"}
+    elif change == "extra_headers":
+        kwargs["extra_headers"] = {"X-Route": "other"}
+    elif change == "extra_query":
+        kwargs["extra_query"] = {"route": "other"}
+    elif change == "unknown_kwarg":
+        kwargs["unreviewed_extension"] = {"tools": []}
+    elif change == "wrong_tools":
+        kwargs["tools"] = []
+    elif change == "mode_mismatch":
+        if streaming:
+            kwargs["stream"] = False
+        else:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+    else:
+        kwargs["model"] = "other"
+
+    sdk = registry.enter(registry.permit, "sdk")
+    try:
+        def attempt():
+            with pytest.raises(RecoveryRefused):
+                if streaming:
+                    driver = SimpleNamespace(
+                        agent=agent, clients=SimpleNamespace(set_client=lambda x: x),
+                        last_chunk_time={})
+                    helpers._StreamingCall._open_chat_stream(driver, kwargs)
+                else:
+                    helpers._dispatch_nonstreaming_api_request(
+                        agent, kwargs,
+                        make_client=lambda *_: client_calls.append("nonstream") or client)
+        sdk.run(attempt)
+        assert not create_calls and not client_calls
+        assert not store.send_inventory(scope, "run_root")
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        client.close()
+        db.close()
+
+
+@pytest.mark.parametrize("change", ["extra_body", "stream_options_unsupported"])
+def test_stream_retry_rechecks_mutated_request_before_second_create(
+    tmp_path: Path, monkeypatch, change: str
+):
+    from openai import OpenAI
+    from agent import chat_completion_helpers as helpers
+    from agent import tool_diagnostic_transport
+
+    db, store, scope, registry = _admitted(tmp_path)
+    client = OpenAI(api_key="test", max_retries=0)
+    calls = []
+    monkeypatch.setattr(client.chat.completions, "create",
+                        lambda **kw: calls.append(kw) or object())
+    monkeypatch.setattr(tool_diagnostic_transport, "observe_sdk_send", lambda *_: None)
+    agent = _supported_send_stub(
+        registry, monkeypatch,
+        _stream_options_unsupported=False,
+        _create_request_openai_client=lambda **kw: client,
+        _touch_activity=lambda *_: None,
+    )
+    driver = SimpleNamespace(agent=agent, clients=SimpleNamespace(set_client=lambda x: x),
+                             last_chunk_time={})
+    sdk = registry.enter(registry.permit, "sdk")
+    try:
+        def attempt():
+            helpers._StreamingCall._open_chat_stream(driver, _request_kwargs(agent, stream=True))
+            first = driver._recovery_send
+            bad = _request_kwargs(agent, stream=True)
+            if change == "extra_body":
+                bad["extra_body"] = {"tools": []}
+            else:
+                agent._stream_options_unsupported = True
+            with pytest.raises(RecoveryRefused):
+                helpers._StreamingCall._open_chat_stream(driver, bad)
+            finish_unknown_if_active(first, "usage_unavailable")
+        sdk.run(attempt)
+        assert len(calls) == len(store.send_inventory(scope, "run_root")) == 1
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        client.close()
+        db.close()
+
+
+def test_active_executor_callback_runs_after_close(tmp_path: Path):
+    from gateway.platforms.api_server_runs import _schedule_run_callback
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release, callback_done = Event(), Event(), Event()
+    parent = registry.enter(registry.permit, "executor")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        owner = SimpleNamespace(_protected_run_registries={"run_root": registry})
+        def work():
+            entered.set()
+            assert release.wait(5)
+            _schedule_run_callback(owner, "run_root", loop, callback_done.set)
+        worker = Thread(target=lambda: parent.run(work))
+        worker.start()
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert _close(store, scope).members[0].producer_state == "open"
+        release.set()
+        assert await asyncio.to_thread(callback_done.wait, 5)
+        await asyncio.to_thread(worker.join, 5)
+        assert not worker.is_alive()
+        registry.request_close()
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        db.close()
+
+
+def test_status_barrier_closes_only_after_worker_and_ordered_write(tmp_path: Path):
+    from gateway.platforms.api_server_runs import _finalize_protected_producers
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release, worker_done = Event(), Event(), Event()
+    executor = registry.enter(registry.permit, "executor")
+    barrier = registry.enter(registry.permit, "callback")
+
+    async def scenario():
+        status_release = asyncio.Event()
+        status_entered = asyncio.Event()
+
+        async def status_write():
+            status_entered.set()
+            await status_release.wait()
+
+        owner = SimpleNamespace(
+            _protected_status_tasks={"run_root": asyncio.create_task(status_write())},
+            _protected_run_registries={"run_root": registry},
+        )
+        coroutine_settled = asyncio.Event()
+        run = SimpleNamespace(
+            run_id="run_root", recovery_registry=registry, recovery_status_barrier=barrier,
+            recovery_execution_settled=worker_done,
+            recovery_coroutine_settled=coroutine_settled)
+
+        def worker_body():
+            try:
+                executor.run(lambda: (entered.set(), release.wait()))
+            finally:
+                worker_done.set()
+
+        worker = Thread(target=worker_body)
+        worker.start()
+        assert await asyncio.to_thread(entered.wait, 5)
+        await status_entered.wait()
+        registry.request_close()
+        coroutine_settled.set()
+        finalizer = asyncio.create_task(_finalize_protected_producers(owner, run))
+        assert _close(store, scope).members[0].producer_state == "open"
+        release.set()
+        assert await asyncio.to_thread(worker_done.wait, 5)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "open"
+        status_release.set()
+        await asyncio.wait_for(finalizer, 5)
+        await asyncio.to_thread(worker.join, 5)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        db.close()
+
+
+@pytest.mark.parametrize("path", ["fallback", "compression", "auxiliary"])
+def test_untracked_runtime_dispatch_refuses_before_effect(tmp_path: Path, path: str):
+    from agent.auxiliary_client import call_llm
+    from agent.chat_completion_helpers import try_activate_fallback
+    from agent.conversation_compression import compress_context
+
+    db, store, scope, registry = _admitted(tmp_path)
+    executor = registry.enter(registry.permit, "executor")
+    try:
+        def attempt():
+            with pytest.raises(RecoveryRefused):
+                if path == "fallback":
+                    try_activate_fallback(SimpleNamespace())
+                elif path == "compression":
+                    compress_context(SimpleNamespace(), [], "")
+                else:
+                    call_llm(messages=[])
+        executor.run(attempt)
+        assert not store.send_inventory(scope, "run_root")
+        assert _close(store, scope).state == "unsupported"
+    finally:
+        db.close()
+
+
+def test_sequential_tool_timeout_retains_actual_worker(tmp_path: Path, monkeypatch):
+    from agent import tool_executor
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release = Event(), Event()
+    monkeypatch.setattr(tool_executor, "_resolve_sequential_tool_timeout", lambda: 0.01)
+    monkeypatch.setattr(tool_executor, "_poll_sequential_future",
+                        lambda *a: ("timeout", None) if entered.wait(5) else pytest.fail("worker did not start"))
+    monkeypatch.setattr(tool_executor, "_registered_tool_worker", lambda agent: nullcontext(1))
+    monkeypatch.setattr(tool_executor, "_interrupt_worker_tids", lambda *a, **kw: None)
+    monkeypatch.setattr(tool_executor, "_abandoned_sequential_result", lambda *a, **kw: "timed out")
+    monkeypatch.setattr(tool_executor, "_run_agent_tool_execution_middleware",
+                        lambda agent, **kw: kw["execute"](kw["function_args"]))
+    agent = SimpleNamespace(_interrupt_requested=False, _touch_activity=lambda *_: None)
+    executor = registry.enter(registry.permit, "executor")
+    try:
+        def call():
+            return tool_executor._run_sequential_tool_execution_middleware(
+                agent, function_name="terminal", function_args={}, effective_task_id="task",
+                tool_call_id="call", execute=lambda args: (entered.set(), release.wait()))
+        assert executor.run(call) == "timed out"
+        assert entered.is_set()
+        registry.request_close()
+        assert _close(store, scope).members[0].producer_state == "open"
+        release.set()
+        registry.wait_until_quiescent(excluding=executor)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        release.set()
+        db.close()
+
+
+def test_concurrent_tool_worker_keeps_exact_lease_after_executor_closes(tmp_path: Path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agent import tool_executor
+    from agent.recovery_producers import current_lease
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release, callback_done = Event(), Event(), Event()
+    observed = []
+    batch = tool_executor._ConcurrentBatch(
+        SimpleNamespace(), [], "task",
+        [tool_executor._ParsedCall(None, "terminal", {}, [], None, None)], 5.0)
+
+    def actual_worker(index, order):
+        observed.append(current_lease())
+        entered.set()
+        assert release.wait(5)
+        callback = registry.enter(current_lease(), "callback")
+        callback.run(callback_done.set)
+
+    batch.run_worker = actual_worker
+    parent = registry.enter(registry.permit, "executor")
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = parent.run(lambda: batch.submit_all(pool, [0])[0][0])
+        assert entered.wait(5)
+        tool_lease = batch._recovery_future_leases[future]
+        registry.request_close()
+        assert _close(store, scope).members[0].producer_state == "open"
+        assert observed == [tool_lease]
+        release.set()
+        future.result(timeout=5)
+        assert callback_done.is_set()
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+        db.close()
+
+
+def test_streaming_caller_abandon_retains_actual_sdk_worker(tmp_path: Path, monkeypatch):
+    from agent import chat_completion_helpers as helpers
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release = Event(), Event()
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openai", platform="api_server",
+        _interrupt_requested=False)
+    driver = helpers._StreamingCall(agent, {"model": "test"}, None)
+    monkeypatch.setattr(driver, "_resolve_stale_timeout", lambda: None)
+    monkeypatch.setattr(driver, "_call", lambda: (entered.set(), release.wait()))
+    monkeypatch.setattr(driver, "_monitor_loop", lambda: entered.wait(5))
+    executor = registry.enter(registry.permit, "executor")
+    try:
+        assert executor.run(driver.run) is None
+        registry.request_close()
+        assert _close(store, scope).members[0].producer_state == "open"
+        release.set()
+        registry.wait_until_quiescent(excluding=executor)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        release.set()
+        db.close()
+
+
+def test_nonstream_interrupt_retains_actual_sdk_worker(tmp_path: Path, monkeypatch):
+    from agent import chat_completion_helpers as helpers
+    from agent.chat_completion_nonstream import _NonStreamRequest
+
+    db, store, scope, registry = _admitted(tmp_path)
+    entered, release = Event(), Event()
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openai", _interrupt_requested=False,
+        _touch_activity=lambda *_: None)
+    watchdog = SimpleNamespace(codex=False, ttfb_enabled=False, idle_enabled=False,
+                               stale_timeout=3600.0)
+    monkeypatch.setattr(helpers, "_resolve_nonstream_watchdogs", lambda *_: watchdog)
+    request = _NonStreamRequest(agent, {"model": "test"})
+    monkeypatch.setattr(request, "_call", lambda: (entered.set(), release.wait()))
+    monkeypatch.setattr(request, "_emit_wait_notice",
+                        lambda *_args, **_kw: setattr(agent, "_interrupt_requested", entered.is_set()))
+    monkeypatch.setattr(request, "_interrupt", lambda *_: (_ for _ in ()).throw(InterruptedError()))
+    executor = registry.enter(registry.permit, "executor")
+    try:
+        with pytest.raises(InterruptedError):
+            executor.run(request.run)
+        registry.request_close()
+        assert _close(store, scope).members[0].producer_state == "open"
+        release.set()
+        registry.wait_until_quiescent(excluding=executor)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        release.set()
+        db.close()
+
+
+def test_inline_watchdog_threads_have_completion_leases(tmp_path: Path):
+    from agent.chat_completion_helpers import _InlineRequest
+
+    db, store, scope, registry = _admitted(tmp_path)
+    agent = SimpleNamespace(_touch_activity=lambda *_: None)
+    executor = registry.enter(registry.permit, "executor")
+    try:
+        def body():
+            request = _InlineRequest(agent, {}, 60.0, 0.0)
+            request.start_watchdogs()
+            registry.request_close()
+            assert _close(store, scope).members[0].producer_state == "open"
+            request.stop_watchdogs()
+        executor.run(body)
+        assert store.lookup_root(scope, "run_root").members[0].producer_state == "closed"
+    finally:
+        db.close()
