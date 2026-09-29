@@ -55,6 +55,34 @@ def test_adapter_supports_push_default_true():
 
 
 @pytest.mark.asyncio
+async def test_idless_push_wake_claims_unscoped_before_handler(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter = PushAdapter()
+    with pytest.raises(Exception, match="internal wake not accepted"):
+        await deliver_wake(adapter, text="wake", source=_source())
+    assert len(adapter.handled) == 1
+    with sqlite3.connect(tmp_path / "state.db") as raw:
+        assert raw.execute(
+            "SELECT kind FROM recovery_exclusions WHERE kind='unscoped_ordinary'"
+        ).fetchone() == ("unscoped_ordinary",)
+
+
+@pytest.mark.asyncio
+async def test_idless_push_wake_refuses_existing_protected_store_before_handler(tmp_path, monkeypatch):
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, _scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter = PushAdapter()
+    try:
+        with pytest.raises(ValueError, match="protected_session_dispatch"):
+            await deliver_wake(adapter, text="wake", source=_source())
+        assert adapter.handled == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_protected_wake_refuses_before_self_post(tmp_path, monkeypatch):
     from tests.agent.test_recovery_runtime import _admitted
 
@@ -165,6 +193,38 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_delivery_claims_original_and_tip_before_append(tmp_path):
+    from types import SimpleNamespace
+
+    from gateway.wake import persist_delegation_delivery
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", "api_server")
+    db.append_message("parent", "user", "original")
+    assert db.try_acquire_compression_lock("parent", "winner", ttl_seconds=60)
+    db.publish_compression_child(
+        parent_session_id="parent", child_session_id="child", source="api_server",
+        messages=[{"role": "user", "content": "summary"}],
+        compression_lock_holder="winner",
+    )
+
+    def before_append(session_id, *_args):
+        assert session_id == "child"
+        with sqlite3.connect(tmp_path / "state.db") as raw:
+            assert set(raw.execute(
+                "SELECT session_id FROM recovery_exclusions WHERE kind='ordinary_session'"
+            ).fetchall()) == {("parent",), ("child",)}
+
+    db.append_delegation_delivery = before_append
+    try:
+        await persist_delegation_delivery(SimpleNamespace(_session_db=db, _ensure_session_db=lambda: db),
+                                          text="done", session_id="parent")
+    finally:
+        db.close()
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):

@@ -2116,44 +2116,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model = self._recover_or_record_model(model, runtime_kwargs, gateway_session_key)
         return model, session_override, request_model, request_provider
 
-    def _assert_recovery_agent_construction(self, session_id: Optional[str]) -> None:
-        """Refuse alternate agent dispatch into a persisted protected session."""
-        if not session_id:
-            return
-        from hermes_state_recovery import RecoveryRefused, RecoveryScope, RecoveryStore
+    def _assert_recovery_agent_construction(self, session_id: Optional[str]) -> tuple[str, Path]:
+        """Claim the actual ID before opening a writer or selecting a provider."""
+        from datetime import datetime
 
-        db = self._ensure_session_db()
-        if db is None:
-            raise RecoveryRefused("protected_session_authority_unavailable")
-        if db._read_one(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_members'") is None:
-            raise RecoveryRefused("protected_session_authority_unavailable")
-        members = db._read_all(
-            "SELECT run_id,generation,profile,scope_digest,producer_state "
-            "FROM recovery_members WHERE session_id=?", (session_id,))
-        if not members:
-            return
-        from agent.recovery_context import current_write_permit, validate_write_permit
+        from agent.recovery_context import current_write_permit
         from agent.recovery_producers import current_lease, current_registry
+        from hermes_recovery_dispatch import selected_state_db_path
+        from hermes_state_ids import new_session_id
+        from hermes_state_recovery_exclusions import authorize_or_claim_agent_construction
 
-        permit = current_write_permit()
-        registry = current_registry()
-        store = RecoveryStore(db)
-        for member in members:
-            if member[4] != "open":
-                continue
-            scope = RecoveryScope(store.store_id, member[2], member[3], session_id)
-            lease = current_lease()
-            construction_lease = _recovery_construction_lease.get()
-            if (registry is not None
-                    and (lease is None or (lease is construction_lease
-                                           and lease.registry is registry and lease.kind == "executor"))
-                    and registry.store.db is db and registry.scope == scope
-                    and registry.run_id == member[0] and registry.generation == member[1]
-                    and validate_write_permit(
-                        permit, store, scope, member[0], member[1], mutation="session")):
-                return
-        raise RecoveryRefused("protected_session_dispatch")
+        actual_id = session_id or new_session_id(datetime.now())
+        db = getattr(self, "_session_db", None)
+        path = selected_state_db_path(db)
+        authorize_or_claim_agent_construction(
+            actual_id, path, db, current_registry(), current_lease(), current_write_permit())
+        return actual_id, path
 
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
@@ -2168,7 +2146,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
-        self._assert_recovery_agent_construction(session_id)
+        session_id, claimed_path = self._assert_recovery_agent_construction(session_id)
+        from hermes_recovery_dispatch import selected_state_db_path
+        from hermes_state_recovery import RecoveryRefused
+
+        session_db = self._ensure_session_db()
+        if (session_db is None
+                or selected_state_db_path(session_db).resolve() != claimed_path.resolve()):
+            raise RecoveryRefused("protected_session_authority_unavailable")
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2212,7 +2197,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": session_db,
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,

@@ -23,7 +23,8 @@ from tests.recovery_provider_fixture import selected_provider
 def test_protected_agent_construction_requires_exact_registry_and_write_permit(tmp_path):
     db, _store, scope, registry = _admitted(tmp_path)
     adapter = APIServerAdapter.__new__(APIServerAdapter)
-    adapter._ensure_session_db = lambda: db
+    adapter._session_db = db
+    adapter._ensure_session_db = lambda: pytest.fail("DB opened before construction claim")
     permit = issue_write_permit(
         registry.permit, registry.store, registry.scope, registry.run_id,
         registry.generation)
@@ -38,14 +39,20 @@ def test_protected_agent_construction_requires_exact_registry_and_write_permit(t
             with pytest.raises(RecoveryRefused):
                 adapter._assert_recovery_agent_construction(scope.session_id)
             with bind_write_permit(permit):
-                adapter._assert_recovery_agent_construction(scope.session_id)
+                with pytest.raises(RecoveryRefused):
+                    adapter._assert_recovery_agent_construction(scope.session_id)
+                lease = registry.enter(registry.permit, "executor")
+                lease.run(lambda: adapter._assert_recovery_agent_construction(scope.session_id))
     finally:
         db.close()
 
 
-def test_unavailable_authority_refuses_before_agent_construction(monkeypatch):
+def test_unavailable_authority_refuses_before_agent_construction(tmp_path, monkeypatch):
     adapter = APIServerAdapter.__new__(APIServerAdapter)
-    adapter._ensure_session_db = lambda: None
+    adapter._session_db = None
+    (tmp_path / "state.db").write_bytes(b"not sqlite")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter._ensure_session_db = lambda: pytest.fail("DB opened before claim")
     constructed = []
     monkeypatch.setattr(adapter, "_select_agent_runtime", lambda *a, **kw: constructed.append(True))
     with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):

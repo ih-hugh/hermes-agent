@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import sqlite3
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -196,6 +197,91 @@ def auth_adapter():
 
 # ---------------------------------------------------------------------------
 # POST /v1/runs — start a run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_session", [False, True])
+async def test_ordinary_run_claims_actual_session_before_status_or_launch(
+    tmp_path, monkeypatch, explicit_session,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    adapter = _make_adapter()
+    adapter._session_db = db
+    original_set_status = adapter._set_run_status
+    observed = []
+
+    def claimed_before_status(run_id, status, **fields):
+        session_id = fields["session_id"]
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            assert conn.execute(
+                "SELECT 1 FROM recovery_exclusions "
+                "WHERE kind='ordinary_session' AND session_id=?", (session_id,),
+            ).fetchone() == (1,)
+        observed.append(session_id)
+        return original_set_status(run_id, status, **fields)
+
+    async def no_agent(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(adapter, "_set_run_status", claimed_before_status)
+    monkeypatch.setattr(api_server_runs, "_execute_run", no_agent)
+    app = _create_runs_app(adapter)
+    body = {"input": "hello"}
+    if explicit_session:
+        body["session_id"] = "ordinary-runs-session"
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/v1/runs", json=body)
+            assert response.status == 202
+            result = await response.json()
+            assert observed == [body.get("session_id") or result["run_id"]]
+    finally:
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_run_claims_original_and_dispatches_compression_tip(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("old-run-session", source="api_server")
+    db.append_message("old-run-session", "user", "old")
+    assert db.try_acquire_compression_lock("old-run-session", "winner", ttl_seconds=60)
+    db.publish_compression_child(
+        parent_session_id="old-run-session", child_session_id="live-run-session",
+        source="api_server", messages=[{"role": "user", "content": "summary"}],
+        compression_lock_holder="winner",
+    )
+    adapter = _make_adapter()
+    adapter._session_db = db
+    original_set_status = adapter._set_run_status
+
+    def claimed_before_status(run_id, status, **fields):
+        assert fields["session_id"] == "live-run-session"
+        with sqlite3.connect(db.db_path) as raw:
+            ids = {row[0] for row in raw.execute(
+                "SELECT session_id FROM recovery_exclusions WHERE kind='ordinary_session'"
+            )}
+        assert {"old-run-session", "live-run-session"} <= ids
+        return original_set_status(run_id, status, **fields)
+
+    async def no_agent(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(adapter, "_set_run_status", claimed_before_status)
+    monkeypatch.setattr(api_server_runs, "_execute_run", no_agent)
+    try:
+        async with TestClient(TestServer(_create_runs_app(adapter))) as client:
+            response = await client.post("/v1/runs", json={
+                "input": "next", "session_id": "old-run-session",
+            })
+            assert response.status == 202
+    finally:
+        await adapter.disconnect()
+        db.close()
 # ---------------------------------------------------------------------------
 
 

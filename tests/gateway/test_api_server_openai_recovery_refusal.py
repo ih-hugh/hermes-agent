@@ -138,3 +138,43 @@ async def test_broken_compression_read_refuses_before_writable_init(tmp_path, mo
         await adapter.disconnect()
     with sqlite3.connect(tmp_path / "state.db") as conn:
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_generated_session_claim_precedes_provider_selection(tmp_path, monkeypatch, route):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "k"}))
+    adapter._session_db = db
+    selected: list[str] = []
+
+    def assert_claimed(*_args, **kwargs):
+        session_id = kwargs["session_id"]
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            assert conn.execute(
+                "SELECT 1 FROM recovery_exclusions WHERE kind='ordinary_session' AND session_id=?",
+                (session_id,),
+            ).fetchone() == (1,)
+        selected.append(session_id)
+        return None, {}, web.Response(status=418)
+
+    monkeypatch.setattr(adapter, "_select_request_route", assert_claimed)
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            if route == "chat":
+                response = await client.post("/v1/chat/completions", json={
+                    "model": "hermes", "messages": [{"role": "user", "content": "hello"}]},
+                    headers={"Authorization": "Bearer k"})
+            else:
+                response = await client.post("/v1/responses", json={"input": "hello"},
+                                             headers={"Authorization": "Bearer k"})
+            assert response.status == 418
+            assert len(selected) == 1
+    finally:
+        await adapter.disconnect()
+        db.close()

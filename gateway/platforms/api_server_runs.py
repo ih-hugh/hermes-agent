@@ -102,6 +102,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # Small process-local identity only; heavy run/registry state retires at its barrier.
     self._protected_provider_identities: dict[object, tuple[weakref.ReferenceType, bytes]] = {}
     self._protected_status_tasks: dict[str, asyncio.Task[None]] = {}
+    # A listener's cold ordinary claims must not inspect the still-empty
+    # SQLite inode another request in that listener is bootstrapping.
+    self._ordinary_claim_lock = asyncio.Lock()
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     (
@@ -653,25 +656,43 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if limited is not None:
         return limited
     run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
     _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        self._declared_conversation_session(gateway_session_key) if _declared_selected else None)
-    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
-    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
-    # is what the next same-id run consumes below.
-    if selected_session_id:
-        if recovery_admission is not None and str(selected_session_id) != body["session_id"]:
-            return _json_error(_openai_error, "Protected session changed",
-                               code="recovery_session_mismatch", status=409)
-        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
-        if recovery_admission is not None and selected_session_id != body["session_id"]:
-            return _json_error(_openai_error, "Protected session rotated",
-                               code="recovery_session_rotated", status=409)
-    session_id = selected_session_id or run_id
+    if recovery_admission is None:
+        from hermes_recovery_dispatch import (
+            claim_exact_ordinary, resolve_declared_ordinary, selected_state_db_path,
+        )
+        from hermes_state_recovery import RecoveryRefused
+
+        try:
+            async with self._ordinary_claim_lock:
+                path = selected_state_db_path(self._session_db)
+                selected_session_id = session_id or (
+                    await asyncio.to_thread(resolve_declared_ordinary, path, gateway_session_key)
+                    if _declared_selected else None)
+                original_session_id = session_id or selected_session_id or run_id
+                claimed = await asyncio.to_thread(
+                    claim_exact_ordinary, path, (original_session_id,))
+        except RecoveryRefused:
+            return _json_error(_openai_error, "Session authority unavailable",
+                               code="protected_session_refused", status=409)
+        session_id = claimed.resolved_ids[0]
+        selected_session_id = session_id if selected_session_id else None
+    else:
+        selected_session_id = session_id or (
+            self._declared_conversation_session(gateway_session_key) if _declared_selected else None)
+        if selected_session_id:
+            if str(selected_session_id) != body["session_id"]:
+                return _json_error(_openai_error, "Protected session changed",
+                                   code="recovery_session_mismatch", status=409)
+            selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+            if selected_session_id != body["session_id"]:
+                return _json_error(_openai_error, "Protected session rotated",
+                                   code="recovery_session_rotated", status=409)
+        session_id = selected_session_id or run_id
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
     # same-key run's context (#98619).  previous_response_id continuations keep their

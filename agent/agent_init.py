@@ -1118,10 +1118,10 @@ def _publish_session_id(session_id: str) -> None:
             os.environ["HERMES_SESSION_ID"] = session_id
 
 
-def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+def _init_session_state(agent, session_id, session_start, session_db, parent_session_id, reasoning_config, max_tokens,
     checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb):
-    agent.session_start = datetime.now()
-    agent.session_id = session_id or new_session_id(agent.session_start)
+    agent.session_start = session_start
+    agent.session_id = session_id
     _publish_session_id(agent.session_id)
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
@@ -2218,6 +2218,21 @@ def init_agent(
       skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
     """
+    # An exact original/generated identity is claimed before stdio, client,
+    # tool, context, or local-session setup can perform an ordinary effect.
+    session_start = datetime.now()
+    session_id = session_id or new_session_id(session_start)
+    from agent.recovery_context import current_write_permit
+    from agent.recovery_producers import current_lease, current_registry
+    from hermes_recovery_dispatch import selected_state_db_path
+    from hermes_state_recovery_exclusions import authorize_or_claim_agent_construction
+
+    authorize_or_claim_agent_construction(
+        session_id, selected_state_db_path(session_db), session_db,
+        current_registry(), current_lease(), current_write_permit(),
+    )
+    agent.session_start = session_start
+    agent.session_id = session_id
     _install_safe_stdio()
 
     _params = locals()
@@ -2279,7 +2294,7 @@ def init_agent(
     _init_fallback_chain(agent, fallback_model)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
     _init_session_state(
-        agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+        agent, session_id, session_start, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
     )
 

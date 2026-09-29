@@ -324,6 +324,11 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
         tip_row = None
     if tip_row is None or tip_row.get("ended_at") is not None:
         return False
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+
+    claimed = claim_exact_ordinary(selected_state_db_path(agent._session_db), (old_id, tip))
+    if claimed.resolved_ids[-1] != tip:
+        return False
     logger.warning("Adopted live compression tip %s for closed session %s; retrying flush once", tip, old_id)
     agent.session_id, agent._flushed_db_message_ids, agent._last_flushed_db_idx = tip, set(), 0
     agent._compression_adoption_failed = False

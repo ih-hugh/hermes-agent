@@ -86,6 +86,32 @@ async def test_partial_recovery_catalog_refuses_hidden_room_before_db_or_ddl(tmp
 
 
 @pytest.mark.asyncio
+async def test_hidden_room_claim_commits_before_session_writer(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from hermes_recovery_dispatch import selected_state_db_path
+
+    db = SessionDB(tmp_path / "state.db")
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._session_db = db
+    dispatch = SimpleNamespace(home_install_id="home", room_id="room",
+                               member_id="member", target_profile="default")
+    session_id = room_dispatch._hosted_member_session_id(dispatch)
+
+    async def before_writer():
+        with sqlite3.connect(selected_state_db_path(db)) as raw:
+            assert raw.execute(
+                "SELECT 1 FROM recovery_exclusions WHERE session_id=?", (session_id,)
+            ).fetchone() == (1,)
+        return db
+
+    adapter._ensure_session_db_async = before_writer
+    try:
+        assert await room_dispatch._ensure_hosted_member_session(adapter, dispatch) == session_id
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_room_dispatch_rejects_extra_fields_before_grant_verification():
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     adapter._room_grant_token = MagicMock(return_value="room-grant")

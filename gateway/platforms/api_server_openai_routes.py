@@ -13,7 +13,6 @@ import re
 import time
 import uuid
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -25,25 +24,19 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
 logger = logging.getLogger("gateway.platforms.api_server")
 
 
-async def _refuse_recovery_session(adapter, *session_ids: str) -> None:
-    """Check alternate-route identities without opening/migrating SessionDB."""
-    from hermes_recovery_refusal import require_unprotected_session
+async def _claim_recovery_session(adapter, *session_ids: str):
+    """Commit exact original and resolved identities before route or writer effects."""
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
 
-    db = getattr(adapter, "_session_db", None)
-    db_path = getattr(db, "db_path", None)
-    if not isinstance(db_path, (str, Path)):
-        db_path = None
-    await asyncio.to_thread(require_unprotected_session, *session_ids, db_path=db_path)
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    return await asyncio.to_thread(claim_exact_ordinary, path, tuple(session_ids))
 
 
-async def _readonly_recovery_identity(adapter, value: str, *, declared: bool = False) -> str | None:
-    from hermes_recovery_refusal import readonly_declared_session, readonly_resume_session
+async def _declared_recovery_identity(adapter, value: str) -> str | None:
+    from hermes_recovery_dispatch import resolve_declared_ordinary, selected_state_db_path
 
-    db_path = getattr(getattr(adapter, "_session_db", None), "db_path", None)
-    if not isinstance(db_path, (str, Path)):
-        db_path = None
-    resolver = readonly_declared_session if declared else readonly_resume_session
-    return await asyncio.to_thread(resolver, value, db_path=db_path)
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    return await asyncio.to_thread(resolve_declared_ordinary, path, value)
 
 
 async def _iter_stream_items(stream_q, agent_task, response):
@@ -497,9 +490,8 @@ class OpenAICompatRoutesMixin:
                 return _invalid_request("Session ID too long")
             session_id = provided_session_id
             try:
-                await _refuse_recovery_session(self, provided_session_id)
-                session_id = await _readonly_recovery_identity(self, provided_session_id)
-                await _refuse_recovery_session(self, provided_session_id, session_id)
+                claim = await _claim_recovery_session(self, provided_session_id)
+                session_id = claim.resolved_ids[0]
             except Exception:
                 return _error_response("Protected session cannot use chat completions", 409)
             try:
@@ -522,10 +514,10 @@ class OpenAICompatRoutesMixin:
             first_user = next(
                 (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
             session_id = _derive_chat_session_id(system_prompt, first_user)
-        try:
-            await _refuse_recovery_session(self, provided_session_id, session_id)
-        except Exception:
-            return _error_response("Protected session cannot use chat completions", 409)
+            try:
+                await _claim_recovery_session(self, session_id)
+            except Exception:
+                return _error_response("Protected session cannot use chat completions", 409)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -883,10 +875,11 @@ class OpenAICompatRoutesMixin:
         _declared_selected = not stored_session_id and bool(gateway_session_key)
         try:
             declared_session_id = (
-                await _readonly_recovery_identity(self, gateway_session_key, declared=True)
+                await _declared_recovery_identity(self, gateway_session_key)
                 if _declared_selected else None)
             session_id = stored_session_id or declared_session_id or str(uuid.uuid4())
-            await _refuse_recovery_session(self, stored_session_id, session_id)
+            claim = await _claim_recovery_session(self, session_id)
+            session_id = claim.resolved_ids[0]
         except Exception:
             return _error_response("Protected session cannot use responses", 409)
         stream = _coerce_request_bool(body.get("stream"), default=False)

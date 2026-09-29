@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import queue
 
 import pytest
 
@@ -109,6 +110,186 @@ def test_ordinary_delegation_uses_existing_schema_in_mixed_store(tmp_path, monke
         ad._reset_for_tests()
 
 
+@pytest.mark.parametrize("parent_id,expected_kind", [
+    ("ordinary-parent", "ordinary_session"), (None, "unscoped_ordinary"),
+])
+def test_dispatch_commits_claim_before_ledger_or_worker(
+    tmp_path, monkeypatch, parent_id, expected_kind,
+):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    monkeypatch.setattr(ad, "_get_executor", lambda *_: pytest.fail("worker pool started"))
+    ad._reset_for_tests()
+
+    def inspect_claim(_record):
+        with sqlite3.connect(db.db_path) as conn:
+            assert conn.execute(
+                "SELECT 1 FROM recovery_exclusions WHERE kind=? "
+                "AND (session_id=? OR (session_id IS NULL AND ? IS NULL))",
+                (expected_kind, parent_id, parent_id),
+            ).fetchone() == (1,)
+        raise RecoveryRefused("test_stop_after_claim")
+
+    monkeypatch.setattr(ad, "_persist_dispatch", inspect_claim)
+    try:
+        handle = ad.dispatch_async_delegation(
+            goal="ordinary", context=None, toolsets=None, role="worker", model=None,
+            session_key="routing-key", parent_session_id=parent_id,
+            runner=lambda: pytest.fail("runner started"))
+        assert handle["status"] == "rejected"
+        assert ad.active_count() == 0
+    finally:
+        db.close()
+        ad._reset_for_tests()
+
+
+def test_restart_delivery_claims_persisted_origin_before_ack(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            raw.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                "state, dispatched_at, updated_at, delivery_state, delivery_attempts) "
+                "VALUES ('historic', 'key', 'ordinary-parent', '', 'completed', 1, 1, 'pending', 0)"
+            )
+        assert ad.mark_completion_delivered("historic")
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT 1 FROM recovery_exclusions WHERE kind='ordinary_session' "
+                "AND session_id='ordinary-parent'"
+            ).fetchone() == (1,)
+    finally:
+        db.close()
+
+
+def test_retention_claims_historical_origin_before_delete(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            raw.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                "state, dispatched_at, updated_at, delivery_state, delivery_attempts) "
+                "VALUES ('expired', 'key', 'old-parent', '', 'completed', 1, 1, 'delivered', 0)"
+            )
+        ad._prune_durable_records()
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT 1 FROM recovery_exclusions WHERE kind='ordinary_session' "
+                "AND session_id='old-parent'"
+            ).fetchone() == (1,)
+            assert raw.execute(
+                "SELECT 1 FROM async_delegations WHERE delegation_id='expired'"
+            ).fetchone() is None
+    finally:
+        db.close()
+
+
+def test_restart_replay_claims_origin_before_enqueue(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            raw.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                "state, dispatched_at, completed_at, updated_at, event_json, "
+                "delivery_state, delivery_attempts) "
+                "VALUES ('historic-replay', 'key', 'ordinary-parent', '', "
+                "'completed', ?, ?, ?, '{\"type\":\"async_delegation\"}', 'pending', 0)",
+                (ad.time.time(), ad.time.time(), ad.time.time()),
+            )
+
+        class CheckedQueue(queue.Queue):
+            def put(self, item, *args, **kwargs):
+                with sqlite3.connect(db.db_path) as raw:
+                    assert raw.execute(
+                        "SELECT 1 FROM recovery_exclusions WHERE kind='ordinary_session' "
+                        "AND session_id='ordinary-parent'"
+                    ).fetchone() == (1,)
+                return super().put(item, *args, **kwargs)
+
+        events = CheckedQueue()
+        assert ad.restore_undelivered_completions(events) == 1
+        assert events.get_nowait()["restored"] is True
+    finally:
+        db.close()
+
+
+def test_delivery_refuses_origin_changed_after_claim_before_update(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            raw.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                "state, dispatched_at, updated_at, delivery_state, delivery_attempts) "
+                "VALUES ('changing', 'key', 'claimed-parent', '', 'completed', 1, 1, 'pending', 0)"
+            )
+        original_claim = ad._claim_durable_identity
+
+        def change_origin_after_claim(delegation_id):
+            expected = original_claim(delegation_id)
+            with sqlite3.connect(db.db_path) as raw:
+                raw.execute(
+                    "UPDATE async_delegations SET parent_session_id='different-parent' "
+                    "WHERE delegation_id=?", (delegation_id,),
+                )
+            return expected
+
+        monkeypatch.setattr(ad, "_claim_durable_identity", change_origin_after_claim)
+        with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+            ad.mark_completion_delivered("changing")
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT delivery_state FROM async_delegations WHERE delegation_id='changing'"
+            ).fetchone() == ("pending",)
+            assert raw.execute(
+                "SELECT session_id FROM recovery_exclusions WHERE kind='ordinary_session'"
+            ).fetchall() == [("claimed-parent",)]
+    finally:
+        db.close()
+
+
+def test_restart_origin_inventory_bound_refuses_without_partial_prune(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    monkeypatch.setattr(ad, "_MAX_DURABLE_ORIGIN_SCAN", 1)
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            for index in range(2):
+                raw.execute(
+                    "INSERT INTO async_delegations "
+                    "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                    "state, dispatched_at, updated_at, delivery_state, delivery_attempts) "
+                    "VALUES (?, 'key', ?, '', 'completed', 1, 1, 'delivered', 0)",
+                    (f"expired-{index}", f"ordinary-{index}"),
+                )
+        with pytest.raises(RecoveryRefused, match="ordinary_ledger_inventory_too_large"):
+            ad._prune_durable_records()
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute("SELECT COUNT(*) FROM async_delegations").fetchone() == (2,)
+            assert raw.execute("SELECT COUNT(*) FROM recovery_exclusions").fetchone() == (0,)
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("shape", ["missing", "incompatible"])
 def test_mixed_store_bad_async_schema_refuses_without_ghost(tmp_path, monkeypatch, shape):
     db, _store, _scope, _registry = _admitted(tmp_path)
@@ -138,15 +319,20 @@ def test_mixed_store_bad_async_schema_refuses_without_ghost(tmp_path, monkeypatc
     (RecoveryRefused("protected_session_dispatch"), "rejected"),
     (sqlite3.OperationalError("ambiguous commit"), "unknown"),
 ])
-def test_persistence_failure_leaves_no_active_ghost(monkeypatch, failure, expected):
+def test_persistence_failure_leaves_no_active_ghost(tmp_path, monkeypatch, failure, expected):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
     ad._reset_for_tests()
-    monkeypatch.setattr(ad, "_db_path", lambda: None)
-    monkeypatch.setattr("hermes_recovery_refusal.require_unprotected_session", lambda *a, **kw: None)
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
     monkeypatch.setattr(ad, "_persist_dispatch", lambda _record: (_ for _ in ()).throw(failure))
     monkeypatch.setattr(ad, "_get_executor", lambda *_: pytest.fail("worker pool started"))
-    handle = ad.dispatch_async_delegation(
-        goal="ordinary", context=None, toolsets=None, role="worker", model=None,
-        session_key="key", parent_session_id="ordinary",
-        runner=lambda: pytest.fail("runner started"))
-    assert handle["status"] == expected
-    assert ad.active_count() == 0
+    try:
+        handle = ad.dispatch_async_delegation(
+            goal="ordinary", context=None, toolsets=None, role="worker", model=None,
+            session_key="key", parent_session_id="ordinary",
+            runner=lambda: pytest.fail("runner started"))
+        assert handle["status"] == expected
+        assert ad.active_count() == 0
+    finally:
+        db.close()

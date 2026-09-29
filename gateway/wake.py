@@ -27,13 +27,19 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
-async def _require_unprotected_wake(*session_ids: str, db_path=None) -> None:
-    from hermes_recovery_refusal import require_unprotected_session, require_unprotected_store
+async def _claim_wake(adapter: Any, *session_ids: str):
+    from hermes_recovery_dispatch import claim_exact_ordinary, selected_state_db_path
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
 
-    if any(session_ids):
-        await asyncio.to_thread(require_unprotected_session, *session_ids, db_path=db_path)
-    else:
-        await asyncio.to_thread(require_unprotected_store, db_path=db_path)
+    path = selected_state_db_path(getattr(adapter, "_session_db", None))
+    if any(sid and type(sid) is not str for sid in session_ids):
+        raise RecoveryRefused("invalid_ordinary_identity")
+    exact = tuple(sid for sid in session_ids if type(sid) is str and sid)
+    if exact:
+        return await asyncio.to_thread(claim_exact_ordinary, path, exact)
+    await asyncio.to_thread(claim_unscoped_ordinary, path)
+    return None
 
 
 def adapter_supports_push(adapter: Any) -> bool:
@@ -54,7 +60,9 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
-    await _require_unprotected_wake(getattr(event, "session_id", ""))
+    claim = await _claim_wake(adapter, getattr(event, "session_id", ""))
+    if claim is not None:
+        event.session_id = claim.resolved_ids[0]
     event._gateway_accepted = False
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
@@ -66,10 +74,11 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
     failure so the caller can rewind/retry."""
-    await _require_unprotected_wake(session_id)
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
+        # The synthesized event has no stable session ID: the adapter may derive
+        # or rotate its target only inside handle_message.
         from gateway.platforms.event import MessageEvent, MessageType
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True)
         await admit_internal_event(adapter, synth_event)
@@ -116,13 +125,8 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     if not session_id:
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
-    await _require_unprotected_wake(session_id)
-    from hermes_recovery_refusal import readonly_resume_session
-
-    db_path = getattr(getattr(adapter, "_session_db", None), "db_path", None)
-    resolved = await asyncio.to_thread(readonly_resume_session, session_id, db_path=db_path)
-    await _require_unprotected_wake(session_id, resolved, db_path=db_path)
-    session_id = resolved
+    claim = await _claim_wake(adapter, session_id)
+    session_id = claim.resolved_ids[0]
     ensure = getattr(adapter, "_ensure_session_db", None)
     db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
     if db is None:
@@ -143,7 +147,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches."""
-    await _require_unprotected_wake(session_id)
+    claim = await _claim_wake(adapter, session_id)
+    session_id = claim.resolved_ids[0]
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
