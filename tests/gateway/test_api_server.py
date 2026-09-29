@@ -241,7 +241,7 @@ class TestAdapterInit:
         assert adapter._cors_origins == ("http://localhost:3000",)
 
 
-    def test_create_agent_forwards_runtime_config(self, monkeypatch):
+    def test_create_agent_forwards_runtime_config(self, monkeypatch, ordinary_session_db):
         captured = {}
 
         class FakeAgent:
@@ -278,7 +278,7 @@ class TestAdapterInit:
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         agent = adapter._create_agent(session_id="api-session")
 
@@ -411,6 +411,17 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+@pytest.fixture
+def ordinary_session_db(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2644,7 +2655,7 @@ class TestModelRoutesHandlers:
 
 class TestModelRoutesAgentCreation:
 
-    def test_route_provider_resolves_provider_credentials(self, monkeypatch):
+    def test_route_provider_resolves_provider_credentials(self, monkeypatch, ordinary_session_db):
         captured = {}
 
         class FakeAgent:
@@ -2664,7 +2675,7 @@ class TestModelRoutesAgentCreation:
         adapter = _make_routing_adapter(
             {"alias": {"model": "other/model", "provider": "otherprov"}}
         )
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
         adapter._create_agent(session_id="s1", route=adapter._resolve_route("alias"))
@@ -2674,7 +2685,7 @@ class TestModelRoutesAgentCreation:
         assert captured["api_key"] == "sk-otherprov"
 
 
-    def test_session_model_override_beats_route(self, monkeypatch):
+    def test_session_model_override_beats_route(self, monkeypatch, ordinary_session_db):
         """A user-issued /model on the session must win over static route config."""
         captured = {}
 
@@ -2684,7 +2695,7 @@ class TestModelRoutesAgentCreation:
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
         adapter = _make_routing_adapter({"alias": {"model": "route/model", "api_key": "sk-route"}})
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(
             adapter,
             "_session_model_override_for",
@@ -3012,7 +3023,7 @@ class TestRouteWithoutModelKeepsDefault:
     """A model_routes alias whose route has no ``model`` key must keep the
     global default model — the alias string itself is never a model name."""
 
-    def test_alias_never_leaks_as_model(self, monkeypatch):
+    def test_alias_never_leaks_as_model(self, monkeypatch, ordinary_session_db):
         captured = {}
 
         class FakeAgent:
@@ -3026,7 +3037,7 @@ class TestRouteWithoutModelKeepsDefault:
         # _parse_model_routes drops routes without model; simulate a
         # credentials-only route surviving via direct dict (defensive path).
         adapter._model_routes = {"alias": {"api_key": "sk-route"}}
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
         monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
 
         adapter._create_agent(
@@ -3046,7 +3057,7 @@ class TestRouteWithoutModelKeepsDefault:
 
 
 class TestCreateAgentModelRecovery:
-    def test_create_agent_defaults_to_provider_catalog_model_when_empty(self, monkeypatch):
+    def test_create_agent_defaults_to_provider_catalog_model_when_empty(self, monkeypatch, ordinary_session_db):
         """api_server.py had no equivalent of run.py's provider-catalog
         default when model resolves empty but a provider did resolve (e.g.
         `hermes auth add openai-codex` without `hermes model`) —
@@ -3070,14 +3081,14 @@ class TestCreateAgentModelRecovery:
         )
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         agent = adapter._create_agent(session_id="api-session")
 
         assert isinstance(agent, FakeAgent)
         assert captured["model"] == "gpt-5.5-codex"
 
-    def test_create_agent_recovers_last_known_good_model_when_empty(self, monkeypatch):
+    def test_create_agent_recovers_last_known_good_model_when_empty(self, monkeypatch, ordinary_session_db):
         """Last-known-good recovery (#35314): a transient config-cache miss
         producing an empty model would build AIAgent(model="") and fail every
         call until manual retry, instead of reusing the model that just
@@ -3092,7 +3103,7 @@ class TestCreateAgentModelRecovery:
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Turn 1: model resolves fine — populates the last-known-good cache
         # (keyed on gateway_session_key).
@@ -3113,7 +3124,7 @@ class TestCreateAgentModelRecovery:
 
     # ── Recovery-net alias guards (PR for #79101) ──────────────────────
 
-    def test_create_agent_does_not_cache_virtual_alias(self, monkeypatch):
+    def test_create_agent_does_not_cache_virtual_alias(self, monkeypatch, ordinary_session_db):
         """Write-side guard: the advertised virtual model (``hermes-agent``)
         must never enter ``_last_resolved_model``, even when a prior turn
         (or the session-row bug) dispatched it."""
@@ -3126,7 +3137,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         virtual = adapter._model_name
         # Make _resolve_gateway_model return the virtual alias — the
@@ -3141,7 +3152,7 @@ class TestCreateAgentModelRecovery:
         assert adapter._last_resolved_model.get("ch") != virtual
         assert adapter._last_resolved_model.get("*") != virtual
 
-    def test_create_agent_rejects_virtual_alias_from_cache(self, monkeypatch):
+    def test_create_agent_rejects_virtual_alias_from_cache(self, monkeypatch, ordinary_session_db):
         """Read-side gate: an empty-model dispatch with the alias in
         ``_last_resolved_model`` must NOT recover it — the recovery net
         must never serve the advertised virtual model."""
@@ -3154,7 +3165,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Seed the cache with the alias (simulate a prior poisoned turn).
         adapter._last_resolved_model["ch"] = adapter._model_name
@@ -3172,7 +3183,7 @@ class TestCreateAgentModelRecovery:
         assert captured[0]["model"] != adapter._model_name
 
     def test_create_agent_recovery_still_works_for_legitimate_model(
-        self, monkeypatch,
+        self, monkeypatch, ordinary_session_db,
     ):
         """Non-regression: a real dispatched model still enters the cache
         and recovers on a subsequent empty-resolution turn — the alias
@@ -3186,7 +3197,7 @@ class TestCreateAgentModelRecovery:
         _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
 
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
-        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: ordinary_session_db)
 
         # Turn 1: legitimate model — must enter the cache.
         monkeypatch.setattr(

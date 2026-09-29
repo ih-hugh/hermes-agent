@@ -27,6 +27,15 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
+async def _require_unprotected_wake(*session_ids: str, db_path=None) -> None:
+    from hermes_recovery_refusal import require_unprotected_session, require_unprotected_store
+
+    if any(session_ids):
+        await asyncio.to_thread(require_unprotected_session, *session_ids, db_path=db_path)
+    else:
+        await asyncio.to_thread(require_unprotected_store, db_path=db_path)
+
+
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends. Reads
     ``supports_async_delivery`` off the adapter class rather than the request-scoped contextvar
@@ -45,6 +54,7 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
+    await _require_unprotected_wake(getattr(event, "session_id", ""))
     event._gateway_accepted = False
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
@@ -56,6 +66,7 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
     failure so the caller can rewind/retry."""
+    await _require_unprotected_wake(session_id)
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
@@ -105,11 +116,13 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     if not session_id:
         raise ValueError("persist_delegation_delivery: raw session id required to persist "
                          "the completion on the api_server session transcript")
+    await _require_unprotected_wake(session_id)
     ensure = getattr(adapter, "_ensure_session_db", None)
     db: Any = await asyncio.to_thread(ensure) if callable(ensure) else None
     if db is None:
         raise RuntimeError("persist_delegation_delivery: api_server SessionDB unavailable — "
                            f"cannot persist completion for session {session_id}")
+    db_path = getattr(db, "db_path", None)
     # #98619: the parent run may have compressed/rotated between dispatch and this detached
     # completion — the captured origin id is then a closed parent and the append below is
     # rejected with CompressionSessionClosedError forever (the watcher retries the same stale
@@ -120,10 +133,13 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     if callable(resolver):
         try:
             resolved = await asyncio.to_thread(resolver, session_id)
+        except Exception as exc:
+            from hermes_state_recovery import RecoveryRefused
+            raise RecoveryRefused("protected_session_authority_unavailable") from exc
+        else:
             if resolved:
+                await _require_unprotected_wake(session_id, str(resolved), db_path=db_path)
                 session_id = str(resolved)
-        except Exception:
-            logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
     await asyncio.to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
@@ -137,6 +153,7 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
     nobody watches."""
+    await _require_unprotected_wake(session_id)
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):

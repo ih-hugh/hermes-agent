@@ -53,6 +53,42 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+@pytest.mark.asyncio
+async def test_protected_wake_refuses_before_self_post(tmp_path, monkeypatch):
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    try:
+        with pytest.raises(ValueError, match="protected_session_dispatch"):
+            await deliver_wake(
+                ApiServerLikeAdapter(key="test-key"), text="wake",
+                session_id=scope.session_id)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_delegation_delivery_checks_original_and_resolved_before_append(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from gateway.wake import persist_delegation_delivery
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    db.resolve_resume_session_id = lambda sid: scope.session_id
+    db.append_delegation_delivery = lambda *a, **kw: pytest.fail("delivery row appended")
+    adapter = SimpleNamespace(_ensure_session_db=lambda: db)
+    try:
+        with pytest.raises(ValueError, match="protected_session_dispatch"):
+            await persist_delegation_delivery(adapter, text="complete", session_id="ordinary")
+        with pytest.raises(ValueError, match="protected_session_dispatch"):
+            await persist_delegation_delivery(adapter, text="complete", session_id=scope.session_id)
+    finally:
+        db.close()
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
@@ -180,5 +216,4 @@ def test_persist_delegation_delivery_raises_without_db():
         asyncio.run(persist_delegation_delivery(
             NoDbAdapter(), text="x", session_id="sid",
         ))
-
 

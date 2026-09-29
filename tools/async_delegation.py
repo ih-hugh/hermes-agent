@@ -82,6 +82,11 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_recovery_refusal import require_unprotected_store
+
+    # A raw opener must not repair/reconcile an opted store, even before its
+    # own ledger write. This probe does not instantiate SessionDB or create a DB.
+    require_unprotected_store(db_path=_db_path())
     from hermes_cli.sqlite_util import open_db
     # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
     # hardening so this writer doesn't create/leave the file (and its WAL
@@ -99,8 +104,14 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_recovery_refusal import require_unprotected_connection
     from hermes_state_repair import apply_durability_barriers
     from hermes_state_schema import reconcile_state_schema
+    # Raw connections have no process-owned permit. Register fail-closed trigger
+    # functions before even attempting schema reconciliation on this connection.
+    conn.create_function("recovery_row_guard", 2, lambda _sid, _mutation: 0)
+    conn.create_function("recovery_store_guard", 0, lambda: 0)
+    require_unprotected_connection(conn)
     # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
     # every short-lived connection collides with live transcript/FTS writers.
     apply_durability_barriers(conn)
@@ -537,6 +548,18 @@ def _dispatch(
     can't pile up unbounded background work. ``slot_key`` names the pool slot the unit occupies
     (default: its own id); the units of one delegate_task call share the first unit's id so
     splitting a call into per-group completions never consumes more capacity than the call did."""
+    from hermes_recovery_refusal import require_unprotected_session, require_unprotected_store
+    from hermes_state_recovery import RecoveryRefused
+
+    identities = tuple(sid for sid in (
+        parent_session_id, origin_session_id, _current_origin_session_id()) if sid)
+    try:
+        if identities:
+            require_unprotected_session(*identities, db_path=_db_path())
+        else:
+            require_unprotected_store(db_path=_db_path())
+    except RecoveryRefused as exc:
+        return {"status": "rejected", "error": exc.code}
     is_batch = goals is not None
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")

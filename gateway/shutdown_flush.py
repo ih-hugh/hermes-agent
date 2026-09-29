@@ -69,11 +69,26 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         serialised = _serialise_value(value)
         if serialised is None:
             return False
+        _require_unprotected_spool(serialised.get("session_id"))
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
         return False
+
+
+def _require_unprotected_spool(session_id: Optional[str], *, db_path=None) -> None:
+    from hermes_recovery_refusal import require_unprotected_session, require_unprotected_store
+
+    if session_id:
+        require_unprotected_session(session_id, db_path=db_path)
+    else:
+        require_unprotected_store(db_path=db_path)
+
+
+def _session_db_path(session_db) -> Optional[Path]:
+    value = getattr(session_db, "db_path", None)
+    return Path(value) if isinstance(value, (str, Path)) else None
 
 
 def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -120,6 +135,7 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
     discards user data while the process stays up (#78182).
     """
     try:
+        _require_unprotected_spool(session_id)
         return _write_payload(_get_flush_dir(), {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
             "seq": next(_TRANSCRIPT_SPOOL_SEQ),
@@ -136,6 +152,7 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
     only after its replay succeeds. The first failure stops the drain (the DB is likely still
     unhealthy) and keeps the rest for retry.
     """
+    _require_unprotected_spool(session_id)
     try:
         candidates = list(_get_flush_dir().glob("pending-*.json"))
     except Exception as exc:
@@ -207,10 +224,8 @@ def recover_pending_to_db(session_db=None) -> int:
     flush_files = sorted(_get_flush_dir().glob("*.json"))
     if not flush_files:
         return 0
+    from hermes_state_recovery import RecoveryRefused
     own_db = session_db is None
-    if own_db:
-        from hermes_state_registry import acquire
-        session_db = acquire()
     recovered = 0
     try:
         for path in flush_files:
@@ -218,11 +233,25 @@ def recover_pending_to_db(session_db=None) -> int:
             # Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
-            if _recover_one_payload(session_db, path, payload):
-                recovered += 1
-                path.unlink(missing_ok=True)
+            data = payload.get("data") or {}
+            replay_id = (data.get("session_id") if isinstance(data, dict) else None)
+            try:
+                _require_unprotected_spool(
+                    replay_id, db_path=_session_db_path(session_db))
+            except RecoveryRefused:
+                logger.warning("Refusing unsupported or unclassifiable transcript replay from %s", path)
+                continue  # The file is retained for a later operator decision.
+            if own_db and session_db is None:
+                from hermes_state_registry import acquire
+                session_db = acquire()
+            try:
+                if _recover_one_payload(session_db, path, payload):
+                    recovered += 1
+                    path.unlink(missing_ok=True)
+            except RecoveryRefused:
+                logger.warning("Refusing or deferring transcript replay from %s", path, exc_info=True)
     finally:
-        if own_db:  # shutdown cancellation/interrupt must not strand an owned DB
+        if own_db and session_db is not None:  # shutdown must not strand an owned DB
             with contextlib.suppress(Exception):
                 from hermes_state_registry import release_or_close
                 release_or_close(session_db)
@@ -243,6 +272,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
             logger.warning("Cannot recover structurally invalid transcript spool "
                            "file %s; preserved for manual inspection", path)
             return False
+        _require_unprotected_spool(spooled_sid, db_path=_session_db_path(session_db))
         session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
                                   content=message.get("content") or "",
                                   timestamp=message.get("timestamp") or payload.get("ts"))
@@ -261,6 +291,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
                        "session_key-to-id resolution is not available at this recovery stage. "
                        "The message text is preserved in %s", session_key, path)
         return False
+    _require_unprotected_spool(session_id, db_path=_session_db_path(session_db))
     session_db.append_message(session_id=session_id, role="user", content=text,
                               timestamp=payload.get("ts", int(time.time())))
     return True
@@ -274,6 +305,7 @@ def flush_agent_history_to_file(session_id: Optional[str], history: list) -> Non
     if not history:
         return
     try:
+        _require_unprotected_spool(session_id)
         flush_dir = _get_flush_dir()
         snapshot = []
         for _m in history:

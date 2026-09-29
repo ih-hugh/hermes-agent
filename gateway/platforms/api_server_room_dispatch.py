@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import time
+from pathlib import Path
 from typing import Any
 
 try:
@@ -14,18 +15,32 @@ except ImportError:
 from gateway.platforms.api_server_room_grants import _json_error
 
 
+def _hosted_member_session_id(dispatch: Any) -> str:
+    seed = (
+        f"{dispatch.home_install_id}\0{dispatch.room_id}\0"
+        f"{dispatch.member_id}\0{dispatch.target_profile}")
+    return f"room_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
+
+
+async def _refuse_protected_room_session(self, session_id: str) -> None:
+    from hermes_recovery_refusal import require_unprotected_session
+
+    db_path = getattr(getattr(self, "_session_db", None), "db_path", None)
+    if not isinstance(db_path, (str, Path)):
+        db_path = None
+    await asyncio.to_thread(require_unprotected_session, session_id, db_path=db_path)
+
+
 async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
     """Create or verify the target's canonical hidden group session. The ``Group: <room_id>``
     namespace is reused on purpose (Desktop-assisted -> hosted keeps one transcript); a
     conflicting title under another session id fails closed rather than merging."""
+    session_id = _hosted_member_session_id(dispatch)
+    await _refuse_protected_room_session(self, session_id)
     db = await self._ensure_session_db_async()
     if db is None:
         raise RuntimeError("session database unavailable")
     title = f"Group: {dispatch.room_id}"
-    seed = (
-        f"{dispatch.home_install_id}\0{dispatch.room_id}\0"
-        f"{dispatch.member_id}\0{dispatch.target_profile}")
-    session_id = f"room_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
 
     def atomic(conn):
         row = conn.execute("SELECT id, title, source FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -81,6 +96,7 @@ async def _normalize_room_dispatch(
         local_install = hosted_rooms.local_authority_gateway_id()
         if dispatch.target_profile != active_profile or dispatch.target_install_id != local_install:
             raise ValueError("room dispatch target does not match this profile")
+        await _refuse_protected_room_session(self, _hosted_member_session_id(dispatch))
         _, catalog_map = _local_room_catalog(self, active_profile, local_install)
         catalog = GatewayRoomCatalog.from_mapping(catalog_map)
         policy = RoomExecutionPolicy.from_mapping(catalog.execution_policy.as_mapping())

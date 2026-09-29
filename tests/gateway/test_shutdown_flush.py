@@ -42,6 +42,34 @@ def test_flush_writes_string_pending_to_file(tmp_path, monkeypatch):
     assert "telegram" not in files[0].name
 
 
+def test_protected_transcript_is_neither_spooled_nor_replayed(tmp_path, monkeypatch):
+    from gateway import shutdown_flush
+    from hermes_state_recovery import RecoveryRefused
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, scope, _registry = _admitted(tmp_path)
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(shutdown_flush, "_get_flush_dir", lambda: flush_dir)
+    try:
+        assert shutdown_flush.spool_dropped_transcript_message(
+            scope.session_id, {"role": "user", "content": "private"}) is None
+        assert shutdown_flush.flush_pending_to_file({
+            "routing-key": {"session_id": scope.session_id, "text": "private"}}) == 0
+        assert not list(flush_dir.glob("*.json"))
+        with pytest.raises(RecoveryRefused):
+            shutdown_flush.drain_transcript_spool(scope.session_id, lambda _: pytest.fail("replayed"))
+        payload = {"session_key": "routing-key", "data": {
+            "session_id": scope.session_id, "text": "private"}}
+        pending = flush_dir / "pending-protected.json"
+        pending.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr("hermes_state_registry.acquire", lambda: pytest.fail("SessionDB opened"))
+        assert shutdown_flush.recover_pending_to_db() == 0
+        assert pending.exists()
+    finally:
+        db.close()
+
+
 def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     flush_dir = _make_flush_dir(tmp_path)
     monkeypatch.setattr(

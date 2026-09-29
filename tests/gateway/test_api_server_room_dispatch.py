@@ -1,7 +1,9 @@
 """Compatibility seams for extracted RoomLink dispatch handling."""
 
 import json
+import sqlite3
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -62,6 +64,25 @@ async def test_non_room_run_body_passes_through_unchanged():
     assert normalized is body
     assert error is None
     adapter._room_grant_token.assert_called_once_with(request)
+
+
+@pytest.mark.asyncio
+async def test_partial_recovery_catalog_refuses_hidden_room_before_db_or_ddl(tmp_path, monkeypatch):
+    dispatch = SimpleNamespace(home_install_id="home", room_id="room",
+                               member_id="member", target_profile="default")
+    session_id = room_dispatch._hosted_member_session_id(dispatch)
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE recovery_sessions(session_id TEXT PRIMARY KEY, phase TEXT, root_run_id TEXT)")
+        conn.execute("CREATE TABLE recovery_members(run_id TEXT PRIMARY KEY, session_id TEXT, producer_state TEXT)")
+        conn.execute("INSERT INTO recovery_sessions VALUES(?, 'sealed', 'run')", (session_id,))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
+    adapter._session_db = None
+    adapter._ensure_session_db_async = AsyncMock(side_effect=AssertionError("DB opened"))
+    with pytest.raises(ValueError, match="protected_session_authority_unavailable"):
+        await room_dispatch._ensure_hosted_member_session(adapter, dispatch)
+    adapter._ensure_session_db_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio
