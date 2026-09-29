@@ -12,10 +12,14 @@ import uuid
 import weakref
 import sys
 import math
+import hashlib
+import json
+import os
+import stat
 from pathlib import Path
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, Literal, TypeVar
 
 from agent.recovery_context import ProducerPermit, _register_usage_completion
@@ -24,6 +28,7 @@ from hermes_state_recovery import RecoveryRefused
 if TYPE_CHECKING:
     from agent.recovery_context import UsageCompletion
     from hermes_state_recovery import RecoveryScope, RecoveryStore
+    from hermes_cli.plugins import PluginManager
 
 
 T = TypeVar("T")
@@ -36,12 +41,33 @@ _ACTIVE_REGISTRY: ContextVar[ProducerRegistry | None] = ContextVar(
 _ACTIVE_LEASE: ContextVar[ProducerLease | None] = ContextVar(
     "recovery_producer_lease", default=None
 )
+_CONSTRUCTOR_PREPARATION: ContextVar[FrozenProtectedRuntime | None] = ContextVar(
+    "recovery_constructor_preparation", default=None
+)
 _SEND_ISSUER = object()
 _LEASE_ISSUER = object()
 _SEND_LOCK = threading.Lock()
 _SEND_MAP: weakref.WeakKeyDictionary[SendPermit, tuple[ProducerRegistry, str, str]] = (
     weakref.WeakKeyDictionary()
 )
+_MAX_PROTECTED_CONFIG_BYTES = 1_048_576
+
+
+def read_bounded_protected_config(path: Path) -> bytes:
+    """Read one exact regular config image without unbounded allocation."""
+    try:
+        with path.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_PROTECTED_CONFIG_BYTES:
+                raise RecoveryRefused("unsupported_configuration")
+            raw = stream.read(_MAX_PROTECTED_CONFIG_BYTES + 1)
+    except RecoveryRefused:
+        raise
+    except OSError as exc:
+        raise RecoveryRefused("unsupported_configuration") from exc
+    if len(raw) > _MAX_PROTECTED_CONFIG_BYTES:
+        raise RecoveryRefused("unsupported_configuration")
+    return raw
 
 
 def current_registry() -> ProducerRegistry | None:
@@ -50,6 +76,127 @@ def current_registry() -> ProducerRegistry | None:
 
 def current_lease() -> ProducerLease | None:
     return _ACTIVE_LEASE.get()
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenProtectedRuntime:
+    """Private same-process constructor input; never a recovery authority."""
+
+    profile: str
+    home: Path
+    scope_digest: str = field(repr=False)
+    session_id: str
+    model: str
+    provider: str
+    api_mode: str
+    base_url: str
+    api_key: str = field(repr=False, compare=False)
+    config_json: bytes = field(repr=False, compare=False)
+    config_sha256: str = field(repr=False)
+    manager: PluginManager = field(repr=False, compare=False)
+    selected_provider: object = field(repr=False, compare=False)
+    tool_generation: int
+    terminal_registry_generation: tuple[int, int]
+
+    def agent_config(self) -> dict[str, object]:
+        """Give constructor helpers a fresh copy of the validated safe subset."""
+        return json.loads(self.config_json)
+
+    def __reduce_ex__(self, protocol: int):
+        raise TypeError("protected runtime preparation cannot be serialized")
+
+
+def current_constructor_preparation() -> FrozenProtectedRuntime | None:
+    return _CONSTRUCTOR_PREPARATION.get()
+
+
+def _require_preparation_current(prepared: FrozenProtectedRuntime) -> ProducerRegistry:
+    """Check exact selected profile and loaded identities without callback/discovery."""
+    from agent.secret_scope import get_secret_str
+    from agent.terminal_env_registry import registry_generation
+    from hermes_cli.plugins import get_plugin_manager
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_constants import get_hermes_home
+    from hermes_cli.config import get_config_path
+    from tools.registry import registry as tool_registry
+    from tools.terminal_tool_config import _get_plugin_env_provider
+
+    try:
+        registry = current_registry()
+        if (registry is None
+                or registry.scope.profile != prepared.profile
+                or registry.scope.scope_digest != prepared.scope_digest
+                or registry.scope.session_id != prepared.session_id
+                or get_active_profile_name() != prepared.profile
+                or get_hermes_home().resolve() != prepared.home.resolve()
+                or get_plugin_manager() is not prepared.manager
+                or not getattr(prepared.manager, "_discovered", False)
+                or tool_registry._generation != prepared.tool_generation
+                or registry_generation() != prepared.terminal_registry_generation
+                or _get_plugin_env_provider("byf_workspace") is not prepared.selected_provider
+                or not loaded_selected_provider_supported(
+                    prepared.manager, prepared.selected_provider
+                )
+                or get_secret_str("OPENAI_API_KEY") != prepared.api_key):
+            raise RecoveryRefused("unsupported_configuration")
+        raw = read_bounded_protected_config(get_config_path())
+        if hashlib.sha256(raw).hexdigest() != prepared.config_sha256:
+            raise RecoveryRefused("unsupported_configuration")
+    except RecoveryRefused:
+        raise
+    except Exception as exc:
+        raise RecoveryRefused("unsupported_configuration") from exc
+    return registry
+
+
+@contextmanager
+def bind_protected_constructor(prepared: FrozenProtectedRuntime) -> Iterator[None]:
+    """Pin the discovered manager for one bounded AIAgent construction only."""
+    if type(prepared) is not FrozenProtectedRuntime:
+        raise RecoveryRefused("unsupported_configuration")
+    lock = getattr(prepared.manager, "_discovery_lock", None)
+    if lock is None or not lock.acquire(blocking=False):
+        raise RecoveryRefused("unsupported_configuration")
+    token = None
+    try:
+        _require_preparation_current(prepared)
+        token = _CONSTRUCTOR_PREPARATION.set(prepared)
+        yield
+        _require_preparation_current(prepared)
+    finally:
+        if token is not None:
+            _CONSTRUCTOR_PREPARATION.reset(token)
+        lock.release()
+
+
+def require_protected_constructor(
+    session_id: str, *, model: str, provider: str | None, api_mode: str | None,
+    base_url: str | None, api_key: str | None, enabled_toolsets: list[str] | None,
+    disabled_toolsets: list[str] | None, fallback_model: object, credential_pool: object,
+    request_overrides: object, skip_memory: bool, skip_background_review: bool,
+    skip_context_files: bool, platform: str | None,
+) -> FrozenProtectedRuntime | None:
+    """Refuse unprepared protected construction before session/client/tool effects."""
+    if current_registry() is None:
+        return None
+    prepared = current_constructor_preparation()
+    if (prepared is None
+            or session_id != prepared.session_id
+            or model != prepared.model
+            or provider != prepared.provider
+            or api_mode != prepared.api_mode
+            or base_url != prepared.base_url
+            or api_key != prepared.api_key
+            or enabled_toolsets != ["terminal_only"]
+            or disabled_toolsets not in (None, [])
+            or fallback_model is not None
+            or credential_pool is not None
+            or request_overrides not in (None, {})
+            or not skip_memory or not skip_background_review or not skip_context_files
+            or platform != "api_server"):
+        raise RecoveryRefused("unsupported_configuration")
+    _require_preparation_current(prepared)
+    return prepared
 
 
 def refuse_untracked_work() -> None:
@@ -73,11 +220,9 @@ def require_unmanaged_dispatch() -> None:
         refuse_untracked_work()
 
 
-def _selected_provider_and_callbacks_supported(registry: ProducerRegistry) -> bool:
-    """Inspect existing registration state without discovering or invoking plugins."""
-    from hermes_cli.plugins import get_plugin_manager
+def loaded_selected_provider_supported(manager: PluginManager, provider: object) -> bool:
+    """Inspect only settled registration slots; invoke no selected plugin method."""
     from hermes_cli.plugins_manifest import manifest_key
-    from hermes_state_recovery_provider import SelectedProviderCapture
     from agent.tool_diagnostic_transport import (
         _BUNDLED_PLUGIN_ROOT,
         _UNOBSERVED_CALLBACK_REGISTRIES,
@@ -85,12 +230,6 @@ def _selected_provider_and_callbacks_supported(registry: ProducerRegistry) -> bo
         _only_stock_raft_hooks,
     )
 
-    capture = getattr(registry, "provider_capture", None)
-    if (type(capture) is not SelectedProviderCapture
-            or capture.admission.session_id != registry.scope.session_id):
-        return False
-    provider = capture.require_selected()
-    manager = get_plugin_manager()
     hooks = {kind: callbacks for kind, callbacks in manager._hooks.items() if callbacks}
     if (not manager._discovered
             or any(manager._middleware.values())
@@ -124,6 +263,19 @@ def _selected_provider_and_callbacks_supported(registry: ProducerRegistry) -> bo
             return False
         selected_plugin_seen = True
     return selected_plugin_seen
+
+
+def _selected_provider_and_callbacks_supported(registry: ProducerRegistry) -> bool:
+    """Recheck the captured selected plugin after ordinary config resolution."""
+    from hermes_cli.plugins import get_plugin_manager
+    from hermes_state_recovery_provider import SelectedProviderCapture
+
+    capture = getattr(registry, "provider_capture", None)
+    if (type(capture) is not SelectedProviderCapture
+            or capture.admission.session_id != registry.scope.session_id):
+        return False
+    provider = capture.require_selected()
+    return loaded_selected_provider_supported(get_plugin_manager(), provider)
 
 
 def _exact_terminal_schema(agent: object) -> bool:

@@ -435,8 +435,9 @@ def _finalize_routing(agent, api_mode, credential_pool):
             agent._credential_pool = None
 
     # Warm the transport cache so import errors surface at init (non-fatal: some modes lack one).
-    with suppress(Exception):
-        agent._get_transport()
+    if getattr(agent, "_recovery_constructor_prepared", None) is None:
+        with suppress(Exception):
+            agent._get_transport()
 
     # The Nous agent key lives ~1 h. Without the proactive refresher every agent in the process
     # discovers expiry reactively, on its own next request, all in the same minute: with 200
@@ -655,6 +656,8 @@ def _init_prompt_cache_config(agent):
     # subscription users where cache writes bill against "extra usage" or for third-party proxies that
     # inject their own cache_control markers (#13477).
     agent._cache_ttl = "5m"
+    if getattr(agent, "_recovery_constructor_prepared", None) is not None:
+        return
     with suppress(Exception):
         from hermes_cli.config import load_config_readonly as _load_pc_cfg
         from agent.agent_runtime_helpers import cache_ttl_means_disabled
@@ -880,6 +883,10 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Dict[str,
 def _apply_openai_header_policy(agent, client_kwargs: Dict[str, Any]) -> None:
     """Mutate ``client_kwargs`` (== ``agent._client_kwargs``) with header/TLS policy, in order:
     OpenRouter Claude beta header → model.default_headers → custom-provider TLS/extra_headers."""
+    if getattr(agent, "_recovery_constructor_prepared", None) is not None:
+        # The static route has no configured default/custom headers. A second
+        # config read here could replace the frozen route after admission.
+        return
     # Fine-grained tool streaming for Claude on OpenRouter: without the beta header
     # Anthropic buffers the whole tool call and OpenRouter's proxy times out.
     from agent.anthropic_adapter import _TOOL_STREAMING_BETA
@@ -911,6 +918,37 @@ def _apply_openai_header_policy(agent, client_kwargs: Dict[str, Any]) -> None:
 
 def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_timeout):
     """OpenAI-wire client: resolve kwargs, apply header/TLS policy, construct."""
+    prepared = getattr(agent, "_recovery_constructor_prepared", None)
+    if prepared is not None:
+        # The normal helper consults provider hooks and can install a shared
+        # keepalive transport. Neither is part of this inventoried route.
+        from hermes_state_recovery import RecoveryRefused
+        from httpx import HTTPTransport
+        from openai import OpenAI
+        from openai._base_client import SyncHttpxClientWrapper
+
+        if (agent.provider != "openai-api" or agent.api_mode != "chat_completions"
+                or api_key != prepared.api_key or base_url != prepared.base_url
+                or _provider_timeout is not None):
+            raise RecoveryRefused("unsupported_configuration")
+        http_client = SyncHttpxClientWrapper(
+            transport=HTTPTransport(retries=0, trust_env=False), trust_env=False,
+        )
+        try:
+            agent.client = OpenAI(
+                api_key=api_key, base_url=base_url, max_retries=0,
+                organization="", project="", webhook_secret="",
+                http_client=http_client,
+            )
+        except BaseException:
+            http_client.close()
+            raise
+        agent._client_kwargs = {
+            "api_key": api_key, "base_url": base_url, "max_retries": 0,
+        }
+        agent.api_key = api_key
+        agent.base_url = base_url
+        return
     if api_key and base_url:
         client_kwargs = _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout)
     else:
@@ -949,7 +987,10 @@ def _build_client(agent, api_key, base_url, fallback_model):
     # responses.stream()). One provider/model timeout up front so every path applies it.
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    _provider_timeout = (
+        None if getattr(agent, "_recovery_constructor_prepared", None) is not None
+        else get_provider_request_timeout(agent.provider, agent.model)
+    )
     if agent.api_mode == "anthropic_messages":
         _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
     elif agent.provider == "moa":
@@ -1043,6 +1084,28 @@ def _init_fallback_chain(agent, fallback_model):
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    prepared = getattr(agent, "_recovery_constructor_prepared", None)
+    if prepared is not None:
+        from hermes_state_recovery import RecoveryRefused
+        from tools.registry import registry as tool_registry
+        from tools.terminal_tool import TERMINAL_SCHEMA, _handle_terminal
+
+        entry = tool_registry.get_entry("terminal")
+        if (enabled_toolsets != ["terminal_only"]
+                or disabled_toolsets not in (None, [])
+                or tool_registry._generation != prepared.tool_generation
+                or entry is None or entry.toolset != "terminal"
+                or entry.schema is not TERMINAL_SCHEMA
+                or entry.handler is not _handle_terminal
+                or entry.dynamic_schema_overrides is not None
+                or entry.is_async):
+            raise RecoveryRefused("unsupported_configuration")
+        agent._tool_snapshot_generation = tool_registry._generation
+        from copy import deepcopy
+        agent.tools = [{"type": "function", "function": deepcopy(TERMINAL_SCHEMA)}]
+        agent.valid_tool_names = {"terminal"}
+        agent._kanban_worker_guidance = ""
+        return
     # A multiplexed gateway may have switched HERMES_HOME since model_tools was imported;
     # make sure this profile's plugins are discovered before the tool snapshot.
     try:
@@ -1702,7 +1765,8 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     # ``model.context_length`` describes the configured default model; drop it when the
     # startup runtime (model or route) differs from that default.
-    if _config_context_length is not None:
+    if (_config_context_length is not None
+            and getattr(agent, "_recovery_constructor_prepared", None) is None):
         _config_context_length = _scope_context_length_to_default_runtime(
             agent, _agent_cfg, _model_section, _custom_providers, _config_context_length, base_url
         )
@@ -1725,7 +1789,10 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     # Persisted for switch_model / fallback AFTER the custom_providers branch (per-model overrides).
     agent._config_context_length = _config_context_length
 
-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(_config_context_length)
+    _lmstudio_runtime_context_length = (
+        None if getattr(agent, "_recovery_constructor_prepared", None) is not None
+        else agent._ensure_lmstudio_runtime_loaded(_config_context_length)
+    )
     if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
         _ra().logger.warning(
             "LM Studio model activation was rejected or completed without a "
@@ -2223,14 +2290,25 @@ def init_agent(
     session_start = datetime.now()
     session_id = session_id or new_session_id(session_start)
     from agent.recovery_context import current_write_permit
-    from agent.recovery_producers import current_lease, current_registry
+    from agent.recovery_producers import (
+        current_lease, current_registry, require_protected_constructor,
+    )
     from hermes_recovery_dispatch import selected_state_db_path
     from hermes_state_recovery_exclusions import authorize_or_claim_agent_construction
 
+    prepared = require_protected_constructor(
+        session_id, model=model, provider=provider, api_mode=api_mode,
+        base_url=base_url, api_key=api_key, enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets, fallback_model=fallback_model,
+        credential_pool=credential_pool, request_overrides=request_overrides,
+        skip_memory=skip_memory, skip_background_review=skip_background_review,
+        skip_context_files=skip_context_files, platform=platform,
+    )
     authorize_or_claim_agent_construction(
         session_id, selected_state_db_path(session_db), session_db,
         current_registry(), current_lease(), current_write_permit(),
     )
+    agent._recovery_constructor_prepared = prepared
     agent.session_start = session_start
     agent.session_id = session_id
     _install_safe_stdio()
@@ -2272,6 +2350,14 @@ def init_agent(
     agent.acp_args = list(acp_args or args or [])
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
+    if prepared is not None and (
+        agent.provider != prepared.provider
+        or agent.api_mode != prepared.api_mode
+        or agent.base_url != prepared.base_url
+        or agent.model != prepared.model
+    ):
+        from hermes_state_recovery import RecoveryRefused
+        raise RecoveryRefused("unsupported_configuration")
 
     # Platform callbacks are stored under their parameter names verbatim.
     for _cb in _CALLBACK_PARAMS:
@@ -2281,7 +2367,9 @@ def init_agent(
     _set_defaults(agent, _CONTROL_STATE)
 
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
-    agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    agent._reasoning_echo_flag = (
+        False if prepared is not None else agent._read_reasoning_echo_from_config()
+    )
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
@@ -2299,11 +2387,14 @@ def init_agent(
     )
 
     # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config_readonly as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
+    if prepared is not None:
+        _agent_cfg = prepared.agent_config()
+    else:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform)
@@ -2320,6 +2411,7 @@ def init_agent(
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    agent._recovery_constructor_prepared = None
 
 
 __all__ = ["init_agent"]

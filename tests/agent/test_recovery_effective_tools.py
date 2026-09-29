@@ -56,21 +56,48 @@ def _scratch_home(tmp_path: Path, monkeypatch) -> None:
 def _with_protected_agent(
     tmp_path: Path, monkeypatch, check: Callable[[AIAgent], None]
 ) -> None:
+    from agent.recovery_producers import bind_protected_constructor
+    from gateway.platforms.api_server_recovery import RecoveryOwnerContext
+    from gateway.platforms.api_server_recovery_runtime import (
+        prepare_static_chat_runtime,
+    )
+
     _scratch_home(tmp_path, monkeypatch)
+    home = tmp_path / "hermes-home"
+    (home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+        "platform_toolsets:\n  api_server: [terminal_only, no_mcp]\n"
+        "tools:\n  tool_search:\n    enabled: 'off'\n"
+        "terminal:\n  backend: byf_workspace\n"
+        "context:\n  engine: compressor\n"
+        "model:\n  provider: openai-api\n  api_mode: chat_completions\n"
+        "  default: gpt-4.1\n  context_length: 128000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-scratch-constructor-only")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "factory"
+    )
     db, store, scope, registry = _admitted(tmp_path)
+    _install_selected_plugin_fixture(registry, monkeypatch)
+    prepared = prepare_static_chat_runtime(
+        RecoveryOwnerContext("factory", home, scope.scope_digest),
+        session_id=scope.session_id,
+    )
     writer = issue_write_permit(
         registry.permit, store, scope, registry.run_id, registry.generation
     )
     executor = registry.enter(registry.permit, "executor")
 
     def body() -> None:
-        with bind_write_permit(writer):
+        with bind_write_permit(writer), bind_protected_constructor(prepared):
             agent = AIAgent(
-                api_key="scratch-only",
-                base_url="http://127.0.0.1:9/v1",
-                provider="openai",
-                api_mode="chat_completions",
-                model="gpt-4o",
+                api_key=prepared.api_key,
+                base_url=prepared.base_url,
+                provider=prepared.provider,
+                api_mode=prepared.api_mode,
+                model=prepared.model,
                 enabled_toolsets=["terminal_only"],
                 session_id=scope.session_id,
                 session_db=db,
