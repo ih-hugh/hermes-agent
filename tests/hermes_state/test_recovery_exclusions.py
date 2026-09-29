@@ -192,11 +192,17 @@ def test_raw_claim_close_cannot_retire_wal_during_initializer_open(tmp_path: Pat
                                                                     monkeypatch):
     """An in-process raw close must not expose a pre-guard WAL to a peer close."""
     import hermes_state as hs
+    import hermes_state_wal
     from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
 
+    # This specifically exercises WAL sidecar ownership. A vulnerable SQLite
+    # runtime correctly forces a new store to DELETE even when WAL is configured.
+    monkeypatch.setattr(hermes_state_wal, "resolve_journal_mode", lambda: "wal")
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: False)
     path = tmp_path / "state.db"
     initial = SessionDB(path)
     initial.close()
+    assert path.read_bytes()[18] == 2, "fixture must retain WAL journal mode"
     entered, resume = threading.Event(), threading.Event()
     original_hold = hs._lockguard.hold
     opened: list[SessionDB] = []
