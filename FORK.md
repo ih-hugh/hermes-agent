@@ -348,6 +348,38 @@ a focused green run is not full hosted CI or an installed Factory source-pair pr
   failed three pre-existing macOS real-binary subprocess fixtures and skipped one.
   The same three sort/man cases failed before the regex edit and never call the
   detector. They remain host qualification failures, not a globally green claim.
+- `c27c1bd2` lets the workspace-check wrapper drain its output before returning
+  failure. Immediate process exit truncated hosted desktop failures and even the
+  final summary. A real child-process regression reproduces the truncation with
+  a 2 MiB failed-check log; all 70 root JavaScript tests, types and lint pass with
+  the fix. Check selection, assertions and failure exit status are unchanged.
+- `238a302b` corrects the TUI unmount-measurement fixture's scroll geometry. The
+  old scroll position could unmount the row before the stale-cache update being
+  tested. The fixture now deliberately commits those updates separately and
+  still requires exactly one adjustment of one row. Independent review passed
+  all 17 affected tests; the full local TUI check passed. No production scrolling
+  behavior, timeout or retry policy changes.
+- `148a06fa` adds protected-only `hermes.recovery-admission-result/v1` metadata to
+  original and exact-replay 202 responses. The first store UUID and original
+  member incarnation now come from durable admission, so BytFactory need not
+  obtain its expected identity from the later seal being checked. A shared
+  bounded validator reads the store singleton, member, root relation and verified
+  provider admission in one transaction. Reserve returns that checked identity
+  only after commit; early replay uses a query-only snapshot without recapturing
+  a retired provider. Ordinary 202 bytes are unchanged. Strict integer generation,
+  status, response-loss replay and dispatch after HTTP-timeout checks passed
+  independent review with 121 affected tests. An immutable-checkout run covering
+  all direct reservation callers passed 463 tests in 25 files without retries.
+  The admission owner incarnation is distinct from the seal-time incarnation.
+  This adds no SQL schema or cleanup
+  authority; the corresponding Factory consumer and installed pair remain separate.
+- `2e954886` avoids a false read-only diagnosis when SQLite removes an optional
+  WAL or SHM sidecar between preflight enumeration and its permission check.
+  Only a missing sidecar with an extant parent is ignored; present unreadable
+  sidecars, the main database and its parent retain their existing refusal rules.
+  Deterministic disappearance tests failed before the fix. Two independent
+  reviews passed all 59 preflight and recovery-store tests without retries. No
+  WAL deletion, extra retry or permission-repair scope is introduced.
 
 At this pre-merge checkpoint, an immutable 272-file selection at `4453db94`
 passed 4,717 tests, failed those same three macOS binary fixtures and skipped 43,
