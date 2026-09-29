@@ -14,7 +14,7 @@ import sqlite3
 import time
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, TypeVar, cast
 
 from pydantic import JsonValue
 
@@ -81,6 +81,24 @@ if TYPE_CHECKING:
 
 
 _SEAL_SECONDS = 5.0
+_ReadResult = TypeVar("_ReadResult")
+
+
+class RecoveryReadableDB(Protocol):
+    def _read_retrying_ioerr(
+        self, fn: Callable[[sqlite3.Connection], _ReadResult]
+    ) -> _ReadResult: ...
+
+
+class RecoveryReadableStore(Protocol):
+    """Immutable readers need no writer or producer-authority methods."""
+
+    db: RecoveryReadableDB
+    store_id: str
+
+    def _check_scope(self, scope: RecoveryScope) -> None: ...
+
+
 _MAX_SOURCE_ROW_BYTES = MAX_RESPONSE_BYTES
 _MAX_ACK_RESULT_BYTES = 65_536
 _MAX_SOURCE_ROWS = 100_000
@@ -1457,7 +1475,7 @@ def _read_document_on_conn(
 
 
 def _read_document(
-    store: RecoveryStore,
+    store: RecoveryReadableStore,
     scope: RecoveryScope,
     root_id: str,
     request: SealRequest | None = None,
@@ -1507,7 +1525,7 @@ def _read_document(
 
 
 def read_seal_bytes(
-    store: RecoveryStore,
+    store: RecoveryReadableStore,
     scope: RecoveryScope,
     root_id: str,
     *,
@@ -1520,7 +1538,7 @@ def read_seal_bytes(
 
 
 def read_committed_seal_bytes(
-    store: RecoveryStore,
+    store: RecoveryReadableStore,
     scope: RecoveryScope,
     root_id: str,
     request: SealRequest,
@@ -1542,7 +1560,7 @@ def read_committed_seal_bytes(
 
 
 def read_sealed_page_bytes(
-    store: RecoveryStore,
+    store: RecoveryReadableStore,
     scope: RecoveryScope,
     root_id: str,
     page: int,

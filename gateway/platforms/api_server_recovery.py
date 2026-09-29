@@ -8,12 +8,14 @@ import hashlib
 import hmac
 import re
 import sqlite3
+import stat
 import threading
 import time
+from contextlib import contextmanager
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Callable, Iterator, TypeVar, cast
 
 try:
     from aiohttp import web
@@ -36,6 +38,7 @@ from gateway.platforms.api_server_recovery_contract import (
 from hermes_state_recovery import RecoveryRefused, RecoveryScope, RecoveryStore
 from hermes_state_recovery_deadline import (
     RecoveryDeadlineExceeded,
+    acquire_recovery_lock,
     recovery_deadline,
     require_time,
 )
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
 _REQUEST_BYTES = 16_384
 _WORKER_SECONDS = 5.0
 _MAX_WORKERS = 2
+_ReadResult = TypeVar("_ReadResult")
 
 
 class RecoveryHttpRefused(ValueError):
@@ -201,28 +205,187 @@ class RecoveryWorkerPool:
         return cancelled
 
 
-def _scope_for_root(
-    adapter: APIServerAdapter, owner: RecoveryOwnerContext, root_id: str
-) -> tuple[RecoveryStore, RecoveryScope]:
+class _ReadOnlyDB:
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def _read_retrying_ioerr(
+        self, fn: Callable[[sqlite3.Connection], _ReadResult]
+    ) -> _ReadResult:
+        require_time()
+        result = fn(self._conn)
+        require_time()
+        return result
+
+
+class _ReadOnlyRecoveryView:
+    """Only the immutable sealer read interface; no ledger write authority."""
+
+    def __init__(self, conn: sqlite3.Connection, scope: RecoveryScope):
+        self.db = _ReadOnlyDB(conn)
+        self.store_id = scope.store_id
+        self._scope = scope
+
+    def _check_scope(self, scope: RecoveryScope) -> None:
+        if scope != self._scope:
+            raise RecoveryRefused("scope_mismatch")
+
+
+@contextmanager
+def _read_scope_for_root(
+    owner: RecoveryOwnerContext, root_id: str
+) -> Iterator[tuple[_ReadOnlyRecoveryView, RecoveryScope, tuple[int, int]]]:
+    """Prove an existing protected root without a writable SessionDB open."""
+    from hermes_state_dbfile import _connect_tracked_db
+    from hermes_state_recovery_exclusions import _catalog, _protected_exists
+
     if not root_id or len(root_id) > 255:
         raise RecoveryHttpRefused(404, "recovery_not_found")
-    db = adapter._session_db or adapter._open_and_cache_session_db(owner.home)
-    if db is None:
+    path = owner.home / "state.db"
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise RecoveryHttpRefused(404, "recovery_not_found") from exc
+    if not stat.S_ISREG(before.st_mode) or not before.st_dev or not before.st_ino:
         raise RecoveryHttpRefused(503, "recovery_store_unavailable")
-    if Path(db.db_path).resolve() != (owner.home / "state.db").resolve():
+    identity = before.st_dev, before.st_ino
+    require_time()
+    try:
+        conn = _connect_tracked_db(
+            path.absolute().as_uri() + "?mode=ro",
+            tracking_path=path,
+            uri=True,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=0,
+        )
+    except sqlite3.OperationalError:
+        require_time()
+        raise
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=0")
+
+        def _progress() -> int:
+            try:
+                require_time()
+            except RecoveryDeadlineExceeded:
+                return 1
+            return 0
+
+        conn.set_progress_handler(_progress, 1000)
+        try:
+            conn.execute("BEGIN")
+            require_time()
+            catalog = _catalog(conn)
+            if catalog != "full" or not _protected_exists(conn, catalog):
+                raise RecoveryHttpRefused(404, "recovery_not_found")
+            store_meta = conn.execute(
+                "SELECT typeof(store_id),length(substr(CAST(store_id AS BLOB),1,129)) "
+                "FROM recovery_store WHERE singleton=1"
+            ).fetchone()
+            if (
+                store_meta is None
+                or store_meta[0] != "text"
+                or type(store_meta[1]) is not int
+                or not 0 < store_meta[1] <= 128
+            ):
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+            store_id = conn.execute(
+                "SELECT store_id FROM recovery_store WHERE singleton=1"
+            ).fetchone()[0]
+            metadata = conn.execute(
+                "SELECT typeof(s.session_id),"
+                "length(substr(CAST(s.session_id AS BLOB),1,256)) "
+                "FROM recovery_sessions s JOIN recovery_members m "
+                "ON m.run_id=s.root_run_id AND m.session_id=s.session_id "
+                "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? "
+                "AND m.generation=0 AND m.profile=? AND m.scope_digest=? LIMIT 2",
+                (
+                    root_id,
+                    owner.profile,
+                    owner.scope_digest,
+                    owner.profile,
+                    owner.scope_digest,
+                ),
+            ).fetchall()
+            require_time()
+            if (
+                len(metadata) != 1
+                or metadata[0][0] != "text"
+                or type(metadata[0][1]) is not int
+                or not 0 < metadata[0][1] <= 255
+            ):
+                raise RecoveryHttpRefused(404, "recovery_not_found")
+            row = conn.execute(
+                "SELECT s.session_id FROM recovery_sessions s "
+                "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? LIMIT 2",
+                (root_id, owner.profile, owner.scope_digest),
+            ).fetchall()
+            require_time()
+            if (
+                len(row) != 1
+                or type(row[0][0]) is not str
+                or len(row[0][0].encode()) != metadata[0][1]
+            ):
+                raise RecoveryHttpRefused(404, "recovery_not_found")
+            scope = RecoveryScope(
+                store_id, owner.profile, owner.scope_digest, row[0][0]
+            )
+            conn.execute("COMMIT")
+        except sqlite3.OperationalError as exc:
+            conn.set_progress_handler(None, 0)
+            conn.rollback()
+            try:
+                require_time()
+            except RecoveryDeadlineExceeded as deadline_exc:
+                raise deadline_exc from exc
+            raise
+        except BaseException:
+            conn.set_progress_handler(None, 0)
+            conn.rollback()
+            raise
+        finally:
+            conn.set_progress_handler(None, 0)
+        require_time()
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+        yield _ReadOnlyRecoveryView(conn, scope), scope, identity
+        require_time()
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+    finally:
+        conn.close()
+
+
+def _cached_writer_for_scope(
+    adapter: APIServerAdapter,
+    owner: RecoveryOwnerContext,
+    scope: RecoveryScope,
+    identity: tuple[int, int],
+) -> RecoveryStore:
+    """Use only the writer already retained by this process's protected admission."""
+    with acquire_recovery_lock(adapter._session_db_cache_lock):
+        db = adapter._session_db or adapter._session_dbs.get(str(owner.home))
+    if (
+        db is None
+        or db.read_only
+        or Path(db.db_path).resolve() != (owner.home / "state.db").resolve()
+        or db._db_file_identity != identity
+    ):
+        raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+    try:
+        current = (owner.home / "state.db").lstat()
+    except OSError as exc:
+        raise RecoveryHttpRefused(503, "recovery_store_unavailable") from exc
+    if (current.st_dev, current.st_ino) != identity:
         raise RecoveryHttpRefused(503, "recovery_store_unavailable")
     store = RecoveryStore(db)
-    rows = db._read_all(
-        "SELECT s.session_id FROM recovery_sessions s "
-        "JOIN recovery_members m ON m.run_id=s.root_run_id AND m.session_id=s.session_id "
-        "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? "
-        "AND m.generation=0 AND m.profile=? AND m.scope_digest=? LIMIT 2",
-        (root_id, owner.profile, owner.scope_digest, owner.profile, owner.scope_digest),
-    )
-    if len(rows) != 1 or type(rows[0][0]) is not str or not 0 < len(rows[0][0]) <= 255:
-        raise RecoveryHttpRefused(404, "recovery_not_found")
-    scope = RecoveryScope(store.store_id, owner.profile, owner.scope_digest, rows[0][0])
-    return store, scope
+    if store.store_id != scope.store_id:
+        raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+    return store
 
 
 def _body_request(raw: bytes, root_id: str) -> SealRequest:
@@ -266,10 +429,14 @@ def _post_worker(
         read_committed_seal_bytes,
     )
 
-    store, scope = _scope_for_root(adapter, owner, root_id)
-    prior = read_committed_seal_bytes(store, scope, root_id, request, deadline=deadline)
+    with _read_scope_for_root(owner, root_id) as (view, scope, identity):
+        prior = read_committed_seal_bytes(
+            view, scope, root_id, request, deadline=deadline
+        )
     if prior is not None:
+        runs._retire_selected_provider_identity(adapter, scope)
         return prior
+    store = _cached_writer_for_scope(adapter, owner, scope, identity)
     view = store.begin_close(scope, request)
     if view.state == "unsupported":
         return bounded_response_bytes(
@@ -294,10 +461,13 @@ def _post_worker(
     result = finalize(store, scope, request, evidence, deadline=deadline)
     if result.state != "sealed":
         return bounded_response_bytes(result)
+    # Finalize returning sealed is the confirmed commit boundary. A response
+    # readback can still fail under the same deadline, but identity retirement
+    # must not depend on the HTTP response making it to the client.
+    runs._retire_selected_provider_identity(adapter, scope)
     saved = read_committed_seal_bytes(store, scope, root_id, request, deadline=deadline)
     if saved is None:
         raise RecoveryHttpRefused(503, "recovery_seal_indeterminate")
-    runs._retire_selected_provider_identity(adapter, scope)
     return saved
 
 
@@ -310,11 +480,11 @@ def _get_worker(
 ) -> bytes:
     from hermes_state_recovery_seal import read_seal_bytes, read_sealed_page_bytes
 
-    store, scope = _scope_for_root(adapter, owner, root_id)
-    require_time()
-    if page is None:
-        return read_seal_bytes(store, scope, root_id, deadline=deadline)
-    return read_sealed_page_bytes(store, scope, root_id, page, deadline=deadline)
+    with _read_scope_for_root(owner, root_id) as (view, scope, _identity):
+        require_time()
+        if page is None:
+            return read_seal_bytes(view, scope, root_id, deadline=deadline)
+        return read_sealed_page_bytes(view, scope, root_id, page, deadline=deadline)
 
 
 def _error(exc: BaseException) -> web.Response:
@@ -325,6 +495,8 @@ def _error(exc: BaseException) -> web.Response:
     elif isinstance(exc, RecoveryRefused):
         if exc.code == "seal_deadline_exceeded":
             status = 504
+        elif exc.code == "protected_session_authority_unavailable":
+            status = 503
         elif exc.code in {
             "not_found",
             "seal_not_found",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 import weakref
@@ -29,6 +30,7 @@ from gateway.platforms.api_server_recovery_contract import (
 from hermes_state import SessionDB
 from hermes_state_recovery import (
     AdmissionIdentity,
+    RecoveryRefused,
     RecoveryScope,
     RecoveryStore,
     membership_sha256,
@@ -216,7 +218,7 @@ def test_owner_context_rejects_no_key_and_room_grant_beside_bearer(
     assert alternate.value.status == 401
 
 
-def test_root_lookup_refuses_manual_db_override_from_different_profile_home(
+def test_readonly_root_lookup_ignores_foreign_override_and_does_not_create(
     tmp_path,
 ) -> None:
     adapter = _adapter()
@@ -229,8 +231,9 @@ def test_root_lookup_refuses_manual_db_override_from_different_profile_home(
     try:
         owner = recovery.RecoveryOwnerContext("selected", selected_home, "a" * 64)
         with pytest.raises(recovery.RecoveryHttpRefused) as refused:
-            recovery._scope_for_root(adapter, owner, "run_root")
-        assert refused.value.status == 503
+            with recovery._read_scope_for_root(owner, "run_root"):
+                pytest.fail("absent root opened")
+        assert refused.value.status == 404
         assert not (selected_home / "state.db").exists()
     finally:
         db.close()
@@ -428,6 +431,53 @@ async def test_served_routes_reject_unbounded_or_ambiguous_inputs_before_db(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ordinary_file", [False, True])
+async def test_cold_missing_root_reads_never_initialize_or_reconcile_store(
+    tmp_path, monkeypatch, ordinary_file: bool
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+    )
+    state_path = home / "state.db"
+    if ordinary_file:
+        ordinary = SessionDB(state_path)
+        ordinary.close()
+    before = state_path.read_bytes() if ordinary_file else None
+    adapter = _adapter()
+    request = SealRequest(
+        request_id=str(uuid4()),
+        session_id="missing-session",
+        run_ids=("missing-root",),
+        expected_membership_sha256=membership_sha256(("missing-root",)),
+    )
+    headers = {"Authorization": f"Bearer {_KEY}"}
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            for method, path, data in (
+                ("GET", "/v1/runs/missing-root/seal", None),
+                ("GET", "/v1/runs/missing-root/sealed-transcript?page=0", None),
+                (
+                    "POST",
+                    "/v1/runs/missing-root/seal",
+                    request.model_dump_json(by_alias=True),
+                ),
+            ):
+                response = await client.request(
+                    method, path, data=data, headers=headers
+                )
+                assert response.status == 404, await response.text()
+        assert (state_path.read_bytes() if state_path.exists() else None) == before
+        assert not list(home.glob("state.db.malformed-backup-*"))
+        assert not list(home.glob("state.db.repair-scratch*"))
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_served_get_replays_exact_committed_bytes_after_reopen(
     tmp_path, monkeypatch
 ) -> None:
@@ -443,9 +493,17 @@ async def test_served_get_replays_exact_committed_bytes_after_reopen(
         adapter, _request(f"Bearer {_KEY}"), selected_profile=None
     )
     assert owner.profile == "default"
-    db, store, scope, _seal_request, _, _ = _no_call_case(home, owner, monkeypatch)
+    db, store, scope, seal_request, _, _ = _no_call_case(home, owner, monkeypatch)
     saved_result = read_seal_bytes(store, scope, "run_root")
     saved_page = read_sealed_page_bytes(store, scope, "run_root", 0)
+    with recovery._read_scope_for_root(owner, "run_root") as (read_view, read_scope, _):
+        assert read_scope == scope and not hasattr(read_view, "_write")
+        assert read_view.db._conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            read_view.db._conn.execute(
+                "UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
+                (scope.session_id,),
+            )
     adapter._session_db = db
     headers = {"Authorization": f"Bearer {_KEY}"}
     from gateway.platforms import api_server_runs as runs
@@ -470,7 +528,6 @@ async def test_served_get_replays_exact_committed_bytes_after_reopen(
         db.close()
 
     reopened = _adapter()
-    reopened._session_db = SessionDB(home / "state.db")
     try:
         async with TestClient(TestServer(_app(reopened))) as client:
             result = await client.get("/v1/runs/run_root/seal", headers=headers)
@@ -479,9 +536,14 @@ async def test_served_get_replays_exact_committed_bytes_after_reopen(
                 "/v1/runs/run_root/sealed-transcript?page=0", headers=headers
             )
             assert page.status == 200 and await page.read() == saved_page
+            replay = await client.post(
+                "/v1/runs/run_root/seal",
+                data=seal_request.model_dump_json(by_alias=True),
+                headers=headers,
+            )
+            assert replay.status == 200 and await replay.read() == saved_result
     finally:
         await reopened.disconnect()
-        reopened._session_db.close()
 
 
 @pytest.mark.asyncio
@@ -584,6 +646,67 @@ async def test_post_seals_after_durable_close_with_selected_readback_deadline(
 
 
 @pytest.mark.asyncio
+async def test_committed_post_replay_retires_identity_after_lost_response_readback(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_state_recovery_seal as sealer
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+    )
+    adapter = _adapter()
+    owner = recovery.capture_owner_context(
+        adapter, _request(f"Bearer {_KEY}"), selected_profile=None
+    )
+    db, store, scope, seal_request, plugin, read_deadlines = _no_call_case(
+        home, owner, monkeypatch, seal_now=False
+    )
+    adapter._session_db = db
+    admission = provider_admission(scope.session_id)
+    identities = cast(
+        dict[RecoveryScope, tuple[weakref.ReferenceType[object], bytes]],
+        getattr(adapter, "_protected_provider_identities"),
+    )
+    identities[scope] = (weakref.ref(plugin), admission.canonical_bytes())
+    original = sealer.read_committed_seal_bytes
+    calls = 0
+
+    def lose_second_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RecoveryRefused("seal_deadline_exceeded")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sealer, "read_committed_seal_bytes", lose_second_read)
+    headers = {"Authorization": f"Bearer {_KEY}"}
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            first = await client.post(
+                "/v1/runs/run_root/seal",
+                data=seal_request.model_dump_json(by_alias=True),
+                headers=headers,
+            )
+            assert first.status == 504
+            assert read_deadlines and identities.get(scope) is None
+            saved = read_seal_bytes(store, scope, "run_root")
+            retry = await client.post(
+                "/v1/runs/run_root/seal",
+                data=seal_request.model_dump_json(by_alias=True),
+                headers=headers,
+            )
+            assert retry.status == 200 and await retry.read() == saved
+            assert len(read_deadlines) == 1 and calls == 3
+    finally:
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("close_producer", [False, True])
 async def test_post_keeps_close_barrier_for_open_producer_or_lost_identity(
     tmp_path, monkeypatch, close_producer: bool
@@ -620,6 +743,43 @@ async def test_post_keeps_close_barrier_for_open_producer_or_lost_identity(
                 assert (await response.json())["state"] == "pending"
             assert store.lookup_root(scope, "run_root").phase == "closing"
             assert read_deadlines == []
+    finally:
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_new_post_needs_existing_same_process_writer(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+    )
+    adapter = _adapter()
+    owner = recovery.capture_owner_context(
+        adapter, _request(f"Bearer {_KEY}"), selected_profile=None
+    )
+    db, store, scope, seal_request, _, _ = _no_call_case(
+        home, owner, monkeypatch, seal_now=False
+    )
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/v1/runs/run_root/seal",
+                data=seal_request.model_dump_json(by_alias=True),
+                headers={"Authorization": f"Bearer {_KEY}"},
+            )
+            assert response.status == 503
+            row = db._read_one(
+                "SELECT phase,close_request_id FROM recovery_sessions WHERE session_id=?",
+                (scope.session_id,),
+            )
+            assert row is not None and tuple(row) == ("open", None)
+            assert adapter._session_dbs == {}
     finally:
         await adapter.disconnect()
         db.close()
