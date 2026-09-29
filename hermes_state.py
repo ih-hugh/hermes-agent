@@ -1201,7 +1201,7 @@ class SessionDB(
         """Snapshot inode plus the on-disk generation header when present."""
         self._db_file_identity = _stat_db_file_identity(self.db_path)
         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
-        if self._conn is not None:
+        if not self.read_only and self._conn is not None:
             store = self._conn.execute(
                 "SELECT store_id FROM recovery_store WHERE singleton=1"
             ).fetchone()

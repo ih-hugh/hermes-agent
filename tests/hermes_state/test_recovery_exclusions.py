@@ -634,6 +634,28 @@ def test_late_writer_reopen_aba_checks_opened_store_before_wal(tmp_path: Path, m
         assert raw.execute("SELECT store_id FROM recovery_store").fetchone()[0] != first_id
 
 
+def test_read_only_legacy_store_needs_no_recovery_catalog_or_writer_generation(tmp_path: Path):
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as raw:
+        raw.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY)")
+        raw.execute("INSERT INTO sessions(id) VALUES('legacy')")
+    source = path.read_bytes()
+    db = SessionDB(path, read_only=True)
+    try:
+        assert db._conn.execute("SELECT id FROM sessions").fetchone()[0] == "legacy"
+        assert db._opened_store_id is None
+        assert db._opened_generation_token is None
+    finally:
+        db.close()
+    assert path.read_bytes() == source
+    with sqlite3.connect(path) as raw:
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='recovery_store'"
+        ).fetchone() is None
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        db._read_one("SELECT id FROM sessions")
+
+
 def test_simultaneous_schema_openers_release_only_their_own_claim(tmp_path: Path,
                                                                   monkeypatch):
     path = tmp_path / "state.db"
