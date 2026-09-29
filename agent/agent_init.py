@@ -1396,6 +1396,10 @@ def _apply_agent_section(agent, _agent_cfg):
         "environment_probe", "bot_mode_protocol",
     ):
         setattr(agent, f"_{_key}", bool(_agent_section.get(_key, True)))
+    if getattr(agent, "_recovery_constructor_prepared", None) is not None:
+        # This host probe starts a detached subprocess worker. Protected work
+        # cannot inventory it, including a later lazy system-prompt rebuild.
+        agent._environment_probe = False
     # Warm the probe (~0.5s of subprocesses) off-thread so the first prompt build finds it cached.
     if agent._environment_probe:
         with suppress(Exception):

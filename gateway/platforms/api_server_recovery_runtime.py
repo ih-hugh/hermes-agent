@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from agent.recovery_producers import (
     FrozenProtectedRuntime,
+    _issue_static_preparation,
     loaded_selected_provider_supported,
     read_bounded_protected_config,
 )
@@ -167,6 +168,7 @@ def prepare_static_chat_runtime(
             },
             "context": {"engine": "compressor"},
             "tools": {"tool_search": {"enabled": "off"}},
+            "agent": {"environment_probe": False},
         }
         config_json = json.dumps(
             safe_config,
@@ -174,22 +176,24 @@ def prepare_static_chat_runtime(
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
-        return FrozenProtectedRuntime(
-            owner.profile,
-            owner.home.resolve(),
-            owner.scope_digest,
-            session_id,
-            model,
-            "openai-api",
-            "chat_completions",
-            _OPENAI_BASE,
-            key,
-            config_json,
-            hashlib.sha256(raw_bytes).hexdigest(),
-            manager,
-            provider,
-            tool_generation,
-            terminal_generation,
+        return _issue_static_preparation(
+            FrozenProtectedRuntime(
+                owner.profile,
+                owner.home.resolve(),
+                owner.scope_digest,
+                session_id,
+                model,
+                "openai-api",
+                "chat_completions",
+                _OPENAI_BASE,
+                key,
+                config_json,
+                hashlib.sha256(raw_bytes).hexdigest(),
+                manager,
+                provider,
+                tool_generation,
+                terminal_generation,
+            )
         )
     except RecoveryRefused:
         raise

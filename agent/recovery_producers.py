@@ -50,6 +50,10 @@ _SEND_LOCK = threading.Lock()
 _SEND_MAP: weakref.WeakKeyDictionary[SendPermit, tuple[ProducerRegistry, str, str]] = (
     weakref.WeakKeyDictionary()
 )
+_PREPARATION_LOCK = threading.Lock()
+_ISSUED_PREPARATIONS: weakref.WeakValueDictionary[int, FrozenProtectedRuntime] = (
+    weakref.WeakValueDictionary()
+)
 _MAX_PROTECTED_CONFIG_BYTES = 1_048_576
 
 
@@ -78,7 +82,7 @@ def current_lease() -> ProducerLease | None:
     return _ACTIVE_LEASE.get()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class FrozenProtectedRuntime:
     """Private same-process constructor input; never a recovery authority."""
 
@@ -110,6 +114,15 @@ def current_constructor_preparation() -> FrozenProtectedRuntime | None:
     return _CONSTRUCTOR_PREPARATION.get()
 
 
+def _issue_static_preparation(prepared: FrozenProtectedRuntime) -> FrozenProtectedRuntime:
+    """Retain only this exact same-process preparation object, not copied fields."""
+    if type(prepared) is not FrozenProtectedRuntime:
+        raise RecoveryRefused("unsupported_configuration")
+    with _PREPARATION_LOCK:
+        _ISSUED_PREPARATIONS[id(prepared)] = prepared
+    return prepared
+
+
 def _require_preparation_current(prepared: FrozenProtectedRuntime) -> ProducerRegistry:
     """Check exact selected profile and loaded identities without callback/discovery."""
     from agent.secret_scope import get_secret_str
@@ -121,6 +134,9 @@ def _require_preparation_current(prepared: FrozenProtectedRuntime) -> ProducerRe
     from tools.registry import registry as tool_registry
     from tools.terminal_tool_config import _get_plugin_env_provider
 
+    with _PREPARATION_LOCK:
+        if _ISSUED_PREPARATIONS.get(id(prepared)) is not prepared:
+            raise RecoveryRefused("unsupported_configuration")
     try:
         registry = current_registry()
         if (registry is None

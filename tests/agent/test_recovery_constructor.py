@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event, Thread
 import pickle
+from dataclasses import replace
 
 import pytest
 
@@ -123,6 +124,96 @@ def test_real_protected_agent_uses_loaded_terminal_without_discovery_or_checker(
         executor.run(construct)
         assert calls == []
         assert manager._discovered
+    finally:
+        db.close()
+
+
+def test_cold_protected_constructor_and_prompt_never_start_environment_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent import system_prompt
+    from tools import env_probe
+
+    _, db, scope, _, _, prepared, writer, executor = _prepared(tmp_path, monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        env_probe, "warm_environment_probe_async", lambda: calls.append("warm")
+    )
+    monkeypatch.setattr(
+        env_probe, "get_environment_probe_line", lambda: calls.append("lazy") or ""
+    )
+
+    def construct() -> None:
+        with bind_write_permit(writer), bind_protected_constructor(prepared):
+            agent = AIAgent(
+                api_key=prepared.api_key,
+                base_url=prepared.base_url,
+                provider=prepared.provider,
+                api_mode=prepared.api_mode,
+                model=prepared.model,
+                enabled_toolsets=["terminal_only"],
+                session_id=scope.session_id,
+                session_db=db,
+                platform="api_server",
+                quiet_mode=True,
+                skip_memory=True,
+                skip_background_review=True,
+                skip_context_files=True,
+            )
+        assert agent._environment_probe is False
+        system_prompt.build_system_prompt_parts(agent)
+        assert calls == []
+        agent.client.close()
+
+    try:
+        executor.run(construct)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("change", ["base_url", "model", "config_json"])
+def test_replaced_preparation_refuses_before_client(
+    tmp_path: Path, monkeypatch, change: str
+) -> None:
+    import openai
+
+    _, db, scope, _, _, prepared, writer, executor = _prepared(tmp_path, monkeypatch)
+    replacement = {
+        "base_url": "https://other.example/v1",
+        "model": "redirected-model",
+        "config_json": b'{"agent":{"environment_probe":true}}',
+    }[change]
+    changed = replace(prepared, **{change: replacement})
+    calls: list[str] = []
+    monkeypatch.setattr(
+        openai, "OpenAI", lambda **_kwargs: calls.append("client") or object()
+    )
+
+    def construct() -> None:
+        with (
+            bind_write_permit(writer),
+            pytest.raises(RecoveryRefused, match="unsupported_configuration"),
+        ):
+            with bind_protected_constructor(changed):
+                AIAgent(
+                    api_key=changed.api_key,
+                    base_url=changed.base_url,
+                    provider=changed.provider,
+                    api_mode=changed.api_mode,
+                    model=changed.model,
+                    enabled_toolsets=["terminal_only"],
+                    session_id=scope.session_id,
+                    session_db=db,
+                    platform="api_server",
+                    quiet_mode=True,
+                    skip_memory=True,
+                    skip_background_review=True,
+                    skip_context_files=True,
+                )
+
+    try:
+        executor.run(construct)
+        assert calls == []
     finally:
         db.close()
 
