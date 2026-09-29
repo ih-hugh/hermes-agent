@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Literal
@@ -189,6 +190,14 @@ class RecoveryStore:
                     return AdmissionResult("refused", None, "existing_session")
                 from hermes_state_recovery_guard import install_recovery_guards
                 install_recovery_guards(conn)
+                # A stopped queued run still has a real source row. Insert it
+                # before the recovery identity in this same transaction: the
+                # row trigger sees no protected identity yet, while commit
+                # exposes both records atomically.
+                conn.execute(
+                    "INSERT INTO sessions(id,source,profile_name,started_at) VALUES(?,?,?,?)",
+                    (scope.session_id, "api_server", scope.profile, time.time()),
+                )
                 conn.execute(
                     "INSERT INTO recovery_sessions(session_id,profile,scope_digest,phase,revision,root_run_id) "
                     "VALUES(?,?,?,'open',1,?)",

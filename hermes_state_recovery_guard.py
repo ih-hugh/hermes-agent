@@ -9,8 +9,10 @@ from __future__ import annotations
 import sqlite3
 import weakref
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Callable, Iterator, TypeVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -42,7 +44,47 @@ _LEDGER = (
     "recovery_sealed_pages",
     "recovery_exclusions",
 )
+_INITIAL_METADATA_COLUMNS = (
+    "user_id", "session_key", "chat_id", "chat_type", "thread_id",
+    "display_name", "origin_json", "model", "model_config",
+    "system_prompt_hash", "parent_session_id", "cwd",
+)
+_INITIAL_METADATA_MARKERS = _INITIAL_METADATA_COLUMNS
+_INITIAL_METADATA_RESTRICTED = tuple(
+    column for column in _INITIAL_METADATA_COLUMNS
+    if column not in {"model", "model_config", "display_name"}
+)
+_INITIAL_METADATA: ContextVar[tuple[int, int, int, str, str, int, int] | None] = ContextVar(
+    "recovery_initial_session_metadata", default=None,
+)
 T = TypeVar("T")
+
+
+@contextmanager
+def initial_session_metadata_write(
+    db: SessionDB, conn: sqlite3.Connection, permit: object, session_id: str,
+    run_id: str, generation: int,
+) -> Iterator[None]:
+    """Authorize one exact source-row NULL fill inside a guarded write callback."""
+    from agent.recovery_producers import current_lease
+    from hermes_state_recovery import RecoveryRefused
+
+    lease = current_lease()
+    if (
+        lease is None or lease.kind != "executor"
+        or lease.registry.store.db is not db
+        or lease.registry.scope.session_id != session_id
+        or lease.registry.run_id != run_id
+        or lease.registry.generation != generation
+    ):
+        raise RecoveryRefused("session_init_executor_required")
+    token = _INITIAL_METADATA.set(
+        (id(db), id(conn), id(permit), session_id, run_id, generation, id(lease))
+    )
+    try:
+        yield
+    finally:
+        _INITIAL_METADATA.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +259,29 @@ def register_connection_guard(conn: sqlite3.Connection, db: SessionDB) -> None:
 
     def _row_guard(session_id, mutation):
         live_db, live_conn = db_ref(), conn_ref()
+        if mutation == "session_init" and live_db is not None and live_conn is not None:
+            from agent.recovery_context import current_write_permit
+            from agent.recovery_producers import current_lease
+            from agent.recovery_context import current_incarnation
+
+            permit = current_write_permit()
+            lease = current_lease()
+            record = _INITIAL_METADATA.get()
+            if (
+                record is not None and lease is not None and permit is not None
+                and record == (id(live_db), id(live_conn), id(permit), session_id,
+                               lease.registry.run_id, lease.registry.generation, id(lease))
+                and lease.kind == "executor"
+                and lease.registry.store.db is live_db
+                and authorize_recovery_row(live_db, live_conn, session_id, "session")
+            ):
+                producer = live_conn.execute(
+                    "SELECT state,owner_incarnation FROM recovery_producers "
+                    "WHERE producer_id=? AND run_id=? AND kind='executor'",
+                    (lease.producer_id, lease.registry.run_id),
+                ).fetchone()
+                return int(producer is not None and tuple(producer) == ("running", current_incarnation()))
+            return 0
         return int(
             live_db is not None
             and live_conn is not None
@@ -265,6 +330,23 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                     f"CASE WHEN {nonzero} THEN 'usage' ELSE 'session' END"
                 )
             if table == "sessions" and operation == "UPDATE":
+                columns = [str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")]
+                allowed = set(_INITIAL_METADATA_COLUMNS)
+                initial_only = " AND ".join(
+                    f"OLD.{column} IS NEW.{column}" for column in columns if column not in allowed
+                )
+                null_fills = " AND ".join(
+                    f"(OLD.{column} IS NULL OR OLD.{column} IS NEW.{column})"
+                    for column in _INITIAL_METADATA_COLUMNS
+                )
+                initial_change = " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}"
+                    for column in _INITIAL_METADATA_MARKERS
+                )
+                restricted_change = " OR ".join(
+                    f"OLD.{column} IS NOT NEW.{column}"
+                    for column in _INITIAL_METADATA_RESTRICTED
+                )
                 changed = " OR ".join(
                     f"OLD.{column} IS NOT NEW.{column}"
                     for column in _USAGE_SESSION_COLUMNS
@@ -275,6 +357,9 @@ def install_recovery_guards(conn: sqlite3.Connection) -> None:
                 )
                 checked_mutation = (
                     f"CASE WHEN OLD.id IS NOT NEW.id THEN 'move' "
+                    f"WHEN ({initial_change}) AND ({initial_only}) AND ({null_fills}) "
+                    "THEN 'session_init' "
+                    f"WHEN {restricted_change} THEN 'unsupported' "
                     f"WHEN {unsupported} THEN 'unsupported' "
                     f"WHEN {changed} THEN 'usage' ELSE 'session' END"
                 )

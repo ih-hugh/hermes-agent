@@ -118,6 +118,26 @@ def test_atomic_member_before_dispatch(tmp_path: Path):
         second.db.close()
 
 
+def test_root_admission_commits_real_source_session_before_dispatch(tmp_path: Path):
+    """A queued stop has a source row even if no AIAgent was constructed."""
+    first, second = _stores(tmp_path)
+    try:
+        result = first.reserve(_root(), _identity(first, owner=current_incarnation()))
+        assert result.outcome == "created"
+        row = second.db._read_one(
+            "SELECT id,source,profile_name,started_at,model,model_config "
+            "FROM sessions WHERE id=?", ("exact-session",),
+        )
+        assert row is not None
+        assert row[:3] == ("exact-session", "api_server", "factory")
+        assert isinstance(row[3], (int, float)) and row[3] > 0
+        assert row[4:] == (None, None)
+        assert second.lookup_key(_identity(second).scope, "byf-recovery-v1:one", "a" * 64)
+    finally:
+        first.db.close()
+        second.db.close()
+
+
 def test_close_races_admission(tmp_path: Path):
     """BEGIN IMMEDIATE orders close against a nudge reservation on another connection."""
     first, second = _stores(tmp_path)

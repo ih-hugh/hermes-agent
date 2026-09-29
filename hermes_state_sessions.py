@@ -2,6 +2,7 @@
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
 
+import hashlib
 import json
 import logging
 import re
@@ -367,6 +368,115 @@ class SessionSessionsMixin:
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create (upsert) a session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
+        return session_id
+
+    def initialize_protected_session(
+        self, session_id: str, source: str, *, recovery_permit: object,
+        model: str | None = None, model_config: Dict[str, Any] | None = None,
+        system_prompt: str | None = None, user_id: str | None = None,
+        session_key: str | None = None, chat_id: str | None = None,
+        chat_type: str | None = None, thread_id: str | None = None,
+        display_name: str | None = None, origin_json: str | None = None,
+        parent_session_id: str | None = None, cwd: str | None = None,
+        profile_name: str | None = None,
+    ) -> str:
+        """Acknowledge one real agent's NULL-fill of its admitted source row."""
+        from agent.recovery_context import write_binding
+        from agent.recovery_producers import current_lease
+        from gateway.platforms.api_server_recovery_artifacts import MAX_DOCUMENT_BYTES
+        from hermes_state_recovery import RecoveryRefused, RecoveryStore
+        from hermes_state_recovery_guard import guarded_write, initial_session_metadata_write
+
+        store = RecoveryStore(self)
+        binding = write_binding(recovery_permit, store)
+        if binding is None:
+            raise RecoveryRefused("invalid_write_permit")
+        scope, run_id, generation = binding
+        lease = current_lease()
+        if (
+            scope.session_id != session_id or source != "api_server"
+            or profile_name != scope.profile or lease is None or lease.kind != "executor"
+            or lease.registry.store.db is not self or lease.registry.scope != scope
+            or lease.registry.run_id != run_id or lease.registry.generation != generation
+        ):
+            raise RecoveryRefused("session_init_executor_required")
+        metadata = {
+            "model": model, "model_config": model_config, "system_prompt": system_prompt,
+            "user_id": user_id, "session_key": session_key, "chat_id": chat_id,
+            "chat_type": chat_type, "thread_id": thread_id,
+            "display_name": display_name, "origin_json": origin_json,
+            "parent_session_id": parent_session_id, "cwd": cwd,
+        }
+        try:
+            payload = json.dumps(
+                {"session_id": session_id, "source": source, "profile_name": profile_name,
+                 "metadata": metadata},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise RecoveryRefused("session_init_invalid") from exc
+        if len(payload) > MAX_DOCUMENT_BYTES:
+            raise RecoveryRefused("session_init_oversized")
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        write_identity = json.dumps(
+            [scope.store_id, session_id, run_id, generation], separators=(",", ":")
+        ).encode("utf-8")
+        write_id = "session-init:" + hashlib.sha256(write_identity).hexdigest()
+
+        def _fill(conn: sqlite3.Connection) -> dict[str, bool]:
+            row = conn.execute(
+                "SELECT source,profile_name,system_prompt_hash FROM sessions WHERE id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row[0] != source or row[1] != profile_name:
+                raise RecoveryRefused("source_session_mismatch")
+            producer = conn.execute(
+                "SELECT state,owner_incarnation FROM recovery_producers "
+                "WHERE producer_id=? AND run_id=? AND kind='executor'",
+                (lease.producer_id, run_id),
+            ).fetchone()
+            from agent.recovery_context import current_incarnation
+            if producer is None or tuple(producer) != ("running", current_incarnation()):
+                raise RecoveryRefused("session_init_executor_required")
+            prior_initialization = conn.execute(
+                "SELECT 1 FROM recovery_write_acks WHERE session_id=? "
+                "AND mutation='session' AND state='committed' "
+                "AND write_id LIKE 'session-init:%' AND write_id<>? LIMIT 1",
+                (session_id, write_id),
+            ).fetchone()
+            if prior_initialization is not None:
+                # A nudge may acknowledge its own turn, but it cannot fill
+                # routing or model fields that the root left NULL.
+                return {"initialized": False}
+            prompt_hash = row[2]
+            if prompt_hash is None and system_prompt is not None:
+                prompt_hash = self._store_system_prompt(conn, system_prompt)
+            values = (
+                user_id, session_key, chat_id, chat_type, thread_id,
+                display_name, origin_json, model,
+                json.dumps(model_config) if model_config else None,
+                prompt_hash, parent_session_id, cwd, session_id,
+            )
+            with initial_session_metadata_write(
+                self, conn, recovery_permit, session_id, run_id, generation,
+            ):
+                conn.execute(
+                    "UPDATE sessions SET "
+                    "user_id=COALESCE(user_id,?),session_key=COALESCE(session_key,?),"
+                    "chat_id=COALESCE(chat_id,?),chat_type=COALESCE(chat_type,?),"
+                    "thread_id=COALESCE(thread_id,?),display_name=COALESCE(display_name,?),"
+                    "origin_json=COALESCE(origin_json,?),model=COALESCE(model,?),"
+                    "model_config=COALESCE(model_config,?),"
+                    "system_prompt_hash=COALESCE(system_prompt_hash,?),"
+                    "parent_session_id=COALESCE(parent_session_id,?),cwd=COALESCE(cwd,?) "
+                    "WHERE id=?",
+                    values,
+                )
+            return {"initialized": True}
+
+        guarded_write(
+            self, recovery_permit, "session", write_id, payload_sha256, _fill,
+        )
         return session_id
 
     def ensure_session(self, session_id: str, source: str = "unknown", model: str = None, **kwargs) -> str:

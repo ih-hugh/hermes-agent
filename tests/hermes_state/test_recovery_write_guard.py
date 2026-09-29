@@ -51,10 +51,15 @@ def test_admission_atomically_guards_protected_rows_but_preserves_legacy_writes(
     try:
         db.create_session("ordinary-session", "cli")
         assert db.get_session("ordinary-session") is not None
+        admitted_row = tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        ))
 
         with pytest.raises(sqlite3.DatabaseError):
             db.create_session(scope.session_id, "api_server")
-        assert db.get_session(scope.session_id) is None
+        assert tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == admitted_row
 
         with sqlite3.connect(db.db_path) as raw:
             with pytest.raises(sqlite3.DatabaseError):
@@ -67,6 +72,9 @@ def test_admission_atomically_guards_protected_rows_but_preserves_legacy_writes(
                     "UPDATE sessions SET display_name=? WHERE id=?",
                     ("raw", "ordinary-session"),
                 )
+        assert tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == admitted_row
         assert (
             db._read_one(
                 "SELECT phase FROM recovery_sessions WHERE session_id=?",
@@ -74,6 +82,36 @@ def test_admission_atomically_guards_protected_rows_but_preserves_legacy_writes(
             )[0]
             == "open"
         )
+    finally:
+        db.close()
+
+
+def test_generic_permit_cannot_fill_first_agent_metadata(tmp_path: Path) -> None:
+    db, store, scope, handoff = _protected_db(tmp_path)
+    producer = issue_producer_permit(store, handoff)
+    writer = issue_write_permit(producer, store, scope, "root", 0)
+    try:
+        before = tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        ))
+        with bind_write_permit(writer):
+            with pytest.raises(sqlite3.DatabaseError):
+                db._execute_write(lambda conn: conn.execute(
+                    "UPDATE sessions SET model='forged',model_config='{}' WHERE id=?",
+                    (scope.session_id,),
+                ))
+            with pytest.raises(sqlite3.DatabaseError):
+                db._execute_write(lambda conn: conn.execute(
+                    "UPDATE sessions SET session_key='forged' WHERE id=?",
+                    (scope.session_id,),
+                ))
+        assert tuple(db._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == before
+        assert db._read_one(
+            "SELECT count(*) FROM recovery_write_acks WHERE session_id=?",
+            (scope.session_id,),
+        )[0] == 0
     finally:
         db.close()
 
@@ -98,9 +136,14 @@ def test_reopened_sessiondb_has_guard_before_first_write(tmp_path: Path) -> None
     reopened = SessionDB(path)
     try:
         reopened.create_session("ordinary", "cli")
+        admitted_row = tuple(reopened._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        ))
         with pytest.raises(sqlite3.DatabaseError):
             reopened.create_session(scope.session_id, "api_server")
-        assert reopened.get_session(scope.session_id) is None
+        assert tuple(reopened._read_one(
+            "SELECT * FROM sessions WHERE id=?", (scope.session_id,),
+        )) == admitted_row
     finally:
         reopened.close()
 
