@@ -12,12 +12,13 @@ import json
 import sqlite3
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, RecoveryMember, SealRequest
 
 if TYPE_CHECKING:
     from hermes_state import SessionDB
+    from hermes_state_usage import RetainedUsagePayload
 
 
 RESERVED_KEY_PREFIX = "byf-recovery-v1:"
@@ -224,16 +225,21 @@ class RecoveryStore:
     def reserve_usage_payload(self, permit: object, delta: object, digest: str) -> str:
         """Pin the first accepted payload before the worker crosses a thread boundary."""
         from agent.recovery_context import current_incarnation, usage_write_binding
+        from hermes_state_usage import UsageDelta
 
         binding = usage_write_binding(permit, self)
-        if (binding is None or delta.write_id != binding.delta_id
+        if (binding is None or type(delta) is not UsageDelta
+                or delta.write_id != binding.delta_id
                 or delta.attempt_id != binding.attempt_id or delta.generation != binding.generation):
             raise RecoveryRefused("invalid_usage_permit")
+        payload = delta.canonical_bytes()
+        if delta.digest() != digest:
+            raise RecoveryRefused("usage_payload_conflict")
 
         def _tx(conn):
             row = conn.execute(
-                "SELECT s.state,s.payload_sha256,a.state,p.state,p.owner_incarnation,"
-                "m.producer_state,m.owner_incarnation FROM recovery_usage_slots s "
+                "SELECT s.state,s.payload_sha256,s.payload_json,a.state,p.state,p.owner_incarnation,"
+                "m.producer_state,m.owner_incarnation,s.ack_revision FROM recovery_usage_slots s "
                 "JOIN recovery_sends a USING(attempt_id) "
                 "JOIN recovery_producers p ON p.producer_id=a.producer_id "
                 "JOIN recovery_members m ON m.run_id=a.run_id "
@@ -245,20 +251,26 @@ class RecoveryStore:
             ).fetchone()
             if row is None:
                 raise RecoveryRefused("invalid_usage_permit")
-            if row[1] is not None and row[1] != digest:
+            if (row[1] is None) != (row[2] is None):
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            if row[1] is not None and (row[1] != digest or row[2] != payload):
                 raise RecoveryRefused("usage_payload_conflict")
+            if (row[0] == "committed" and
+                    (row[2] is None or type(row[8]) is not int or row[8] <= 0)):
+                raise RecoveryRefused("invalid_retained_usage_payload")
             if row[0] == "committed":
                 return "committed"
             if row[0] != "pending":
                 raise RecoveryRefused("usage_write_failed")
-            if (row[2] != "invoking" or row[3] not in {"running", "closed"}
-                    or row[4:] != (current_incarnation(), "open", current_incarnation())):
+            if (row[3] != "invoking" or row[4] not in {"running", "closed"}
+                    or row[5:8] != (current_incarnation(), "open", current_incarnation())):
                 raise RecoveryRefused("invalid_usage_permit")
-            conn.execute(
-                "UPDATE recovery_usage_slots SET payload_sha256=? "
-                "WHERE delta_id=? AND payload_sha256 IS NULL",
-                (digest, binding.delta_id),
-            )
+            if row[1] is None:
+                conn.execute(
+                    "UPDATE recovery_usage_slots SET payload_sha256=?,payload_json=? "
+                    "WHERE delta_id=? AND payload_sha256 IS NULL AND payload_json IS NULL",
+                    (digest, payload, binding.delta_id),
+                )
             return "pending"
 
         return self._write(_tx)
@@ -266,21 +278,41 @@ class RecoveryStore:
     def apply_usage_delta(self, permit: object, delta: object, digest: str) -> None:
         """Apply session/model counters and acknowledgement in one guarded transaction."""
         from agent.recovery_context import _usage_apply, usage_write_binding
-        from hermes_state_usage import _TOKEN_UPDATE_DELTA_SQL
+        from hermes_state_usage import UsageDelta, _TOKEN_UPDATE_DELTA_SQL
 
         binding = usage_write_binding(permit, self)
-        if (binding is None or binding.delta_id != delta.write_id
+        if (binding is None or type(delta) is not UsageDelta
+                or binding.delta_id != delta.write_id
                 or binding.attempt_id != delta.attempt_id or binding.generation != delta.generation):
             raise RecoveryRefused("invalid_usage_permit")
+        submitted = delta.canonical_bytes()
+        if delta.digest() != digest:
+            raise RecoveryRefused("usage_payload_conflict")
 
         def _tx(conn):
             slot = conn.execute(
-                "SELECT state,payload_sha256,ack_revision FROM recovery_usage_slots "
-                "WHERE delta_id=? AND attempt_id=?", (binding.delta_id, binding.attempt_id),
+                "SELECT s.state,s.payload_sha256,s.payload_json,s.ack_revision,"
+                "a.run_id,a.producer_id,m.generation,p.run_id "
+                "FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
+                "JOIN recovery_members m ON m.run_id=a.run_id "
+                "JOIN recovery_producers p ON p.producer_id=a.producer_id "
+                "WHERE s.delta_id=? AND s.attempt_id=? AND m.session_id=? "
+                "AND m.profile=? AND m.scope_digest=?",
+                (binding.delta_id, binding.attempt_id, binding.scope.session_id,
+                 binding.scope.profile, binding.scope.scope_digest),
             ).fetchone()
-            if slot is None or slot[1] != digest:
+            if (slot is None or (slot[4], slot[5], slot[6], slot[7]) !=
+                    (binding.run_id, binding.producer_id, binding.generation, binding.run_id)):
+                raise RecoveryRefused("invalid_usage_permit")
+            retained = UsageDelta.from_canonical_bytes(slot[2], slot[1])
+            if (slot[1] != digest or slot[2] != submitted
+                    or retained.write_id != binding.delta_id
+                    or retained.attempt_id != binding.attempt_id
+                    or retained.generation != binding.generation):
                 raise RecoveryRefused("usage_payload_conflict")
             if slot[0] == "committed":
+                if type(slot[3]) is not int or slot[3] <= 0:
+                    raise RecoveryRefused("invalid_retained_usage_payload")
                 return
             if slot[0] != "pending":
                 raise RecoveryRefused("usage_write_failed")
@@ -293,35 +325,35 @@ class RecoveryStore:
             # Row triggers re-check live member, send, producer and slot on this same
             # connection. The private usage context narrows this permit to these counters.
             with _usage_apply(self.db, conn, permit):
-                if (int(row[3] or 0) == 0 and delta.model and delta.billing_provider
-                        and (row[1] != delta.model or row[2] != delta.billing_provider)):
+                if (int(row[3] or 0) == 0 and retained.model and retained.billing_provider
+                        and (row[1] != retained.model or row[2] != retained.billing_provider)):
                     conn.execute(
                         "UPDATE sessions SET model=?,billing_provider=?,billing_base_url=?,"
                         "billing_mode=? WHERE id=?",
-                        (delta.model, delta.billing_provider, delta.billing_base_url,
-                         delta.billing_mode, binding.scope.session_id),
+                        (retained.model, retained.billing_provider, retained.billing_base_url,
+                         retained.billing_mode, binding.scope.session_id),
                     )
                 conn.execute(_TOKEN_UPDATE_DELTA_SQL, (
-                    delta.input_tokens, delta.output_tokens, delta.cache_read_tokens,
-                    delta.cache_write_tokens, delta.reasoning_tokens,
-                    delta.estimated_cost_usd, delta.actual_cost_usd, delta.actual_cost_usd,
-                    delta.cost_status, delta.cost_source, delta.pricing_version,
-                    delta.billing_provider, delta.billing_base_url, delta.billing_mode,
-                    delta.model, delta.api_call_count, binding.scope.session_id,
+                    retained.input_tokens, retained.output_tokens, retained.cache_read_tokens,
+                    retained.cache_write_tokens, retained.reasoning_tokens,
+                    retained.estimated_cost_usd, retained.actual_cost_usd, retained.actual_cost_usd,
+                    retained.cost_status, retained.cost_source, retained.pricing_version,
+                    retained.billing_provider, retained.billing_base_url, retained.billing_mode,
+                    retained.model, retained.api_call_count, binding.scope.session_id,
                 ))
                 self.db._record_model_usage(
-                    conn, binding.scope.session_id, model=delta.model,
-                    billing_provider=delta.billing_provider,
-                    billing_base_url=delta.billing_base_url,
-                    billing_mode=delta.billing_mode,
-                    input_tokens=delta.input_tokens, output_tokens=delta.output_tokens,
-                    cache_read_tokens=delta.cache_read_tokens,
-                    cache_write_tokens=delta.cache_write_tokens,
-                    reasoning_tokens=delta.reasoning_tokens,
-                    estimated_cost_usd=delta.estimated_cost_usd,
-                    actual_cost_usd=delta.actual_cost_usd,
-                    cost_status=delta.cost_status, cost_source=delta.cost_source,
-                    api_call_count=delta.api_call_count,
+                    conn, binding.scope.session_id, model=retained.model,
+                    billing_provider=retained.billing_provider,
+                    billing_base_url=retained.billing_base_url,
+                    billing_mode=retained.billing_mode,
+                    input_tokens=retained.input_tokens, output_tokens=retained.output_tokens,
+                    cache_read_tokens=retained.cache_read_tokens,
+                    cache_write_tokens=retained.cache_write_tokens,
+                    reasoning_tokens=retained.reasoning_tokens,
+                    estimated_cost_usd=retained.estimated_cost_usd,
+                    actual_cost_usd=retained.actual_cost_usd,
+                    cost_status=retained.cost_status, cost_source=retained.cost_source,
+                    api_call_count=retained.api_call_count,
                 )
             conn.execute("UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
                          (binding.scope.session_id,))
@@ -333,6 +365,51 @@ class RecoveryStore:
             )
 
         self._write(_tx)
+
+    def iter_committed_usage_payloads(
+        self, scope: RecoveryScope, *, conn: sqlite3.Connection,
+    ) -> Iterator[RetainedUsagePayload]:
+        """Yield one checked delta at a time inside the caller's finalization transaction."""
+        from hermes_state_usage import RetainedUsagePayload, UsageDelta, _MAX_USAGE_PAYLOAD_BYTES
+
+        self._check_scope(scope)
+        sql = (
+            "SELECT s.delta_id,s.attempt_id,s.payload_sha256,length(s.payload_json),"
+            "typeof(s.payload_json),s.ack_revision,a.run_id,a.producer_id,m.generation,p.run_id "
+            "FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
+            "JOIN recovery_members m ON m.run_id=a.run_id "
+            "JOIN recovery_producers p ON p.producer_id=a.producer_id "
+            "WHERE m.session_id=? AND m.profile=? AND m.scope_digest=? AND s.state='committed' "
+            "ORDER BY s.ack_revision,s.delta_id"
+        )
+        params = (scope.session_id, scope.profile, scope.scope_digest)
+        cursor = conn.execute(sql, params)
+        try:
+            for row in cursor:
+                # The ordered cursor holds only small metadata. Never fetch an
+                # unbounded corrupt BLOB into Python or SQLite's sort buffer.
+                if (row[4] != "blob" or type(row[3]) is not int
+                        or not 0 < row[3] <= _MAX_USAGE_PAYLOAD_BYTES):
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                payload_row = conn.execute(
+                    "SELECT payload_json FROM recovery_usage_slots WHERE delta_id=? "
+                    "AND typeof(payload_json)='blob' AND length(payload_json)=?",
+                    (row[0], row[3]),
+                ).fetchone()
+                if payload_row is None:
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                payload = payload_row[0]
+                delta = UsageDelta.from_canonical_bytes(payload, row[2])
+                if (delta.write_id != row[0] or delta.attempt_id != row[1]
+                        or delta.generation != row[8] or row[6] != row[9]
+                        or type(row[5]) is not int or row[5] <= 0):
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                yield RetainedUsagePayload(
+                    run_id=row[6], producer_id=row[7], ack_revision=row[5],
+                    payload_sha256=row[2], payload_json=payload, delta=delta,
+                )
+        finally:
+            cursor.close()
 
     def fail_usage_delta(self, permit: object) -> None:
         """Retain a sticky failure; an unavailable DB leaves the slot pending instead."""

@@ -970,6 +970,7 @@ class SessionSchemaMixin:
                 attempt_id TEXT NOT NULL UNIQUE REFERENCES recovery_sends(attempt_id),
                 state TEXT NOT NULL CHECK (state IN ('pending','committed','abandoned','no_charge')),
                 payload_sha256 TEXT,
+                payload_json BLOB,
                 ack_revision INTEGER
             );
             CREATE TABLE IF NOT EXISTS recovery_write_acks (
@@ -988,6 +989,11 @@ class SessionSchemaMixin:
         if not any(row[1] == "parent_producer_id" for row in
                    cursor.execute("PRAGMA table_info(recovery_producers)").fetchall()):
             cursor.execute("ALTER TABLE recovery_producers ADD COLUMN parent_producer_id TEXT")
+        # Old, unqualified slots cannot be reconstructed from their digest. They
+        # remain NULL and the protected read/apply seam explicitly refuses them.
+        if not any(row[1] == "payload_json" for row in
+                   cursor.execute("PRAGMA table_info(recovery_usage_slots)").fetchall()):
+            cursor.execute("ALTER TABLE recovery_usage_slots ADD COLUMN payload_json BLOB")
         # A settled open must not take the writer lock just to restamp the UUID.
         if cursor.execute("SELECT 1 FROM recovery_store WHERE singleton=1").fetchone() is None:
             cursor.execute("INSERT OR IGNORE INTO recovery_store(singleton, store_id) VALUES (1, ?)",

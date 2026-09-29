@@ -8,11 +8,12 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 import weakref
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
@@ -45,14 +46,96 @@ class UsageDelta:
     def __post_init__(self) -> None:
         from hermes_state_recovery import RecoveryRefused
 
-        if (not self.write_id or not self.attempt_id or self.generation not in {0, 1}
-                or not self.model or not self.billing_provider or self.api_call_count != 1
-                or any(getattr(self, field) < 0 for field in _TOKEN_COUNTERS)):
+        if type(self.generation) is not int or self.generation not in (0, 1):
             raise RecoveryRefused("invalid_usage_delta")
+        for name in _TOKEN_COUNTERS + ("api_call_count",):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise RecoveryRefused("invalid_usage_delta")
+        if self.api_call_count != 1:
+            raise RecoveryRefused("invalid_usage_delta")
+        for name in ("estimated_cost_usd", "actual_cost_usd"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            try:
+                valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+            except (OverflowError, ValueError):
+                valid = False
+            if not valid:
+                raise RecoveryRefused("invalid_usage_delta")
+        for name in _USAGE_REQUIRED_STRINGS + _USAGE_OPTIONAL_STRINGS:
+            value = getattr(self, name)
+            if value is None and name in _USAGE_OPTIONAL_STRINGS:
+                continue
+            maximum = 255 if name in ("write_id", "attempt_id") else 4096
+            if (type(value) is not str or (not value and name in _USAGE_REQUIRED_STRINGS)
+                    or len(value) > maximum):
+                raise RecoveryRefused("invalid_usage_delta")
+            try:
+                value.encode("utf-8")
+            except UnicodeError as exc:
+                raise RecoveryRefused("invalid_usage_delta") from exc
+        self.canonical_bytes()
+
+    def canonical_bytes(self) -> bytes:
+        from hermes_state_recovery import RecoveryRefused
+
+        try:
+            encoded = json.dumps(
+                asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise RecoveryRefused("invalid_usage_delta") from exc
+        if len(encoded) > _MAX_USAGE_PAYLOAD_BYTES:
+            raise RecoveryRefused("usage_payload_too_large")
+        return encoded
 
     def digest(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), allow_nan=False)
-        return hashlib.sha256(payload.encode()).hexdigest()
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_canonical_bytes(cls, raw: bytes, digest: str) -> UsageDelta:
+        """Parse retained bytes strictly; never reconstruct from session totals."""
+        from hermes_state_recovery import RecoveryRefused
+
+        if (type(raw) is not bytes or not 0 < len(raw) <= _MAX_USAGE_PAYLOAD_BYTES
+                or type(digest) is not str or hashlib.sha256(raw).hexdigest() != digest):
+            raise RecoveryRefused("invalid_retained_usage_payload")
+
+        def _unique_pairs(pairs):
+            values = {}
+            for key, value in pairs:
+                if key in values:
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                values[key] = value
+            return values
+
+        def _reject_constant(_value):
+            raise RecoveryRefused("invalid_retained_usage_payload")
+
+        try:
+            decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs,
+                                 parse_constant=_reject_constant)
+            if type(decoded) is not dict or set(decoded) != {field.name for field in fields(cls)}:
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            delta = cls(**decoded)
+            if delta.canonical_bytes() != raw:
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            return delta
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise RecoveryRefused("invalid_retained_usage_payload") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedUsagePayload:
+    run_id: str
+    producer_id: str
+    ack_revision: int
+    payload_sha256: str
+    payload_json: bytes
+    delta: UsageDelta
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +146,11 @@ class WriteAckState:
     revision: int | None
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+_USAGE_REQUIRED_STRINGS = ("write_id", "attempt_id", "model", "billing_provider")
+_USAGE_OPTIONAL_STRINGS = (
+    "cost_status", "cost_source", "pricing_version", "billing_base_url", "billing_mode",
+)
+_MAX_USAGE_PAYLOAD_BYTES = 65536
 
 
 def _token_update_sql(delta: bool) -> str:
