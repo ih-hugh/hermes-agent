@@ -29,6 +29,7 @@ except ImportError:
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 from gateway.platforms import api_server_tool_diagnostic as _tool_diag
+from gateway.platforms.api_server_recovery_contract import RecoveryAdmissionResult
 
 if TYPE_CHECKING:
     from hermes_state import SessionDB
@@ -400,13 +401,20 @@ def _resolve_conversation_history(
     return conversation_history, instructions, stored_session_id, None
 
 
-def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":
+def _accepted_response(
+    run_id: str, status: str, gateway_session_key, *, replayed: bool,
+    recovery_admission: RecoveryAdmissionResult | None = None,
+) -> "web.Response":
     """202 admission response; replays are flagged via ``Idempotency-Replayed``."""
     headers = {"Idempotency-Replayed": "true"} if replayed else {}
     if gateway_session_key:
         headers["X-Hermes-Session-Key"] = gateway_session_key
-    return web.json_response(
-        {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
+    payload = {"run_id": run_id, "status": status, "replayed": replayed}
+    if recovery_admission is not None:
+        if recovery_admission.run_id != run_id:
+            raise ValueError("protected response run mismatch")
+        payload["recovery_admission"] = recovery_admission.model_dump(mode="json", by_alias=True)
+    return web.json_response(payload, status=202, headers=headers)
 
 
 def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> "web.Response":
@@ -473,7 +481,6 @@ class _ProtectedNewAdmission:
     provider_capture: Any
     history: list[dict[str, str]]
     result: Any
-    replay_status: str | None
 
 
 def _bounded_protected_history(db: "SessionDB", session_id: str) -> list[dict[str, Any]]:
@@ -587,18 +594,12 @@ def _prepare_and_reserve_protected(
         AdmissionIdentity(scope, key, fingerprint, run_id, current_incarnation(),
                           capture.admission, initial_status),
     )
-    replay_status = None
-    if result.outcome == "replayed":
-        require_time()
-        if result.member is None:
-            raise RecoveryRefused("protected_status_unavailable")
-        status = store.status_for_run(scope.profile, scope.scope_digest, result.member.run_id)
-        if status is None or type(status.get("status")) is not str:
-            raise RecoveryRefused("protected_status_unavailable")
-        replay_status = status["status"]
-    # Once reserve commits, return its actual result even when COMMIT crossed
-    # the deadline. The retained HTTP continuation owns the one-use handoff.
-    return _ProtectedNewAdmission(db, store, scope, runtime, capture, history, result, replay_status)
+    # Identity and status were validated inside reserve's transaction, then
+    # returned only after COMMIT. The retained continuation can dispatch even
+    # when that commit crossed the HTTP deadline; no second source read occurs.
+    return _ProtectedNewAdmission(
+        db, store, scope, runtime, capture, history, result,
+    )
 
 
 async def _settle_undispatched_protected(
@@ -807,7 +808,13 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             if prior.outcome == "conflict":
                 return _json_error(_openai_error, "Protected key conflict",
                                    code="idempotency_key_conflict", status=409)
-            return _accepted_response(prior.run_id, prior.status, None, replayed=True)
+            if prior.admission_identity is None:
+                return _json_error(_openai_error, "Protected admission unavailable",
+                                   code="recovery_store_unavailable", status=503)
+            return _accepted_response(
+                prior.run_id, prior.status, None, replayed=True,
+                recovery_admission=prior.admission_identity,
+            )
     if recovery_admission is None:
         body, room_error = await self._normalize_room_dispatch(request, body)
         if room_error is not None:
@@ -937,8 +944,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if protected_new.result.outcome != "created":
             if protected_new.result.outcome == "replayed":
                 return _accepted_response(
-                    protected_new.result.member.run_id, protected_new.replay_status,
+                    protected_new.result.member.run_id, protected_new.result.replay_status,
                     gateway_session_key, replayed=True,
+                    recovery_admission=protected_new.result.admission_identity,
                 )
             return _json_error(
                 _openai_error, "Protected admission refused",
@@ -1176,7 +1184,11 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    return _accepted_response(
+        run_id, "started", gateway_session_key, replayed=False,
+        recovery_admission=(protected_new.result.admission_identity
+                            if protected_new is not None else None),
+    )
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):

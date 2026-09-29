@@ -13,9 +13,11 @@ import sqlite3
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Literal
+from typing import TYPE_CHECKING, Iterator, Literal, cast
 
-from gateway.platforms.api_server_recovery_contract import RecoveryAdmission, RecoveryMember, SealRequest
+from gateway.platforms.api_server_recovery_contract import (
+    RecoveryAdmission, RecoveryAdmissionResult, RecoveryMember, SealRequest,
+)
 
 if TYPE_CHECKING:
     from hermes_state import SessionDB
@@ -24,6 +26,10 @@ if TYPE_CHECKING:
 
 
 RESERVED_KEY_PREFIX = "byf-recovery-v1:"
+_PROTECTED_REPLAY_STATUSES = frozenset({
+    "queued", "running", "waiting_for_approval", "stopping",
+    "completed", "failed", "cancelled", "interrupted",
+})
 INCOMPLETE_REASONS = frozenset({
     "lost_producer_owner", "missing_membership", "unknown_send_outcome",
     "failed_usage_acknowledgement", "untracked_producer", "unsupported_configuration",
@@ -64,6 +70,8 @@ class AdmissionResult:
     member: RecoveryMember | None
     reason: str | None = None
     handoff: object | None = field(default=None, repr=False, compare=False)
+    admission_identity: RecoveryAdmissionResult | None = None
+    replay_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +87,158 @@ class CloseView:
 
 def membership_sha256(run_ids: list[str] | tuple[str, ...]) -> str:
     return hashlib.sha256(json.dumps(list(run_ids), separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def read_admission_identity(
+    conn: sqlite3.Connection, store_id: str, profile: str, scope_digest: str,
+    session_id: str, key: str, fingerprint: str, admission: RecoveryAdmission,
+) -> tuple[Literal["replayed", "conflict"], str, str, RecoveryAdmissionResult | None] | None:
+    """Validate one bounded member/source snapshot, in a reader or reserve transaction."""
+    from gateway.platforms.api_server_recovery_artifacts import MAX_RESPONSE_BYTES, strict_json_loads
+    from hermes_state_recovery_deadline import require_time
+    from hermes_state_recovery_provider import read_admission
+
+    unavailable = "protected_admission_unavailable"
+    store_meta = conn.execute(
+        "SELECT typeof(store_id),length(substr(CAST(store_id AS BLOB),1,129)) "
+        "FROM recovery_store WHERE singleton=1"
+    ).fetchone()
+    require_time()
+    if (store_meta is None or store_meta[0] != "text"
+            or type(store_meta[1]) is not int or not 0 < store_meta[1] <= 128):
+        raise RecoveryRefused(unavailable)
+    stored_uuid = conn.execute(
+        "SELECT store_id FROM recovery_store WHERE singleton=1"
+    ).fetchone()
+    require_time()
+    if (stored_uuid is None or type(stored_uuid[0]) is not str
+            or len(stored_uuid[0].encode("utf-8")) != store_meta[1]
+            or stored_uuid[0] != store_id):
+        raise RecoveryRefused(unavailable)
+    metadata = conn.execute(
+        "SELECT typeof(run_id),length(substr(CAST(run_id AS BLOB),1,256)),"
+        "typeof(session_id),length(substr(CAST(session_id AS BLOB),1,256)),"
+        "typeof(parent_run_id),length(substr(CAST(parent_run_id AS BLOB),1,256)),"
+        "typeof(request_sha256),length(substr(CAST(request_sha256 AS BLOB),1,65)),"
+        "typeof(status_json),length(substr(CAST(status_json AS BLOB),1,131073)),"
+        "typeof(generation),generation,"
+        "typeof(idempotency_key),length(substr(CAST(idempotency_key AS BLOB),1,257)),"
+        "typeof(owner_incarnation),length(substr(CAST(owner_incarnation AS BLOB),1,256)) "
+        "FROM recovery_members WHERE profile=? AND scope_digest=? AND idempotency_key=?",
+        (profile, scope_digest, key),
+    ).fetchone()
+    require_time()
+    if metadata is None:
+        return None
+    if (
+        metadata[0] != "text" or type(metadata[1]) is not int or not 0 < metadata[1] <= 255
+        or metadata[2] != "text" or type(metadata[3]) is not int or not 0 < metadata[3] <= 255
+        or not ((metadata[4] == "null" and metadata[5] is None) or
+                (metadata[4] == "text" and type(metadata[5]) is int
+                 and 0 < metadata[5] <= 255))
+        or metadata[6] != "text" or metadata[7] != 64
+        or metadata[8] != "text" or type(metadata[9]) is not int
+        or not 0 < metadata[9] <= MAX_RESPONSE_BYTES
+        or metadata[10] != "integer" or type(metadata[11]) is not int
+        or metadata[11] not in (0, 1)
+        or metadata[12] != "text" or type(metadata[13]) is not int
+        or not 0 < metadata[13] <= 256
+        or metadata[14] != "text" or type(metadata[15]) is not int
+        or not 0 < metadata[15] <= 255
+    ):
+        raise RecoveryRefused(unavailable)
+    row = conn.execute(
+        "SELECT run_id,session_id,generation,parent_run_id,request_sha256,status_json,"
+        "idempotency_key,owner_incarnation FROM recovery_members "
+        "WHERE profile=? AND scope_digest=? AND idempotency_key=?",
+        (profile, scope_digest, key),
+    ).fetchone()
+    require_time()
+    if (row is None or type(row[2]) is not int
+            or any(type(row[index]) is not str for index in (0, 1, 4, 5, 6, 7))
+            or row[6] != key or row[7] == ""
+            or any(len(row[index].encode("utf-8")) != metadata[length_index]
+                   for index, length_index in ((0, 1), (1, 3), (4, 7),
+                                               (5, 9), (6, 13), (7, 15)))):
+        raise RecoveryRefused(unavailable)
+    if (
+        row[1] != session_id or row[2] != admission.generation
+        or row[3] != admission.parent_run_id
+        or not hmac.compare_digest(row[4], fingerprint)
+    ):
+        return "conflict", row[0], "queued", None
+    try:
+        status = strict_json_loads(row[5].encode("utf-8"), max_bytes=MAX_RESPONSE_BYTES)
+        state = cast(dict[str, object], status).get("status") if type(status) is dict else None
+        if type(state) is not str or state not in _PROTECTED_REPLAY_STATUSES:
+            raise ValueError("invalid protected status")
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+        raise RecoveryRefused(unavailable) from exc
+    # The root relation and provider association are read from this very same
+    # transaction as the member, never from a current capture or request echo.
+    lineage_meta = conn.execute(
+        "SELECT typeof(root_run_id),length(substr(CAST(root_run_id AS BLOB),1,256)),"
+        "typeof(profile),length(substr(CAST(profile AS BLOB),1,129)),"
+        "typeof(scope_digest),length(substr(CAST(scope_digest AS BLOB),1,65)) "
+        "FROM recovery_sessions WHERE session_id=?", (row[1],),
+    ).fetchone()
+    require_time()
+    if (lineage_meta is None or lineage_meta[0] != "text"
+            or type(lineage_meta[1]) is not int or not 0 < lineage_meta[1] <= 255
+            or lineage_meta[2] != "text" or type(lineage_meta[3]) is not int
+            or not 0 < lineage_meta[3] <= 128
+            or lineage_meta[4] != "text" or lineage_meta[5] != 64):
+        raise RecoveryRefused(unavailable)
+    lineage = conn.execute(
+        "SELECT root_run_id,profile,scope_digest FROM recovery_sessions WHERE session_id=?",
+        (row[1],),
+    ).fetchone()
+    require_time()
+    if (lineage is None or lineage[1:] != (profile, scope_digest)
+            or any(len(lineage[index].encode("utf-8")) != lineage_meta[length_index]
+                   for index, length_index in ((0, 1), (1, 3), (2, 5)))):
+        raise RecoveryRefused(unavailable)
+    root_meta = conn.execute(
+        "SELECT typeof(run_id),length(substr(CAST(run_id AS BLOB),1,256)),"
+        "typeof(parent_run_id) FROM recovery_members "
+        "WHERE session_id=? AND generation=0 AND profile=? AND scope_digest=?",
+        (row[1], profile, scope_digest),
+    ).fetchone()
+    require_time()
+    if (root_meta is None or root_meta[0] != "text" or type(root_meta[1]) is not int
+            or not 0 < root_meta[1] <= 255 or root_meta[2] != "null"):
+        raise RecoveryRefused(unavailable)
+    root = conn.execute(
+        "SELECT run_id,generation,parent_run_id FROM recovery_members "
+        "WHERE session_id=? AND generation=0 AND profile=? AND scope_digest=?",
+        (row[1], profile, scope_digest),
+    ).fetchall()
+    require_time()
+    if (len(root) != 1 or tuple(root[0]) != (lineage[0], 0, None)
+            or len(root[0][0].encode("utf-8")) != root_meta[1]
+            or (row[2] == 0 and (row[0] != lineage[0] or row[3] is not None))
+            or (row[2] == 1 and (row[0] == lineage[0] or row[3] != lineage[0]))):
+        raise RecoveryRefused(unavailable)
+    try:
+        provider = read_admission(conn, row[1])
+        identity = RecoveryAdmissionResult.model_validate({
+            "schema": "hermes.recovery-admission-result/v1",
+            "store_id": stored_uuid[0],
+            "profile": lineage[1],
+            "scope_digest": lineage[2],
+            "session_id": row[1],
+            "run_id": row[0],
+            "generation": row[2],
+            "parent_run_id": row[3],
+            "idempotency_key_sha256": hashlib.sha256(row[6].encode("utf-8")).hexdigest(),
+            "request_sha256": row[4],
+            "gateway_incarnation": row[7],
+            "provider_admission_sha256": hashlib.sha256(provider.canonical_bytes()).hexdigest(),
+        })
+    except (RecoveryRefused, ValueError, TypeError, UnicodeError) as exc:
+        raise RecoveryRefused(unavailable) from exc
+    require_time()
+    return "replayed", row[0], state, identity
 
 
 class RecoveryStore:
@@ -164,21 +324,51 @@ class RecoveryStore:
         scope = identity.scope
 
         def _tx(conn):
-            # Global within the authenticated profile/scope, independent of session ID.
-            existing = conn.execute(
-                "SELECT run_id,generation,parent_run_id,request_sha256,producer_state,session_id "
-                "FROM recovery_members WHERE profile=? AND scope_digest=? AND idempotency_key=?",
-                (scope.profile, scope.scope_digest, identity.idempotency_key)).fetchone()
-            if existing is not None:
-                member = self._member(existing)
-                matching = (existing[5] == scope.session_id and existing[1] == admission.generation
-                            and existing[2] == admission.parent_run_id and
-                            hmac.compare_digest(existing[3], identity.request_sha256))
-                return AdmissionResult("replayed" if matching else "conflict", member)
             from hermes_state_recovery_exclusions import _catalog
 
             if _catalog(conn) != "full":
                 raise RecoveryRefused("protected_session_authority_unavailable")
+            # Global within the authenticated profile/scope, independent of session ID.
+            existing = conn.execute(
+                "SELECT 1 FROM recovery_members WHERE profile=? AND scope_digest=? "
+                "AND idempotency_key=?",
+                (scope.profile, scope.scope_digest, identity.idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                source = read_admission_identity(
+                    conn, scope.store_id, scope.profile, scope.scope_digest,
+                    scope.session_id, identity.idempotency_key,
+                    identity.request_sha256, admission,
+                )
+                member_meta = conn.execute(
+                    "SELECT typeof(producer_state),"
+                    "length(substr(CAST(producer_state AS BLOB),1,12)) "
+                    "FROM recovery_members WHERE profile=? AND scope_digest=? "
+                    "AND idempotency_key=?",
+                    (scope.profile, scope.scope_digest, identity.idempotency_key),
+                ).fetchone()
+                if (source is None or member_meta is None or member_meta[0] != "text"
+                        or type(member_meta[1]) is not int or not 0 < member_meta[1] <= 11):
+                    raise RecoveryRefused("protected_admission_unavailable")
+                member_row = conn.execute(
+                    "SELECT run_id,generation,parent_run_id,request_sha256,producer_state "
+                    "FROM recovery_members WHERE profile=? AND scope_digest=? "
+                    "AND idempotency_key=?",
+                    (scope.profile, scope.scope_digest, identity.idempotency_key),
+                ).fetchone()
+                if (member_row is None or type(member_row[4]) is not str
+                        or len(member_row[4].encode("utf-8")) != member_meta[1]
+                        or member_row[4] not in {"open", "closed", "incomplete"}
+                        or source[1] != member_row[0]):
+                    raise RecoveryRefused("protected_admission_unavailable")
+                member = self._member(member_row)
+                if source[0] == "conflict":
+                    return AdmissionResult("conflict", member)
+                if source[3] is None:
+                    raise RecoveryRefused("protected_admission_unavailable")
+                return AdmissionResult(
+                    "replayed", member, admission_identity=source[3], replay_status=source[2],
+                )
             # The old transport store is a different DB. Protected keys are never written
             # there, and a collision found by the API adapter is refused before this call.
             row = self._session(conn, scope)
@@ -231,12 +421,23 @@ class RecoveryStore:
                  scope.profile, scope.scope_digest, identity.idempotency_key, identity.request_sha256,
                  identity.owner_incarnation, json.dumps(identity.initial_status or {"status": "queued"},
                                                         sort_keys=True, separators=(",", ":"))))
+            source = read_admission_identity(
+                conn, scope.store_id, scope.profile, scope.scope_digest,
+                scope.session_id, identity.idempotency_key,
+                identity.request_sha256, admission,
+            )
+            if (source is None or source[0] != "replayed" or source[1] != identity.run_id
+                    or source[3] is None):
+                raise RecoveryRefused("protected_admission_unavailable")
             return AdmissionResult("created", RecoveryMember(
                 run_id=identity.run_id, generation=admission.generation,
                 parent_run_id=admission.parent_run_id, request_sha256=identity.request_sha256,
-                producer_state="open"))
+                producer_state="open"), admission_identity=source[3], replay_status=source[2])
 
-        result = self._write(_tx)
+        try:
+            result = self._write(_tx)
+        except UnicodeError as exc:
+            raise RecoveryRefused("protected_admission_unavailable") from exc
         if result.outcome == "created":
             from agent.recovery_context import _register_admission_handoff
             return replace(result, handoff=_register_admission_handoff(
