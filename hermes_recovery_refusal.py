@@ -162,7 +162,7 @@ def readonly_resume_session(session_id: str, *, db_path: Path | None = None) -> 
     try:
         db = SessionDB(path, read_only=True)
         try:
-            resolved = str(db.resolve_resume_session_id(session_id) or session_id)
+            resolved = str(db.resolve_resume_session_id(session_id, strict=True) or session_id)
             _check_catalog(db._conn, (session_id, resolved))
             return resolved
         finally:

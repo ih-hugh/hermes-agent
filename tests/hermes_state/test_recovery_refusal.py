@@ -31,6 +31,13 @@ def _catalog(path, *, phase="open", member_state="open"):
             CREATE TABLE recovery_usage_slots(delta_id TEXT, attempt_id TEXT, state TEXT);
             CREATE TABLE recovery_write_acks(write_id TEXT, session_id TEXT, run_id TEXT,
                 generation INTEGER, mutation TEXT, state TEXT);
+            CREATE TABLE recovery_provider_admissions(session_id TEXT, provider TEXT,
+                hermes_revision TEXT, source_sha256 TEXT, provider_sha256 TEXT,
+                lease_id TEXT, grant_sha256 TEXT, admission_json TEXT, admission_sha256 TEXT);
+            CREATE TABLE recovery_provider_invocations(invocation_id TEXT, session_id TEXT,
+                run_id TEXT, generation INTEGER, producer_id TEXT, sequence INTEGER,
+                kind TEXT, state TEXT, create_invocation_id TEXT, container_id TEXT,
+                container_attestation_sha256 TEXT, exit_code INTEGER, outcome_reason TEXT);
         """)
         conn.execute("INSERT INTO recovery_sessions VALUES('protected', '', '', ?, 0, 'run')", (phase,))
         conn.execute("INSERT INTO recovery_members VALUES('run', 'protected', 0, ?)", (member_state,))

@@ -644,7 +644,7 @@ class SessionCompressionMixin:
                 (time.time(), cutoff),
         ) or 0
 
-    def get_compression_chain(self, session_id: str) -> List[str]:
+    def get_compression_chain(self, session_id: str, *, strict: bool = False) -> List[str]:
         """Walk the compression-continuation chain forward: root-first through the tip (``[session_id]``
         when no continuation); ``get_compression_tip`` is the last element. A continuation is a child of
         a session with ``end_reason='compression'``. The old ``child.started_at >= parent.ended_at`` test
@@ -659,17 +659,23 @@ class SessionCompressionMixin:
             with self._read_ctx() as conn:
                 row = conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
             child_id = row["id"] if row is not None else None
-            if not child_id or child_id in seen:
+            if not child_id:
+                return chain
+            if child_id in seen:
+                if strict:
+                    raise RuntimeError("compression continuation cycle")
                 return chain
             seen.add(child_id)
             current = child_id
             chain.append(child_id)
+        if strict:
+            raise RuntimeError("compression continuation depth exhausted")
         return chain
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(self, session_id: str, *, strict: bool = False) -> Optional[str]:
         """Live tip of a compression chain (``get_compression_chain`` semantics); the input
         id when no continuation exists."""
-        chain = self.get_compression_chain(session_id)
+        chain = self.get_compression_chain(session_id, strict=strict)
         return chain[-1] if chain else session_id
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:

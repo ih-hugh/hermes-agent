@@ -96,3 +96,45 @@ async def test_protected_alias_or_tip_refuses_before_writable_init(tmp_path, mon
         await adapter.disconnect()
     with sqlite3.connect(tmp_path / "state.db") as conn:
         assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_broken_compression_read_refuses_before_writable_init(tmp_path, monkeypatch):
+    from agent.recovery_context import bind_write_permit, issue_write_permit
+    from hermes_recovery_refusal import readonly_resume_session
+    from hermes_state_recovery import RecoveryRefused
+
+    db, store, scope, registry = _admitted(tmp_path)
+    db.create_session("ordinary", "api_server")
+    db.end_session("ordinary", "compression")
+    writer = issue_write_permit(
+        registry.permit, store, scope, registry.run_id, registry.generation)
+    with bind_write_permit(writer):
+        db.create_session(scope.session_id, "api_server", parent_session_id="ordinary")
+    db.close()
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("ALTER TABLE sessions RENAME COLUMN source TO source_broken")
+        conn.execute("DROP TABLE async_delegations")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        readonly_resume_session("ordinary", db_path=tmp_path / "state.db")
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "k"}))
+    opened = []
+    monkeypatch.setattr(adapter, "_ensure_session_db_async",
+                        lambda: opened.append(True) or pytest.fail("writable SessionDB opened"))
+    monkeypatch.setattr(adapter, "_select_request_route",
+                        lambda *a, **kw: pytest.fail("provider route selected"))
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/v1/chat/completions", json={
+                "model": "hermes", "messages": [{"role": "user", "content": "hello"}]},
+                headers={"Authorization": "Bearer k", "X-Hermes-Session-Id": "ordinary"})
+            assert response.status == 409
+            assert not opened
+    finally:
+        await adapter.disconnect()
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is None
