@@ -48,9 +48,40 @@ class PreparedMessageBatch:
     payload_sha256: str
     count: int
 
+    def _validated_entries(self) -> list[dict]:
+        if (type(self.canonical_bytes) is not bytes
+                or not 0 < len(self.canonical_bytes) <= MAX_MESSAGE_PREIMAGE_BYTES
+                or type(self.count) is not int
+                or not 0 < self.count <= MAX_MESSAGE_BATCH_ROWS
+                or type(self.payload_sha256) is not str
+                or len(self.payload_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.payload_sha256)
+                or hashlib.sha256(self.canonical_bytes).hexdigest() != self.payload_sha256):
+            raise RecoveryRefused("invalid_recovery_write")
+        try:
+            entries = json.loads(self.canonical_bytes, object_pairs_hook=_pairs_unique,
+                parse_constant=lambda _value: (_ for _ in ()).throw(
+                    RecoveryRefused("invalid_recovery_write")))
+            if (not isinstance(entries, list) or len(entries) != self.count
+                    or any(not isinstance(entry, dict)
+                           or set(entry) != {"row", "requested_target_id"}
+                           or not isinstance(entry["row"], dict) for entry in entries)):
+                raise RecoveryRefused("invalid_recovery_write")
+            rows = []
+            for entry in entries:
+                row = entry["row"]
+                if entry["requested_target_id"] is not None:
+                    row["_row_id"] = entry["requested_target_id"]
+                rows.append(row)
+            if prepare_message_batch(rows) != self:
+                raise RecoveryRefused("invalid_recovery_write")
+        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+            raise RecoveryRefused("invalid_recovery_write") from exc
+        return entries
+
     def fresh_rows(self) -> list[dict]:
         """Return new mutable callback rows; rolled-back IDs cannot contaminate a retry."""
-        entries = json.loads(self.canonical_bytes)
+        entries = self._validated_entries()
         rows = []
         for entry in entries:
             row = entry["row"]
@@ -61,7 +92,8 @@ class PreparedMessageBatch:
 
     def matches_input(self, rows: list[dict]) -> bool:
         try:
-            return prepare_message_batch(rows).canonical_bytes == self.canonical_bytes
+            self._validated_entries()
+            return prepare_message_batch(rows) == self
         except RecoveryRefused:
             return False
 

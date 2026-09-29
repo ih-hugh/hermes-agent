@@ -360,7 +360,6 @@ class SessionMessagesMixin:
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds)
                 for start in range(0, len(messages), chunk_rows))
         prepared = None
-        scope = None
         validated_rows = messages
         if protected_ack:
             from agent.recovery_context import write_binding
@@ -372,7 +371,6 @@ class SessionMessagesMixin:
             binding = write_binding(recovery_permit, RecoveryStore(self))
             if binding is None or binding[0].session_id != session_id:
                 raise RecoveryRefused("invalid_write_permit")
-            scope = binding[0]
             if recovery_prepared_batch is not None:
                 if not isinstance(recovery_prepared_batch, PreparedMessageBatch):
                     raise RecoveryRefused("invalid_recovery_write")
@@ -387,7 +385,7 @@ class SessionMessagesMixin:
                     # Recover its original target only after the committed result
                     # proves that this is the output for this input position.
                     result = self._read_message_write_result(
-                        scope, recovery_write_id, recovery_payload_sha256)
+                        recovery_permit, recovery_write_id, recovery_payload_sha256)
                     if len(result.outcomes) != len(messages):
                         raise RecoveryRefused("write_payload_conflict")
                     normalized = [dict(row) for row in messages]
@@ -429,7 +427,7 @@ class SessionMessagesMixin:
                                 recovery_payload_sha256, _do)
             result = read_message_result(ack.result)
             self.restore_committed_message_batch(
-                scope, recovery_write_id, recovery_payload_sha256, prepared, validated_rows)
+                recovery_permit, recovery_write_id, recovery_payload_sha256, prepared, validated_rows)
             if validated_rows is not messages:
                 for destination, source in zip(messages, validated_rows):
                     destination["_row_id"] = source["_row_id"]
@@ -438,31 +436,39 @@ class SessionMessagesMixin:
             return result.inserted_count
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
-    def _read_message_write_result(self, scope, write_id: str, digest: str):
-        """Read one scoped committed raw result without accepting count-only legacy rows."""
+    def _read_message_write_result(self, permit, write_id: str, digest: str):
+        """Read one exact-member committed result from a process-owned permit."""
+        from agent.recovery_context import write_binding
         from hermes_state_recovery import RecoveryRefused, RecoveryStore
         from hermes_state_recovery_message_result import read_message_result
 
-        RecoveryStore(self)._check_scope(scope)
+        binding = write_binding(permit, RecoveryStore(self))
+        if binding is None:
+            raise RecoveryRefused("invalid_write_permit")
+        scope, run_id, generation = binding
         row = self._read_one(
             "SELECT a.state,a.payload_sha256,a.result_json FROM recovery_write_acks a "
             "JOIN recovery_sessions s ON s.session_id=a.session_id "
             "WHERE a.write_id=? AND a.session_id=? AND s.profile=? AND s.scope_digest=? "
-            "AND a.mutation='message'",
-            (write_id, scope.session_id, scope.profile, scope.scope_digest),
+            "AND a.run_id=? AND a.generation=? AND a.mutation='message'",
+            (write_id, scope.session_id, scope.profile, scope.scope_digest, run_id, generation),
         )
         if row is None or row[0] != "committed" or row[1] != digest:
             raise RecoveryRefused("write_payload_conflict")
         return read_message_result(row[2])
 
     def restore_committed_message_batch(
-        self, scope, write_id: str, digest: str, prepared, messages: List[Dict[str, Any]],
+        self, permit, write_id: str, digest: str, prepared, messages: List[Dict[str, Any]],
     ) -> int:
         """Validate exact committed IDs/roles and restore markers after lost responses."""
+        from agent.recovery_context import write_binding
         from hermes_state_recovery import RecoveryRefused, RecoveryStore
         from hermes_state_recovery_message_result import read_message_result
 
-        RecoveryStore(self)._check_scope(scope)
+        binding = write_binding(permit, RecoveryStore(self))
+        if binding is None:
+            raise RecoveryRefused("invalid_write_permit")
+        scope, run_id, generation = binding
         if not prepared.matches_input(messages):
             raise RecoveryRefused("write_payload_conflict")
         expected_rows = prepared.fresh_rows()
@@ -471,8 +477,8 @@ class SessionMessagesMixin:
                 "SELECT a.state,a.payload_sha256,a.result_json FROM recovery_write_acks a "
                 "JOIN recovery_sessions s ON s.session_id=a.session_id "
                 "WHERE a.write_id=? AND a.session_id=? AND s.profile=? AND s.scope_digest=? "
-                "AND a.mutation='message'",
-                (write_id, scope.session_id, scope.profile, scope.scope_digest),
+                "AND a.run_id=? AND a.generation=? AND a.mutation='message'",
+                (write_id, scope.session_id, scope.profile, scope.scope_digest, run_id, generation),
             ).fetchone()
             if ack is None or ack[0] != "committed" or ack[1] != digest:
                 raise RecoveryRefused("write_payload_conflict")

@@ -35,6 +35,7 @@ from hermes_state_recovery import (
     membership_sha256,
 )
 from hermes_state_usage import UsageDelta
+from hermes_state_recovery_message_result import prepare_message_batch
 
 
 def test_queued_usage_applies_once_and_ack_survives_reopen(tmp_path: Path) -> None:
@@ -326,7 +327,7 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
     with pytest.raises(RuntimeError, match="before effect"):
         _db_flush_write(agent, [row], [live])
     pending = agent._recovery_pending_message_batch
-    assert pending[2].matches_input([row])
+    assert pending[4].matches_input([row])
     row["_row_id"] = 42
     with pytest.raises(RecoveryRefused, match="write_payload_conflict"):
         _db_flush_write(agent, [row], [live])
@@ -335,6 +336,9 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
 
     def _commit_then_lose_response(**kwargs):
         append(**kwargs)
+        # The permit's issued identity survives producer closure for exact
+        # acknowledgement readback after the physical write finished.
+        store.close_producer(scope, "root", registry.permit)
         raise RuntimeError("response lost after commit")
 
     monkeypatch.setattr(db, "append_messages_batch", _commit_then_lose_response)
@@ -344,5 +348,59 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
         assert live[_DB_PERSISTED_MARKER] is True
         assert row["_row_id"] == live["_row_id"] == db.get_messages(scope.session_id)[0]["id"]
         assert agent._recovery_pending_message_batch is None
+    finally:
+        db.close()
+
+
+def test_nudge_cannot_hydrate_root_message_ack_after_pre_effect_failure(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "session")
+    root = store.reserve(
+        RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+        AdmissionIdentity(scope, "byf-recovery-v1:root", "a" * 64, "root",
+                          current_incarnation(), provider_admission(scope.session_id)),
+    )
+    root_registry = ProducerRegistry(
+        store, scope, "root", 0, issue_producer_permit(store, root.handoff))
+    root_writer = issue_write_permit(root_registry.permit, store, scope, "root", 0)
+    with bind_write_permit(root_writer):
+        db.create_session(scope.session_id, "api_server")
+    row = {"role": "user", "content": "identical"}
+    prepared = prepare_message_batch([row])
+    try:
+        db.append_messages_batch(
+            scope.session_id, [dict(row)], recovery_permit=root_writer,
+            recovery_write_id="root-message", recovery_payload_sha256=prepared.payload_sha256)
+        store.close_producer(scope, "root", root_registry.permit)
+        nudge = store.reserve(
+            RecoveryAdmission(schema="hermes.recovery/v1", generation=1,
+                              parent_run_id="root"),
+            AdmissionIdentity(scope, "byf-recovery-v1:nudge", "c" * 64, "nudge",
+                              current_incarnation(), provider_admission(scope.session_id)),
+        )
+        assert nudge.outcome == "created"
+        nudge_registry = ProducerRegistry(
+            store, scope, "nudge", 1, issue_producer_permit(store, nudge.handoff))
+        nudge_writer = issue_write_permit(nudge_registry.permit, store, scope, "nudge", 1)
+        live = dict(row)
+        agent = SimpleNamespace(
+            _session_db=db, session_id=scope.session_id,
+            _recovery_registry=nudge_registry, _recovery_write_permit=nudge_writer,
+            _recovery_pending_message_batch=(scope, "nudge", 1, "root-message", prepared),
+        )
+
+        def _pre_effect_failure(**_kwargs):
+            raise RuntimeError("nudge append never entered guarded write")
+
+        monkeypatch.setattr(db, "append_messages_batch", _pre_effect_failure)
+        with pytest.raises((RuntimeError, RecoveryRefused)):
+            _db_flush_write(agent, [row], [live])
+        assert "_row_id" not in row and "_row_id" not in live
+        assert _DB_PERSISTED_MARKER not in live
+        assert agent._recovery_pending_message_batch is not None
+        assert len(db.get_messages(scope.session_id)) == 1
     finally:
         db.close()

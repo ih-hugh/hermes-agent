@@ -218,23 +218,30 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
     protected = _is_protected_session(agent)
     recovery_kwargs = {}
     if protected:
-        from agent.recovery_context import current_write_permit
+        from agent.recovery_context import current_write_permit, write_binding
         from hermes_state_recovery import RecoveryRefused
+        from hermes_state_recovery import RecoveryStore
 
         permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
         if permit is None:
             raise RecoveryRefused("untracked_write")
+        binding = write_binding(permit, RecoveryStore(agent._session_db))
+        if binding is None or binding[0].session_id != agent.session_id:
+            raise RecoveryRefused("invalid_write_permit")
         from hermes_state_recovery_message_result import prepare_message_batch
 
         pending = getattr(agent, "_recovery_pending_message_batch", None)
         if pending is not None:
-            pending_session, write_id, prepared = pending
-            if pending_session != agent.session_id or not prepared.matches_input(batch_rows):
+            if not isinstance(pending, tuple) or len(pending) != 5:
+                raise RecoveryRefused("write_payload_conflict")
+            pending_scope, pending_run, pending_generation, write_id, prepared = pending
+            if ((pending_scope, pending_run, pending_generation) != binding
+                    or not prepared.matches_input(batch_rows)):
                 raise RecoveryRefused("write_payload_conflict")
         else:
             prepared = prepare_message_batch(batch_rows)
             write_id = f"message_{uuid.uuid4().hex}"
-            agent._recovery_pending_message_batch = (agent.session_id, write_id, prepared)
+            agent._recovery_pending_message_batch = (*binding, write_id, prepared)
         digest = prepared.payload_sha256
         recovery_kwargs = {
             "recovery_permit": permit, "recovery_write_id": write_id,
@@ -255,30 +262,19 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         except Exception as flush_error:
             if not protected:
                 raise
-            from agent.recovery_context import write_binding
-            from hermes_state_recovery import RecoveryStore
-
-            binding = write_binding(permit, RecoveryStore(agent._session_db))
-            if binding is None:
-                raise
             try:
-                ack = agent._session_db.read_write_ack(binding[0], write_id)
+                agent._session_db.restore_committed_message_batch(
+                    permit, write_id, digest, prepared, batch_rows)
+            except RecoveryRefused as read_error:
+                if str(read_error) == "write_payload_conflict":
+                    raise flush_error
+                raise
             except Exception:
                 raise flush_error
-            if ack.state != "committed" or ack.payload_sha256 != digest:
-                raise flush_error
-            agent._session_db.restore_committed_message_batch(
-                binding[0], write_id, digest, prepared, batch_rows)
         else:
             if protected:
-                from agent.recovery_context import write_binding
-                from hermes_state_recovery import RecoveryStore, RecoveryRefused
-
-                binding = write_binding(permit, RecoveryStore(agent._session_db))
-                if binding is None:
-                    raise RecoveryRefused("invalid_write_permit")
                 agent._session_db.restore_committed_message_batch(
-                    binding[0], write_id, digest, prepared, batch_rows)
+                    permit, write_id, digest, prepared, batch_rows)
     if protected:
         agent._recovery_pending_message_batch = None
     sync_flushed_message_markers(batch_msgs, batch_rows)

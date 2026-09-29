@@ -13,6 +13,7 @@ from hermes_state_recovery_message_result import (
     MAX_MESSAGE_RESULT_BYTES,
     MessageOutcomeV1,
     MessageWriteResultV1,
+    PreparedMessageBatch,
     prepare_message_batch,
     read_message_result,
 )
@@ -52,6 +53,17 @@ def test_prepared_batch_bounds_rows_and_bytes():
         prepare_message_batch([{"role": "user"}] * (MAX_MESSAGE_BATCH_ROWS + 1))
     with pytest.raises(RecoveryRefused):
         prepare_message_batch([{"role": "user", "content": "x" * MAX_MESSAGE_PREIMAGE_BYTES}])
+
+
+@pytest.mark.parametrize("canonical,count,digest", [
+    (b" " * (MAX_MESSAGE_PREIMAGE_BYTES + 1), 1, "0" * 64),
+    (b"invalid", 0, "0" * 64),
+    (b"invalid", MAX_MESSAGE_BATCH_ROWS + 1, "0" * 64),
+    (b"invalid", 1, "invalid"),
+], ids=["oversized", "zero-count", "over-count", "bad-digest"])
+def test_public_prepared_batch_refuses_bad_framing_before_parse(canonical, count, digest):
+    with pytest.raises(RecoveryRefused):
+        PreparedMessageBatch(canonical, digest, count).fresh_rows()
 
 
 def test_result_records_ordered_insert_repair_adopt_and_strict_readback():

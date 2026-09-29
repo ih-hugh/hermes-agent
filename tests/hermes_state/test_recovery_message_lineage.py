@@ -7,7 +7,8 @@ import pytest
 from agent.recovery_context import bind_write_permit, issue_producer_permit, issue_write_permit
 from hermes_state_recovery import RecoveryRefused
 from hermes_state_recovery_message_result import (
-    MAX_MESSAGE_RESULT_BYTES, prepare_message_batch, read_message_result,
+    MAX_MESSAGE_PREIMAGE_BYTES, MAX_MESSAGE_RESULT_BYTES, PreparedMessageBatch,
+    prepare_message_batch, read_message_result,
 )
 from tests.hermes_state.test_recovery_write_guard import _protected_db
 
@@ -51,6 +52,26 @@ def test_protected_insert_records_ordered_exact_ids_and_direct_retry(tmp_path):
         assert _append(db, scope, writer, "lineage-2", [
             {"role": "user", "content": "same"}, {"role": "assistant", "content": "same"}]) == 2
         assert len(db.get_messages(scope.session_id)) == 4
+    finally:
+        db.close()
+
+
+def test_public_prepared_batch_refuses_oversized_preimage_before_callback(tmp_path):
+    db, scope, writer = _writer(tmp_path)
+    try:
+        row = {"role": "user", "content": "bounded"}
+        prepared = prepare_message_batch([row])
+        forged = PreparedMessageBatch(
+            b" " * (MAX_MESSAGE_PREIMAGE_BYTES + 1), prepared.payload_sha256, 1)
+        with pytest.raises(RecoveryRefused, match="invalid_recovery_write"):
+            db.append_messages_batch(
+                scope.session_id, [row], recovery_permit=writer,
+                recovery_write_id="oversized-prepared",
+                recovery_payload_sha256=prepared.payload_sha256,
+                recovery_prepared_batch=forged)
+        assert db.get_messages(scope.session_id) == []
+        assert db._read_one(
+            "SELECT 1 FROM recovery_write_acks WHERE write_id=?", ("oversized-prepared",)) is None
     finally:
         db.close()
 
