@@ -32,7 +32,11 @@ def _setup(tmp_path: Path):
     return db, store, scope, registry
 
 
-def test_selected_create_and_execute_are_inventoried_before_each_effect(tmp_path, monkeypatch):
+@pytest.mark.parametrize("uncertain_result", [None, {"returncode": 1, "exit_code": 2},
+                                            {"returncode": False, "exit_code": False}])
+def test_selected_create_and_execute_are_inventoried_before_each_effect(
+    tmp_path, monkeypatch, uncertain_result,
+):
     from tools.terminal_tool_backends import _create_environment
     from tools import terminal_tool_backends
     from tools import terminal_tool, terminal_tool_config
@@ -48,12 +52,12 @@ def test_selected_create_and_execute_are_inventoried_before_each_effect(tmp_path
             self.cwd = "/work"
             self.timeout = 30
 
-        def execute(self, _command, **_kwargs):
+        def execute_recovery(self, _command, **_kwargs):
             row = db._read_one(
                 "SELECT kind,state FROM recovery_provider_invocations "
                 "WHERE session_id=? ORDER BY sequence DESC LIMIT 1", (scope.session_id,))
             effects.append(("execute", tuple(row)))
-            return {"output": "ok", "returncode": 2}
+            return {"output": "ok", "returncode": 2, "exit_code": 2}
 
         def cleanup(self):
             pass
@@ -91,12 +95,21 @@ def test_selected_create_and_execute_are_inventoried_before_each_effect(tmp_path
             env = _create_environment(
                 "byf_workspace", "", "/work", 30, task_id=scope.session_id,
                 container_config={})
+            env._environment.execute_recovery = None
+            with pytest.raises(RecoveryRefused, match="unsupported_provider"):
+                env.execute("missing strict seam")
+            del env._environment.execute_recovery
             assert env.execute("false")["returncode"] == 2
             def uncertain(_command):
                 raise RuntimeError("provider response lost")
-            env._environment.execute = uncertain
-            with pytest.raises(RuntimeError, match="response lost"):
-                env.execute("unknown")
+            if uncertain_result is None:
+                env._environment.execute_recovery = uncertain
+                with pytest.raises(RuntimeError, match="response lost"):
+                    env.execute("unknown")
+            else:
+                env._environment.execute_recovery = lambda _command: uncertain_result
+                with pytest.raises(RecoveryRefused, match="provider_result_unknown"):
+                    env.execute("unknown")
             with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
                 env.execute("retry")
         lease.run(invoke)
@@ -131,7 +144,9 @@ def test_root_cleanup_then_nudge_reattaches_without_second_create(tmp_path, monk
 
         def execute(self, _command, **_kwargs):
             assert not self.detached
-            return {"returncode": 0}
+            return {"returncode": 0, "exit_code": 0}
+
+        execute_recovery = execute
 
         def cleanup(self, *, force_remove=False):
             self.detached = True
@@ -212,6 +227,8 @@ def test_close_after_create_begin_allows_settlement_but_refuses_new_effect(
 
         def execute(self, _command):
             raise AssertionError("closing must refuse before execute")
+
+        execute_recovery = execute
 
     WorkspaceEnvironment.__module__ = "byf_workspace.workspace_provider"
 

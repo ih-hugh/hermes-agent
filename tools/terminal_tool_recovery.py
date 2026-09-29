@@ -129,10 +129,13 @@ class ProtectedWorkspaceEnvironment:
         self.validate_current(self._scope.session_id)
         registry, lease, ledger, _capture = _current(
             self._provider, self._scope.session_id, tool=True)
+        strict_execute = getattr(self._environment, "execute_recovery", None)
+        if not callable(strict_execute):
+            raise RecoveryRefused("unsupported_provider")
         cap = ledger.begin(registry.scope, registry.run_id, registry.generation,
                            lease.producer_id, "execute", self._create_id)
         try:
-            result = self._environment.execute(command, *args, **kwargs)
+            result = strict_execute(command, *args, **kwargs)
         except BaseException:
             try:
                 ledger.finish(cap, ProviderInvocationOutcome(
@@ -140,6 +143,8 @@ class ProtectedWorkspaceEnvironment:
             finally:
                 raise
         if (type(result) is not dict or type(result.get("returncode")) is not int
+                or type(result.get("exit_code")) is not int
+                or result["returncode"] != result["exit_code"]
                 or not -(2**31) <= result["returncode"] < 2**31):
             ledger.finish(cap, ProviderInvocationOutcome("unknown", reason="lost_result"))
             raise RecoveryRefused("provider_result_unknown")
