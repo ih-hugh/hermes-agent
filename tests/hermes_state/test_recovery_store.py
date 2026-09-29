@@ -619,3 +619,258 @@ async def test_ordinary_run_body_above_protected_limit_retains_legacy_admission(
             assert response.status == 202
     finally:
         await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "completed", "stopping"])
+async def test_protected_status_writer_lock_keeps_loop_live(tmp_path: Path, status: str):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    assert store.reserve(_root(), identity).outcome == "created"
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    lock_conn = sqlite3.connect(tmp_path / "state.db", check_same_thread=False)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    timer = threading.Timer(0.35, lock_conn.rollback)
+    tick = asyncio.Event()
+    try:
+        timer.start()
+        asyncio.get_running_loop().call_later(0.05, tick.set)
+        adapter._set_run_status(identity.run_id, status)
+        await asyncio.wait_for(tick.wait(), timeout=0.2)
+        await api_server_runs._await_protected_status(adapter, identity.run_id)
+        assert store.status_for_run(identity.scope.profile, identity.scope.scope_digest,
+                                    identity.run_id)["status"] == status
+    finally:
+        timer.join(timeout=1)
+        lock_conn.rollback()
+        lock_conn.close()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_status_writes_order_and_surface_failure(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    store.reserve(_root(), identity)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    entered = threading.Event()
+    release = threading.Event()
+    written: list[str] = []
+    original_update = store.update_status
+
+    def held_update(run_id: str, current: dict):
+        if current["status"] == "running":
+            entered.set()
+            assert release.wait(timeout=3)
+        original_update(run_id, current)
+        written.append(current["status"])
+
+    monkeypatch.setattr(store, "update_status", held_update)
+    try:
+        adapter._set_run_status(identity.run_id, "running")
+        assert await asyncio.to_thread(entered.wait, 2)
+        adapter._set_run_status(identity.run_id, "completed")
+        release.set()
+        await api_server_runs._await_protected_status(adapter, identity.run_id)
+        assert written == ["running", "completed"]
+        assert store.status_for_run(identity.scope.profile, identity.scope.scope_digest,
+                                    identity.run_id)["status"] == "completed"
+
+        def failed_update(run_id: str, current: dict):
+            raise sqlite3.OperationalError("deliberate status write failure")
+
+        monkeypatch.setattr(store, "update_status", failed_update)
+        adapter._set_run_status(identity.run_id, "stopping")
+        with pytest.raises(sqlite3.OperationalError, match="deliberate status write failure"):
+            await api_server_runs._await_protected_status(adapter, identity.run_id)
+        adapter._set_run_status(identity.run_id, "cancelled")
+        with pytest.raises(sqlite3.OperationalError, match="deliberate status write failure"):
+            await api_server_runs._await_protected_status(adapter, identity.run_id)
+        assert written == ["running", "completed"]
+    finally:
+        release.set()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_status_waiter_keeps_worker_and_order(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    store.reserve(_root(), identity)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    entered = threading.Event()
+    release = threading.Event()
+    written: list[str] = []
+    original_update = store.update_status
+
+    def held_update(run_id: str, current: dict):
+        if current["status"] == "running":
+            entered.set()
+            assert release.wait(timeout=3)
+        original_update(run_id, current)
+        written.append(current["status"])
+
+    monkeypatch.setattr(store, "update_status", held_update)
+    try:
+        adapter._set_run_status(identity.run_id, "running")
+        assert await asyncio.to_thread(entered.wait, 2)
+        waiter = asyncio.create_task(adapter._await_protected_run_status(identity.run_id))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not adapter._protected_status_tasks[identity.run_id].done()
+        adapter._set_run_status(identity.run_id, "completed")
+        release.set()
+        await adapter._await_protected_run_status(identity.run_id)
+        assert written == ["running", "completed"]
+    finally:
+        release.set()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_stop_route_keeps_loop_live_while_status_writer_waits(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    store.reserve(_root(), identity)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    adapter._run_statuses[identity.run_id] = {"status": "running"}
+    fake_task = asyncio.create_task(asyncio.sleep(2))
+    monkeypatch.setattr(api_server_runs, "_load_owned_run", lambda *args, **kwargs: (
+        identity.run_id, adapter._run_statuses[identity.run_id], None, fake_task, None))
+    app = web.Application()
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
+    lock_conn = sqlite3.connect(tmp_path / "state.db", check_same_thread=False)
+    lock_conn.execute("BEGIN IMMEDIATE")
+    timer = threading.Timer(0.35, lock_conn.rollback)
+    tick = asyncio.Event()
+    try:
+        async with TestClient(TestServer(app)) as client:
+            timer.start()
+            asyncio.get_running_loop().call_later(0.05, tick.set)
+            response_task = asyncio.create_task(client.post(f"/v1/runs/{identity.run_id}/stop"))
+            await asyncio.wait_for(tick.wait(), timeout=0.2)
+            response = await response_task
+            assert response.status == 200
+            assert store.status_for_run(identity.scope.profile, identity.scope.scope_digest,
+                                        identity.run_id)["status"] == "stopping"
+    finally:
+        timer.join(timeout=1)
+        lock_conn.rollback()
+        lock_conn.close()
+        fake_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await fake_task
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_status_join_waits_for_new_tail_added_during_join(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    identity = _identity(store, owner=current_incarnation())
+    store.reserve(_root(), identity)
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._protected_run_ids.add(identity.run_id)
+    adapter._protected_run_stores[identity.run_id] = store
+    first_entered, first_release = threading.Event(), threading.Event()
+    second_entered, second_release = threading.Event(), threading.Event()
+    original_update = store.update_status
+
+    def held_update(run_id: str, current: dict):
+        if current["status"] == "running":
+            first_entered.set()
+            assert first_release.wait(timeout=3)
+        if current["status"] == "completed":
+            second_entered.set()
+            assert second_release.wait(timeout=3)
+        original_update(run_id, current)
+
+    monkeypatch.setattr(store, "update_status", held_update)
+    try:
+        adapter._set_run_status(identity.run_id, "running")
+        assert await asyncio.to_thread(first_entered.wait, 2)
+        waiter = asyncio.create_task(adapter._await_protected_run_status(identity.run_id))
+        await asyncio.sleep(0)
+        adapter._set_run_status(identity.run_id, "completed")
+        first_release.set()
+        assert await asyncio.to_thread(second_entered.wait, 2)
+        assert not waiter.done()
+        second_release.set()
+        await waiter
+        assert store.status_for_run(identity.scope.profile, identity.scope.scope_digest,
+                                    identity.run_id)["status"] == "completed"
+    finally:
+        first_release.set()
+        second_release.set()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_executor_waits_for_running_status_before_dispatch(tmp_path: Path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._session_db = db
+    adapter._recovery_runtime_ready = lambda request, body: True
+    entered, release = threading.Event(), threading.Event()
+    created = threading.Event()
+    original_update = RecoveryStore.update_status
+
+    def held_update(store, run_id: str, current: dict):
+        if current["status"] == "running":
+            entered.set()
+            assert release.wait(timeout=3)
+        return original_update(store, run_id, current)
+
+    def fake_create_agent(**kwargs):
+        created.set()
+        return object()
+
+    monkeypatch.setattr(RecoveryStore, "update_status", held_update)
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    monkeypatch.setattr(api_server_runs, "_run_agent_sync", lambda *args, **kwargs: (
+        {"final_response": "done"}, {}))
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/v1/runs", json={
+                "input": "hello", "session_id": "exact-session",
+                "recovery": {"schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None},
+            }, headers={"Idempotency-Key": "byf-recovery-v1:one"})
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            assert await asyncio.to_thread(entered.wait, 2)
+            assert not created.is_set()
+            release.set()
+            for _ in range(100):
+                if adapter._run_statuses[run_id]["status"] == "completed":
+                    break
+                await asyncio.sleep(0.01)
+            assert created.is_set()
+            await adapter._await_protected_run_status(run_id)
+            assert adapter._run_statuses[run_id]["status"] == "completed"
+            store = RecoveryStore(db)
+            assert store.status_for_run("default", adapter._run_owners[run_id], run_id)["status"] == "completed"
+    finally:
+        release.set()
+        await adapter.disconnect()
+        db.close()

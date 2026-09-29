@@ -3785,6 +3785,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         return _api_runs._set_run_status(self, run_id, status, **fields)
 
+    async def _await_protected_run_status(self, run_id: str) -> None:
+        """Join this member's ordered status writes before producer closure."""
+        await _api_runs._await_protected_status(self, run_id)
+
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         return _api_runs._make_run_event_callback(self, run_id, loop, _api_server=sys.modules[__name__])
 
@@ -4001,6 +4005,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        await _api_runs._drain_protected_status(self)
         if self._response_store is not None:
             try:
                 self._response_store.close()

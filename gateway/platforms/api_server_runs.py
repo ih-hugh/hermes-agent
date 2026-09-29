@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from copy import deepcopy
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -95,6 +96,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_idempotency_ids: set[str] = set()
     self._protected_run_ids: set[str] = set()
     self._protected_run_stores: dict[str, Any] = {}
+    self._protected_status_tasks: dict[str, asyncio.Task[None]] = {}
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     (
@@ -129,6 +131,47 @@ def _close_run_state(self) -> None:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
 
+async def _await_protected_status(self, run_id: str) -> None:
+    """Join ordered status writes until the run's tail stays unchanged.
+
+    Shielding leaves a SQLite worker tracked and its outcome observable if the
+    HTTP caller or executor coroutine is cancelled while a writer holds the DB.
+    The producer must quiesce its callbacks before using this as a close barrier.
+    """
+    while (task := self._protected_status_tasks.get(run_id)) is not None:
+        await asyncio.shield(task)
+        if self._protected_status_tasks.get(run_id) is task:
+            return
+
+
+async def _drain_protected_status(self) -> None:
+    """Join tracked status workers before the adapter closes its SessionDBs."""
+    lanes = getattr(self, "_protected_status_tasks", {})
+    while tasks := dict(lanes):
+        outcomes = await asyncio.gather(*(asyncio.shield(task) for task in tasks.values()),
+                                        return_exceptions=True)
+        if len(tasks) == len(lanes) and all(lanes.get(run_id) is task for run_id, task in tasks.items()):
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    logger.error("[api_server] protected status persistence failed during disconnect")
+            return
+
+
+def _queue_protected_status(self, run_id: str, status: Dict[str, Any]) -> None:
+    """Serialize durable snapshots for one run without waiting on the API loop."""
+    loop = asyncio.get_running_loop()
+    previous = self._protected_status_tasks.get(run_id)
+    store = self._protected_run_stores[run_id]
+    snapshot = deepcopy(status)
+
+    async def _persist() -> None:
+        if previous is not None:
+            await asyncio.shield(previous)
+        await asyncio.to_thread(store.update_status, run_id, snapshot)
+
+    self._protected_status_tasks[run_id] = loop.create_task(_persist())
+
+
 def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
     """Update pollable run status without exposing private agent objects."""
     now = time.time()
@@ -151,9 +194,9 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
     if run_id in self._protected_run_ids and should_persist:
-        # A failed protected status write is visible to the caller and never
-        # grants closure. The member remains durable even if transport status lags.
-        self._protected_run_stores[run_id].update_status(run_id, current)
+        # Callers that acknowledge dispatch, stop or completion join this lane.
+        # Failures remain on the tracked task and block every later write.
+        _queue_protected_status(self, run_id, current)
     return current
 
 
@@ -827,18 +870,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=delta))
 
-    def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
+    async def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
         extra = extra or {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
+        await _await_protected_status(self, run_id)
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
 
     producer_dispatched = False
     try:
         self._set_run_status(run_id, "running")
+        await _await_protected_status(self, run_id)
         if run_id in self._stopping_run_ids:
-            _finish("cancelled")
+            await _finish("cancelled")
             return
         from agent.tool_diagnostic import current_tool_send_observer
         observer_token = current_tool_send_observer.set(run.tool_observer) if run.tool_observer else None
@@ -859,24 +904,24 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
-            _finish("cancelled")
+            await _finish("cancelled")
         elif result.get("failed"):
             # Non-retryable client errors (401/400) return failed=True rather than raising.
-            _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
+            await _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            await _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
-        _finish("cancelled")
+        await _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
         logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-        _finish("failed", error=f"⚠️ Provider authentication failed: {exc}")
+        await _finish("failed", error=f"⚠️ Provider authentication failed: {exc}")
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
-        _finish("failed", error=_redact_api_error_text(exc))
+        await _finish("failed", error=_redact_api_error_text(exc))
     finally:
         if run.tool_observer is not None and not producer_dispatched:
             run.tool_observer.mark_incomplete("unclosed_producer")
@@ -943,7 +988,8 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     agent = self._active_run_agents.get(run_id)
     task = self._active_run_tasks.get(run_id)
     status = self._durable_run_status(request, run_id)
-    if status is None and active_fallback and (agent is not None or task is not None):
+    if (status is None and active_fallback and run_id not in self._protected_run_ids
+            and (agent is not None or task is not None)):
         status = self._set_run_status(run_id, "running")
     if status is None:
         return run_id, None, agent, task, _run_not_found(_openai_error, run_id)
@@ -952,8 +998,14 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = await asyncio.to_thread(
+    run_id, status, _, _, err = await asyncio.to_thread(
         _load_owned_run, self, request, _api_server=_api_server, permission="status", active_fallback=True)
+    if err is None and run_id in self._protected_run_ids:
+        try:
+            await _await_protected_status(self, run_id)
+        except Exception:
+            return _json_error(_api_server._openai_error, "Protected status unavailable",
+                               code="recovery_status_unavailable", status=503)
     return err or web.json_response(status)
 
 
@@ -1122,6 +1174,12 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+    if run_id in self._protected_run_ids:
+        try:
+            await _await_protected_status(self, run_id)
+        except Exception:
+            return _json_error(_openai_error, "Protected stop status unavailable",
+                               code="recovery_status_unavailable", status=503)
     return web.json_response({"run_id": run_id, "status": "stopping"})
 
 
