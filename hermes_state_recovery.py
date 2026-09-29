@@ -120,8 +120,23 @@ class RecoveryStore:
         members = tuple(cls._member(row) for row in rows)
         codes = tuple(json.loads(reasons))
         state = "sealed" if phase == "sealed" else "unsupported" if codes else "pending"
+        receipt_ref = None
+        if receipt is not None:
+            from gateway.platforms.api_server_recovery_artifacts import (
+                MAX_DOCUMENT_BYTES, canonical_json_bytes, strict_json_loads,
+            )
+            from gateway.platforms.api_server_recovery_contract import SealReceipt, receipt_sha256
+
+            try:
+                parsed = SealReceipt.model_validate(
+                    strict_json_loads(receipt.encode("utf-8"), max_bytes=MAX_DOCUMENT_BYTES))
+                if canonical_json_bytes(parsed).decode("utf-8") != receipt:
+                    raise ValueError("noncanonical receipt")
+                receipt_ref = receipt_sha256(parsed)
+            except (ValueError, TypeError, UnicodeError) as exc:
+                raise RecoveryRefused("sealed_document_invalid") from exc
         return CloseView(phase, revision, members, request_id, state, codes,
-                         hashlib.sha256(receipt.encode()).hexdigest() if receipt else None)
+                         receipt_ref)
 
     @staticmethod
     def _session(conn, scope: RecoveryScope):
@@ -396,47 +411,85 @@ class RecoveryStore:
     ) -> Iterator[RetainedUsagePayload]:
         """Yield one checked delta at a time inside the caller's finalization transaction."""
         from hermes_state_usage import RetainedUsagePayload, UsageDelta, _MAX_USAGE_PAYLOAD_BYTES
+        from gateway.platforms.api_server_recovery_artifacts import MAX_SNAPSHOT_BYTES
 
         self._check_scope(scope)
-        sql = (
-            "SELECT s.delta_id,s.attempt_id,s.payload_sha256,length(s.payload_json),"
-            "typeof(s.payload_json),s.ack_revision,a.run_id,a.producer_id,m.generation,"
-            "p.run_id,a.delta_id "
-            "FROM recovery_usage_slots s JOIN recovery_sends a USING(attempt_id) "
-            "JOIN recovery_members m ON m.run_id=a.run_id "
-            "JOIN recovery_producers p ON p.producer_id=a.producer_id "
-            "WHERE m.session_id=? AND m.profile=? AND m.scope_digest=? AND s.state='committed' "
-            "ORDER BY s.ack_revision,s.delta_id"
-        )
-        params = (scope.session_id, scope.profile, scope.scope_digest)
-        cursor = conn.execute(sql, params)
-        try:
-            for row in cursor:
-                # The ordered cursor holds only small metadata. Never fetch an
-                # unbounded corrupt BLOB into Python or SQLite's sort buffer.
-                if (row[0] != row[10] or row[6] != row[9]
-                        or row[4] != "blob" or type(row[3]) is not int
-                        or not 0 < row[3] <= _MAX_USAGE_PAYLOAD_BYTES):
-                    raise RecoveryRefused("invalid_retained_usage_payload")
-                payload_row = conn.execute(
-                    "SELECT payload_json FROM recovery_usage_slots WHERE delta_id=? "
-                    "AND typeof(payload_json)='blob' AND length(payload_json)=?",
-                    (row[0], row[3]),
+        members = conn.execute(
+            "SELECT run_id,generation FROM recovery_members WHERE session_id=? "
+            "AND profile=? AND scope_digest=? ORDER BY generation LIMIT 3",
+            (scope.session_id, scope.profile, scope.scope_digest),
+        ).fetchall()
+        if not 1 <= len(members) <= 2 or [row[1] for row in members] != list(range(len(members))):
+            raise RecoveryRefused("missing_membership")
+        metadata = []
+        metadata_bytes = 0
+        for member_run, generation in members:
+            if type(member_run) is not str or not 0 < len(member_run) <= 255:
+                raise RecoveryRefused("missing_membership")
+            sequence = 0
+            while True:
+                # The UNIQUE(run_id,sequence) index walks a bounded member prefix.
+                # No SQL sort can materialize an entire session's retained BLOBs.
+                row = conn.execute(
+                    "SELECT a.sequence,substr(s.delta_id,1,256),substr(s.attempt_id,1,256),"
+                    "substr(s.payload_sha256,1,65),"
+                    "length(substr(s.payload_json,1,?)),typeof(s.payload_json),"
+                    "s.ack_revision,substr(a.run_id,1,256),substr(a.producer_id,1,256),"
+                    "substr(p.run_id,1,256),substr(p.owner_incarnation,1,256),"
+                    "substr(a.delta_id,1,256),s.state "
+                    "FROM recovery_sends a JOIN recovery_usage_slots s USING(attempt_id) "
+                    "JOIN recovery_producers p ON p.producer_id=a.producer_id "
+                    "WHERE a.run_id=? AND a.sequence>? ORDER BY a.sequence LIMIT 1",
+                    (_MAX_USAGE_PAYLOAD_BYTES + 1, member_run, sequence),
                 ).fetchone()
-                if payload_row is None:
+                if row is None:
+                    break
+                if row[0] != sequence + 1:
                     raise RecoveryRefused("invalid_retained_usage_payload")
-                payload = payload_row[0]
-                delta = UsageDelta.from_canonical_bytes(payload, row[2])
-                if (delta.write_id != row[0] or delta.attempt_id != row[1]
-                        or delta.generation != row[8]
-                        or type(row[5]) is not int or row[5] <= 0):
+                sequence = row[0]
+                if len(metadata) >= 100_000:
+                    raise RecoveryRefused("retained_usage_oversized")
+                if (any(type(row[index]) is not str or not 0 < len(row[index]) <= 255
+                        for index in (1, 2, 7, 8, 9, 10, 11))
+                        or type(row[3]) is not str or len(row[3]) != 64):
                     raise RecoveryRefused("invalid_retained_usage_payload")
-                yield RetainedUsagePayload(
-                    run_id=row[6], producer_id=row[7], ack_revision=row[5],
-                    payload_sha256=row[2], payload_json=payload, delta=delta,
-                )
-        finally:
-            cursor.close()
+                if row[7] != member_run or row[9] != member_run or row[1] != row[11]:
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                # No-charge and unresolved sends are checked by the finalizer's
+                # full send scan, not by this committed-payload iterator.
+                if row[12] != "committed":
+                    continue
+                if type(row[6]) is not int or row[6] <= 0:
+                    raise RecoveryRefused("invalid_retained_usage_payload")
+                metadata_bytes += sum(len(row[index].encode("utf-8")) for index in
+                                      (1, 2, 3, 7, 8, 9, 10, 11)) + 128
+                if metadata_bytes > MAX_SNAPSHOT_BYTES:
+                    raise RecoveryRefused("retained_usage_oversized")
+                metadata.append((row, generation))
+        metadata.sort(key=lambda item: (item[0][6], item[0][1]))
+        previous_revision = 0
+        for row, generation in metadata:
+            if type(row[6]) is not int or row[6] <= previous_revision:
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            previous_revision = row[6]
+            if row[5] != "blob" or type(row[4]) is not int or not 0 < row[4] <= _MAX_USAGE_PAYLOAD_BYTES:
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            payload_row = conn.execute(
+                "SELECT payload_json FROM recovery_usage_slots WHERE delta_id=? "
+                "AND typeof(payload_json)='blob' AND length(payload_json)=?",
+                (row[1], row[4]),
+            ).fetchone()
+            if payload_row is None:
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            payload = payload_row[0]
+            delta = UsageDelta.from_canonical_bytes(payload, row[3])
+            if (delta.write_id != row[1] or delta.attempt_id != row[2]
+                    or delta.generation != generation):
+                raise RecoveryRefused("invalid_retained_usage_payload")
+            yield RetainedUsagePayload(
+                run_id=row[7], producer_id=row[8], ack_revision=row[6],
+                payload_sha256=row[3], payload_json=payload, delta=delta,
+            )
 
     def fail_usage_delta(self, permit: object) -> None:
         """Retain a sticky failure; an unavailable DB leaves the slot pending instead."""
