@@ -32,11 +32,12 @@ from hermes_state_recovery_deadline import RecoveryDeadlineExceeded, recovery_de
 def test_recovery_registry_waiter_times_out_without_owning_open_marker(tmp_path):
     path = (tmp_path / "state.db").resolve()
     marker = threading.Event()
+    release_owner = threading.Event()
     with registry._lock:
         registry._opening[path] = marker
 
     def finish_owner():
-        time.sleep(0.12)
+        release_owner.wait()
         with registry._lock:
             registry._opening.pop(path, None)
             marker.set()
@@ -53,6 +54,7 @@ def test_recovery_registry_waiter_times_out_without_owning_open_marker(tmp_path)
     finally:
         if acquired is not None:
             registry.release(acquired)
+        release_owner.set()
         owner.join(timeout=1)
     assert not owner.is_alive()
 
