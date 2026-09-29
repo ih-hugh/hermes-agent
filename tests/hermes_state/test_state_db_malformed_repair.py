@@ -15,6 +15,7 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 import contextlib
 import json
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
@@ -164,7 +165,15 @@ def test_auto_open_refuses_unreadable_catalog_before_repair(tmp_path, monkeypatc
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
     _corrupt_duplicate_fts(db_path)
-    original = db_path.read_bytes()
+
+    def scratch_files() -> dict[str, bytes]:
+        return {
+            path.name: path.read_bytes()
+            for path in tmp_path.iterdir()
+            if stat.S_ISREG(path.lstat().st_mode)
+        }
+
+    original = scratch_files()
     calls = {"n": 0}
 
     def fake_repair(*_args, **_kwargs):
@@ -177,9 +186,12 @@ def test_auto_open_refuses_unreadable_catalog_before_repair(tmp_path, monkeypatc
             SessionDB(db_path=db_path)
         assert refused.value.code == "protected_session_authority_unavailable"
     assert calls["n"] == 0
-    assert db_path.read_bytes() == original
-    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
-    assert not list(tmp_path.glob("state.db.repair-scratch*"))
+    after = scratch_files()
+    assert {name: after[name] for name in original} == original
+    new_files = after.keys() - original.keys()
+    assert new_files <= {"state.db-wal", "state.db-shm"}
+    if "state.db-wal" in new_files:
+        assert after["state.db-wal"] == b""  # no committed SQLite frames
 
 
 def test_unclassifiable_file_refuses_repair_before_artifacts(tmp_path):
