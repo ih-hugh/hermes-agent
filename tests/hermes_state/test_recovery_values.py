@@ -139,6 +139,17 @@ def test_shared_sqlite_origin_fixture_is_complete_and_lossless():
         )
         assert encode_sqlite_cells(decoded, storage) == cells
     assert fixture["scalar_cells"][2] == ["f", "8000000000000000"]
+    guarded = fixture["guarded_usage"]
+    guarded_context = SemanticContext.model_validate({
+        **guarded["context"],
+        "members": (("root", 0),),
+    })
+    assert (
+        verify_artifact_crosslinks(
+            guarded["sections"], guarded_context
+        ).accounted_api_calls
+        == 3
+    )
 
 
 def test_fixture_ack_text_is_exact_guarded_writer_output(tmp_path):
@@ -219,7 +230,9 @@ def test_included_semantic_crosslinks_are_bounded_and_explicitly_partial():
     ) == (1, 1, 1, 2, 1)
     assert summary.actual_cost_usd is None
     assert summary.complete_source_proof is False
-    assert summary.route_replay_complete is False
+    assert summary.route_replay_complete is True
+    assert summary.acknowledged_usage.billing_provider == "example"
+    assert summary.acknowledged_usage.billing_mode == "api"
 
     for mutate in (
         lambda sections: sections["transcript"][0]["lineage"].clear(),
@@ -234,6 +247,7 @@ def test_included_semantic_crosslinks_are_bounded_and_explicitly_partial():
             create_invocation_id="other"
         ),
         lambda sections: sections["accounting"][0]["cells"][20].__setitem__(1, "9"),
+        lambda sections: sections["accounting"][1]["cells"][6].__setitem__(1, "9"),
     ):
         changed = deepcopy(fixture["sections"])
         mutate(changed)
@@ -278,3 +292,299 @@ def test_unused_provider_and_no_calls_have_empty_independent_ledgers():
         verify_artifact_crosslinks(
             sections, context.model_copy(update={"no_calls": False})
         )
+
+
+def test_no_charge_only_is_zero_usage_but_not_no_calls():
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1] / "fixtures" / "recovery_artifact_values_v1.json"
+        ).read_text()
+    )
+    sections = deepcopy(fixture["sections"])
+    sections["accounting"].pop(1)
+    names = [name for name, _, _ in SESSION_COLUMNS]
+    cells = sections["accounting"][0]["cells"]
+    for name in (
+        "api_call_count",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ):
+        cells[names.index(name)] = ["i", "0"]
+    for name in ("estimated_cost_usd", "billing_provider", "billing_mode"):
+        cells[names.index(name)] = ["n"]
+    send = sections["send_ledger"][0]
+    send.update(
+        state="no_charge_proved",
+        reason="sdk_not_entered",
+        slot_state="no_charge",
+        ack_revision=None,
+        payload_sha256=None,
+        payload_base64=None,
+    )
+    context = SemanticContext.model_validate({
+        **fixture["context"],
+        "members": (("root", 0),),
+        "no_calls": False,
+    })
+    replay = verify_artifact_crosslinks(sections, context)
+    assert replay.send_count == 1 and replay.accounted_api_calls == 0
+    assert replay.acknowledged_usage.billing_provider is None
+    assert replay.acknowledged_usage.billing_mode is None
+
+
+def _guarded_usage_sections(tmp_path, route_costs):
+    """Return exact value rows after real guarded usage commits in a scratch DB."""
+    import base64
+
+    from agent.recovery_context import (
+        bind_write_permit,
+        current_incarnation,
+        issue_producer_permit,
+        issue_usage_write_permit,
+        issue_write_permit,
+    )
+    from agent.recovery_producers import ProducerRegistry, SendOutcome
+    from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+    from hermes_state import SessionDB
+    from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
+    from hermes_state_usage import UsageDelta
+    from tests.recovery_provider_fixture import provider_admission
+
+    from hermes_state_recovery_values import SCHEMA
+
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        store = RecoveryStore(db)
+        scope = RecoveryScope(store.store_id, "factory", "b" * 64, "usage-fixture")
+        admitted = store.reserve(
+            RecoveryAdmission(
+                schema="hermes.recovery/v1", generation=0, parent_run_id=None
+            ),
+            AdmissionIdentity(
+                scope,
+                "byf-recovery-v1:usage",
+                "a" * 64,
+                "root",
+                current_incarnation(),
+                provider_admission(scope.session_id),
+            ),
+        )
+        assert admitted.outcome == "created"
+        registry = ProducerRegistry(
+            store, scope, "root", 0, issue_producer_permit(store, admitted.handoff)
+        )
+        writer = issue_write_permit(registry.permit, store, scope, "root", 0)
+        with bind_write_permit(writer):
+            db.create_session(scope.session_id, "api_server")
+        for index, (
+            model,
+            provider,
+            base,
+            mode,
+            cost,
+            actual,
+            status,
+            source,
+            version,
+        ) in enumerate(route_costs):
+            attempt = f"actual-{index}"
+
+            def invoke():
+                send = registry.sends.begin(registry.permit, attempt)
+                send.invoke(lambda: None)
+                return send
+
+            send = registry.enter(registry.permit, "sdk").run(invoke)
+            permit = issue_usage_write_permit(store, send.completion)
+            delta = UsageDelta(
+                write_id=send.delta_id,
+                attempt_id=send.attempt_id,
+                generation=0,
+                model=model,
+                billing_provider=provider,
+                billing_base_url=base,
+                billing_mode=mode,
+                input_tokens=index + 1,
+                output_tokens=1,
+                estimated_cost_usd=cost,
+                actual_cost_usd=actual,
+                cost_status=status,
+                cost_source=source,
+                pricing_version=version,
+            )
+            store.reserve_usage_payload(permit, delta, delta.digest())
+            store.apply_usage_delta(permit, delta, delta.digest())
+            send.finish(
+                SendOutcome(
+                    kind="accounted",
+                    attempt_id=send.attempt_id,
+                    acknowledged_delta_ids=(send.delta_id,),
+                )
+            )
+
+        def fixed_row(table, columns, where, params):
+            names = ",".join(name for name, _, _ in columns)
+            types = ",".join(f"typeof({name})" for name, _, _ in columns)
+            values = db._read_one(f"SELECT {names} FROM {table} WHERE {where}", params)
+            storage = db._read_one(f"SELECT {types} FROM {table} WHERE {where}", params)
+            assert values is not None and storage is not None
+            return encode_sqlite_cells(tuple(values), tuple(storage))
+
+        accounting = [
+            {
+                "schema": SCHEMA,
+                "record": "session",
+                "cells": fixed_row(
+                    "sessions", SESSION_COLUMNS, "id=?", (scope.session_id,)
+                ),
+            }
+        ]
+        model_keys = db._read_all(
+            "SELECT model,billing_provider,billing_base_url,billing_mode,task "
+            "FROM session_model_usage WHERE session_id=? "
+            "ORDER BY model,billing_provider,billing_base_url,billing_mode,task",
+            (scope.session_id,),
+        )
+        for key in model_keys:
+            accounting.append({
+                "schema": SCHEMA,
+                "record": "model_usage",
+                "cells": fixed_row(
+                    "session_model_usage",
+                    MODEL_USAGE_COLUMNS,
+                    "session_id=? AND model=? AND billing_provider=? AND billing_base_url=? "
+                    "AND billing_mode=? AND task=?",
+                    (scope.session_id, *key),
+                ),
+            })
+        sends = []
+        rows = db._read_all(
+            "SELECT a.attempt_id,a.run_id,a.producer_id,a.sequence,a.state,a.delta_id,a.reason,"
+            "s.state,s.attempt_id,s.delta_id,s.ack_revision,s.payload_sha256,s.payload_json "
+            "FROM recovery_sends a JOIN recovery_usage_slots s USING(delta_id) "
+            "WHERE a.run_id='root' ORDER BY a.sequence"
+        )
+        for row in rows:
+            sends.append({
+                "schema": SCHEMA,
+                "record": "send",
+                "attempt_id": row[0],
+                "run_id": row[1],
+                "producer_id": row[2],
+                "sequence": row[3],
+                "state": row[4],
+                "delta_id": row[5],
+                "reason": row[6],
+                "slot_state": row[7],
+                "slot_attempt_id": row[8],
+                "slot_delta_id": row[9],
+                "ack_revision": row[10],
+                "payload_sha256": row[11],
+                "payload_base64": base64.b64encode(row[12]).decode("ascii"),
+            })
+        sections = {
+            "transcript": [],
+            "accounting": accounting,
+            "send_ledger": sends,
+            "provider_invocations": [],
+        }
+        context = SemanticContext(
+            session_id=scope.session_id,
+            members=(("root", 0),),
+            provider_container_id=None,
+            provider_attestation_sha256=None,
+            no_calls=False,
+        )
+        return sections, context
+    finally:
+        db.close()
+
+
+def test_full_replay_matches_actual_guarded_sqlite_per_route_order(tmp_path):
+    sections, context = _guarded_usage_sections(
+        tmp_path,
+        (
+            ("small", "provider-a", "", "api", 1.0, None, "estimated", "table-a", "v1"),
+            (
+                "large",
+                "provider-b",
+                "https://b.example",
+                "api",
+                1e16,
+                5.0,
+                "final",
+                "table-b",
+                "v2",
+            ),
+            ("small", "provider-a", "", "api", 1.0, None, None, None, None),
+        ),
+    )
+    result = verify_artifact_crosslinks(sections, context)
+    assert result.route_replay_complete
+    assert result.acknowledged_usage.estimated_cost_usd == 1e16
+    assert result.acknowledged_usage.actual_cost_usd is None
+    assert result.acknowledged_usage.billing_mode == "api"
+    assert result.acknowledged_usage.cost_status == "final"
+    assert result.acknowledged_usage.pricing_version == "v2"
+    model_cells = sections["accounting"][1]["cells"]
+    estimated_index = [name for name, _, _ in MODEL_USAGE_COLUMNS].index(
+        "estimated_cost_usd"
+    )
+    model_cells[estimated_index] = [
+        "f",
+        "4008000000000000",
+    ]  # 3.0 with unchanged aggregates
+    with pytest.raises(ValueError, match="per-model route replay"):
+        verify_artifact_crosslinks(sections, context)
+
+
+def test_actual_null_to_value_route_history_refuses_without_baseline(tmp_path):
+    sections, context = _guarded_usage_sections(
+        tmp_path,
+        (
+            ("one", "provider-a", None, None, 0.25, None, None, None, None),
+            (
+                "two",
+                "provider-b",
+                "https://b.example",
+                "api",
+                0.5,
+                None,
+                None,
+                None,
+                None,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="ambiguous preexisting billing route"):
+        verify_artifact_crosslinks(sections, context)
+
+
+def test_actual_ordinary_priced_null_mode_is_retained(tmp_path):
+    sections, context = _guarded_usage_sections(
+        tmp_path, (("one", "provider-a", None, None, 0.25, None, None, None, None),)
+    )
+    result = verify_artifact_crosslinks(sections, context)
+    assert result.route_replay_complete
+    assert result.acknowledged_usage.billing_mode is None
+    assert result.acknowledged_usage.actual_cost_usd is None
+
+
+def test_zero_actual_is_recorded_but_mixed_actual_remains_unknown(tmp_path):
+    sections, context = _guarded_usage_sections(
+        tmp_path,
+        (
+            ("one", "provider-a", None, None, 0.25, 0.0, None, None, None),
+            ("one", "provider-a", None, None, 0.5, None, None, None, None),
+        ),
+    )
+    result = verify_artifact_crosslinks(sections, context)
+    assert result.acknowledged_usage.actual_cost_usd is None
+    actual_index = [name for name, _, _ in SESSION_COLUMNS].index("actual_cost_usd")
+    assert sections["accounting"][0]["cells"][actual_index] == ["f", "0000000000000000"]
+    sections["accounting"][0]["cells"][actual_index] = ["n"]
+    with pytest.raises(ValueError, match="session actual cost sum"):
+        verify_artifact_crosslinks(sections, context)

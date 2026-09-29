@@ -126,8 +126,14 @@ class AcknowledgedUsage(_Wire):
     actual_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     cost_status: str | None = None
     cost_source: str | None = None
-    billing_provider: str = Field(min_length=1, max_length=128)
-    billing_mode: str = Field(min_length=1, max_length=128)
+    billing_provider: str | None = Field(max_length=128)
+    billing_mode: str | None = Field(max_length=128)
+
+    @model_validator(mode="after")
+    def _accounted_provider(self):
+        if self.api_call_count > 0 and not self.billing_provider:
+            raise ValueError("accounted usage requires a billing provider")
+        return self
 
 
 class WorkspaceRefWire(_Wire):

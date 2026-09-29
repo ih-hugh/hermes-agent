@@ -19,6 +19,7 @@ from gateway.platforms.api_server_recovery_artifacts import (
     strict_json_loads,
 )
 from gateway.platforms.api_server_recovery_contract import (
+    AcknowledgedUsage,
     DataArtifactPage,
     DataBody,
     ManifestArtifactPage,
@@ -28,6 +29,29 @@ from gateway.platforms.api_server_recovery_contract import (
     receipt_sha256,
     verify_sealed_pages,
 )
+
+
+@pytest.mark.parametrize("field", ["billing_provider", "billing_mode"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_zero_call_usage_preserves_nullable_route_fields(field, value):
+    usage = deepcopy(_fixture()["seal_receipt"]["acknowledged_usage"])
+    usage["api_call_count"] = 0
+    usage[field] = value
+    assert getattr(AcknowledgedUsage.model_validate(usage), field) == value
+    with pytest.raises(ValueError):
+        AcknowledgedUsage.model_validate({
+            key: item for key, item in usage.items() if key != field
+        })
+    with pytest.raises(ValueError):
+        AcknowledgedUsage.model_validate({**usage, field: 7})
+
+
+def test_positive_call_usage_requires_nonempty_billing_provider():
+    usage = deepcopy(_fixture()["seal_receipt"]["acknowledged_usage"])
+    usage["api_call_count"] = 1
+    for value in (None, ""):
+        with pytest.raises(ValueError):
+            AcknowledgedUsage.model_validate({**usage, "billing_provider": value})
 
 
 def _fixture() -> dict:

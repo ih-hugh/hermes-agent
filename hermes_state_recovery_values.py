@@ -436,6 +436,31 @@ class SemanticContext(BaseModel):
         return self
 
 
+class VerifiedAcknowledgedUsage(BaseModel):
+    """Values replayed from retained deltas, ready for the receipt's usage field."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    api_call_count: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    reasoning_tokens: int
+    estimated_cost_usd: float
+    actual_cost_usd: float | None
+    cost_status: str | None
+    cost_source: str | None
+    pricing_version: str | None
+    billing_provider: str | None = Field(max_length=128)
+    billing_mode: str | None = Field(max_length=128)
+
+    @model_validator(mode="after")
+    def _accounted_provider(self):
+        if self.api_call_count > 0 and not self.billing_provider:
+            raise ValueError("accounted usage requires a billing provider")
+        return self
+
+
 class PartialSemanticCheck(BaseModel):
     """Internal consistency only; never a complete seal or source-scan proof."""
 
@@ -447,7 +472,8 @@ class PartialSemanticCheck(BaseModel):
     invocation_count: int
     accounted_api_calls: int
     actual_cost_usd: float | None
-    route_replay_complete: Literal[False] = False
+    acknowledged_usage: VerifiedAcknowledgedUsage
+    route_replay_complete: Literal[True] = True
 
 
 class MessageOutcomeValue(TypedDict):
@@ -559,15 +585,143 @@ def _row_cost(row: Mapping[str, object], name: str) -> float | int | None:
     return cast(float | int, value)
 
 
+def _replay_usage(
+    accounted: list[tuple[int, RetainedUsageValue]],
+    session: Mapping[str, object],
+    model_rows: list[dict[str, object]],
+) -> VerifiedAcknowledgedUsage:
+    """Replay the protected SQLite session update and each route's UPSERT order."""
+    totals: dict[str, int] = {name: 0 for name in _COUNTERS}
+    route_deltas: dict[tuple[str, str, str, str, str], list[RetainedUsageValue]] = {}
+    estimated, known_actual = 0.0, 0.0
+    actual_known = True
+    actual_provided = False
+    first = accounted[0][1] if accounted else None
+    if first is not None and (
+        session["model"] != first["model"]
+        or session["billing_provider"] != first["billing_provider"]
+    ):
+        raise ValueError("session first accounted model/provider differs")
+    for component in ("billing_base_url", "billing_mode"):
+        final = session[component]
+        if final is not None and type(final) is not str:
+            raise ValueError("invalid session billing component")
+        if final not in (None, "") and any(
+            not delta[component] for _, delta in accounted
+        ):
+            raise ValueError("ambiguous preexisting billing route")
+        if final is None and any(delta[component] for _, delta in accounted):
+            raise ValueError("explicit usage route missing from final session")
+    latest: dict[str, str | None] = {
+        name: None for name in ("cost_status", "cost_source", "pricing_version")
+    }
+    for _, delta in accounted:
+        if not delta["model"] or not delta["billing_provider"]:
+            raise ValueError("incomplete accounted route")
+        for name in _COUNTERS:
+            totals[name] += delta[name]
+            if totals[name] > _MAX_I64:
+                raise ValueError("aggregate usage counter overflow")
+        estimated += delta["estimated_cost_usd"]
+        actual = delta["actual_cost_usd"]
+        if actual is None:
+            actual_known = False
+        else:
+            known_actual += actual
+            actual_provided = True
+        for name in latest:
+            if delta[name] is not None:
+                latest[name] = delta[name]
+        key = (
+            delta["model"],
+            delta["billing_provider"],
+            delta["billing_base_url"]
+            or cast(str | None, session["billing_base_url"])
+            or "",
+            delta["billing_mode"] or cast(str | None, session["billing_mode"]) or "",
+            "",
+        )
+        route_deltas.setdefault(key, []).append(delta)
+    if any(_row_int(session, name) != totals[name] for name in _COUNTERS):
+        raise ValueError("session usage aggregate differs from retained deltas")
+    session_estimated = _row_cost(session, "estimated_cost_usd")
+    session_actual = _row_cost(session, "actual_cost_usd")
+    if accounted and session_estimated != estimated:
+        raise ValueError("session estimated cost differs from retained deltas")
+    if not accounted and session_estimated not in (None, 0, 0.0):
+        raise ValueError("no-call session has estimated cost")
+    if actual_provided and session_actual != known_actual:
+        raise ValueError("session actual cost sum differs from known deltas")
+    if not actual_provided and session_actual not in (None, 0, 0.0):
+        raise ValueError("session actual cost has no retained basis")
+    for name, expected in latest.items():
+        if session[name] != expected:
+            raise ValueError("session cost metadata differs from retained deltas")
+    if len(model_rows) != len(route_deltas):
+        raise ValueError("missing or extra per-model route")
+    for row in model_rows:
+        key = tuple(
+            row[name]
+            for name in (
+                "model",
+                "billing_provider",
+                "billing_base_url",
+                "billing_mode",
+                "task",
+            )
+        )
+        deltas = route_deltas.get(cast(tuple[str, str, str, str, str], key))
+        if deltas is None:
+            raise ValueError("unknown or auxiliary per-model route")
+        route_totals: dict[str, int] = {name: 0 for name in _COUNTERS}
+        route_estimated, route_actual = 0.0, 0.0
+        route_status: str | None = None
+        route_source: str | None = None
+        for delta in deltas:
+            for name in _COUNTERS:
+                route_totals[name] += delta[name]
+                if route_totals[name] > _MAX_I64:
+                    raise ValueError("per-model usage counter overflow")
+            route_estimated += delta["estimated_cost_usd"]
+            route_actual += delta["actual_cost_usd"] or 0.0
+            if delta["cost_status"] is not None:
+                route_status = delta["cost_status"]
+            if delta["cost_source"] is not None:
+                route_source = delta["cost_source"]
+        if (
+            any(_row_int(row, name) != route_totals[name] for name in _COUNTERS)
+            or _row_cost(row, "estimated_cost_usd") != route_estimated
+            or _row_cost(row, "actual_cost_usd") != route_actual
+            or row["cost_status"] != route_status
+            or row["cost_source"] != route_source
+        ):
+            raise ValueError("per-model route replay differs from SQLite row")
+    provider = session["billing_provider"]
+    mode = session["billing_mode"]
+    if provider is not None and type(provider) is not str:
+        raise ValueError("invalid session billing provider")
+    if mode is not None and type(mode) is not str:
+        raise ValueError("invalid session billing mode")
+    return VerifiedAcknowledgedUsage(
+        **totals,
+        estimated_cost_usd=estimated,
+        actual_cost_usd=known_actual if accounted and actual_known else None,
+        cost_status=latest["cost_status"],
+        cost_source=latest["cost_source"],
+        pricing_version=latest["pricing_version"],
+        billing_provider=cast(str | None, provider),
+        billing_mode=cast(str | None, mode),
+    )
+
+
 def verify_artifact_crosslinks(
     sections: Mapping[str, Sequence[Mapping[str, object]]],
     context: SemanticContext,
 ) -> PartialSemanticCheck:
-    """Check included rows and bounded aggregate sums; H still attests the DB scan.
+    """Check included rows and replay exact retained usage; H still attests the DB scan.
 
-    Full per-route replay needs the original pre-send session route. A final session row
-    alone cannot reconstruct every SQL COALESCE fallback, so this result is expressly
-    partial even when all included links and aggregate counters match.
+    Ambiguous null-to-value route histories refuse without inventing a baseline.
+    Complete source enumeration and producer closure remain outside this pure check.
     """
     if set(sections) != set(_KIND_RECORDS):
         raise ValueError("all four closed artifact sections are required")
@@ -726,35 +880,7 @@ def verify_artifact_crosslinks(
                 raise ValueError("retained usage generation differs")
             accounted.append((revision, delta))
     accounted.sort(key=lambda pair: pair[0])
-    totals: dict[str, int] = {name: 0 for name in _COUNTERS}
-    estimated, known_actual = 0.0, 0.0
-    any_actual = False
-    for _, delta in accounted:
-        for name in _COUNTERS:
-            totals[name] += delta[name]
-            if totals[name] > _MAX_I64:
-                raise ValueError("aggregate usage counter overflow")
-        estimated += delta["estimated_cost_usd"]
-        if delta["actual_cost_usd"] is not None:
-            known_actual += delta["actual_cost_usd"]
-            any_actual = True
-    if any(_row_int(session, name) != totals[name] for name in _COUNTERS):
-        raise ValueError("session usage aggregate differs from retained deltas")
-    session_estimated = _row_cost(session, "estimated_cost_usd")
-    session_actual = _row_cost(session, "actual_cost_usd")
-    if accounted and session_estimated != estimated:
-        raise ValueError("session estimated cost differs from retained deltas")
-    if not accounted and session_estimated not in (None, 0, 0.0):
-        raise ValueError("no-call session has estimated cost")
-    if any_actual and session_actual != known_actual:
-        raise ValueError("session actual cost sum differs from known deltas")
-    if not any_actual and session_actual not in (None, 0, 0.0):
-        raise ValueError("session actual cost has no retained basis")
-    for name in _COUNTERS:
-        if sum(_row_int(row, name) for row in model_rows) != totals[name]:
-            raise ValueError("per-model usage aggregate differs")
-    if not accounted and model_rows:
-        raise ValueError("model rows exist without accounted sends")
+    verified_usage = _replay_usage(accounted, session, model_rows)
 
     invocations = parsed["provider_invocations"]
     create: InvocationValue | None = None
@@ -790,9 +916,6 @@ def verify_artifact_crosslinks(
         send_count=len(sends),
         invocation_count=len(invocations),
         accounted_api_calls=len(accounted),
-        actual_cost_usd=known_actual
-        if accounted
-        and len(accounted)
-        == sum(delta["actual_cost_usd"] is not None for _, delta in accounted)
-        else None,
+        actual_cost_usd=verified_usage.actual_cost_usd,
+        acknowledged_usage=verified_usage,
     )
