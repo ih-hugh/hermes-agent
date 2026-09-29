@@ -319,6 +319,20 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
     live = {"role": "user", "content": "durable"}
     append = db.append_messages_batch
 
+    def _fail_before_effect(**_kwargs):
+        raise RuntimeError("before effect")
+
+    monkeypatch.setattr(db, "append_messages_batch", _fail_before_effect)
+    with pytest.raises(RuntimeError, match="before effect"):
+        _db_flush_write(agent, [row], [live])
+    pending = agent._recovery_pending_message_batch
+    assert pending[2].matches_input([row])
+    row["_row_id"] = 42
+    with pytest.raises(RecoveryRefused, match="write_payload_conflict"):
+        _db_flush_write(agent, [row], [live])
+    assert agent._recovery_pending_message_batch is pending
+    row.pop("_row_id")
+
     def _commit_then_lose_response(**kwargs):
         append(**kwargs)
         raise RuntimeError("response lost after commit")
@@ -328,5 +342,7 @@ def test_transcript_commit_lost_response_reads_ack_before_stamping_markers(
         _db_flush_write(agent, [row], [live])
         assert len(db.get_messages(scope.session_id)) == 1
         assert live[_DB_PERSISTED_MARKER] is True
+        assert row["_row_id"] == live["_row_id"] == db.get_messages(scope.session_id)[0]["id"]
+        assert agent._recovery_pending_message_batch is None
     finally:
         db.close()

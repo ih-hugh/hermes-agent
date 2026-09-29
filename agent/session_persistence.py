@@ -224,42 +224,61 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         permit = getattr(agent, "_recovery_write_permit", None) or current_write_permit()
         if permit is None:
             raise RecoveryRefused("untracked_write")
-        # Repair may annotate private _row_id/_canonical_content fields while
-        # retrying a transaction; those are not part of the submitted row payload.
-        submitted = [{k: v for k, v in row.items() if k not in {"_row_id", "_canonical_content"}}
-                     for row in batch_rows]
-        encoded = json.dumps(submitted, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        from hermes_state_recovery_message_result import prepare_message_batch
+
         pending = getattr(agent, "_recovery_pending_message_batch", None)
         if pending is not None:
-            if pending[0] != agent.session_id or pending[2] != digest:
+            pending_session, write_id, prepared = pending
+            if pending_session != agent.session_id or not prepared.matches_input(batch_rows):
                 raise RecoveryRefused("write_payload_conflict")
-            write_id = pending[1]
         else:
+            prepared = prepare_message_batch(batch_rows)
             write_id = f"message_{uuid.uuid4().hex}"
-            agent._recovery_pending_message_batch = (agent.session_id, write_id, digest)
+            agent._recovery_pending_message_batch = (agent.session_id, write_id, prepared)
+        digest = prepared.payload_sha256
         recovery_kwargs = {
             "recovery_permit": permit, "recovery_write_id": write_id,
-            "recovery_payload_sha256": digest,
+            "recovery_payload_sha256": digest, "recovery_prepared_batch": prepared,
         }
+        # The callback and the response path may annotate rows. Keep the caller's
+        # pending preimage untouched until a committed acknowledgement is read.
+        write_rows = prepared.fresh_rows()
     with _protected_write_binding(agent):
         try:
             agent._session_db.append_messages_batch(
-                session_id=agent.session_id, messages=batch_rows,
+                session_id=agent.session_id, messages=write_rows if protected else batch_rows,
                 compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
                 turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
                 turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
                 **recovery_kwargs,
             )
-        except Exception:
+        except Exception as flush_error:
             if not protected:
                 raise
-            registry = getattr(agent, "_recovery_registry", None)
-            if registry is None:
+            from agent.recovery_context import write_binding
+            from hermes_state_recovery import RecoveryStore
+
+            binding = write_binding(permit, RecoveryStore(agent._session_db))
+            if binding is None:
                 raise
-            ack = agent._session_db.read_write_ack(registry.scope, write_id)
+            try:
+                ack = agent._session_db.read_write_ack(binding[0], write_id)
+            except Exception:
+                raise flush_error
             if ack.state != "committed" or ack.payload_sha256 != digest:
-                raise
+                raise flush_error
+            agent._session_db.restore_committed_message_batch(
+                binding[0], write_id, digest, prepared, batch_rows)
+        else:
+            if protected:
+                from agent.recovery_context import write_binding
+                from hermes_state_recovery import RecoveryStore, RecoveryRefused
+
+                binding = write_binding(permit, RecoveryStore(agent._session_db))
+                if binding is None:
+                    raise RecoveryRefused("invalid_write_permit")
+                agent._session_db.restore_committed_message_batch(
+                    binding[0], write_id, digest, prepared, batch_rows)
     if protected:
         agent._recovery_pending_message_batch = None
     sync_flushed_message_markers(batch_msgs, batch_rows)

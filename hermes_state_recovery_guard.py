@@ -79,6 +79,13 @@ def guarded_write(
 
     identity = (scope.session_id, run_id, generation, mutation, payload_sha256)
 
+    def _committed_result(raw: str) -> object:
+        if mutation == "message":
+            from hermes_state_recovery_message_result import read_message_result
+
+            return read_message_result(raw).to_ack_value()
+        return json.loads(raw)
+
     def _existing(conn):
         row = conn.execute(
             "SELECT session_id,run_id,generation,mutation,payload_sha256,state,"
@@ -94,7 +101,7 @@ def guarded_write(
         if existing is not None:
             if existing[5] == "committed":
                 return WriteAck(
-                    write_id, payload_sha256, existing[6], json.loads(existing[7])
+                    write_id, payload_sha256, existing[6], _committed_result(existing[7])
                 )
             if existing[5] == "failed":
                 raise RecoveryRefused("write_failed")
@@ -119,13 +126,17 @@ def guarded_write(
         if existing is None or existing[5] != "pending":
             if existing is not None and existing[5] == "committed":
                 return WriteAck(
-                    write_id, payload_sha256, existing[6], json.loads(existing[7])
+                    write_id, payload_sha256, existing[6], _committed_result(existing[7])
                 )
             raise RecoveryRefused("write_failed")
         with _generic_write(db, conn, permit):
             if not authorize_recovery_row(db, conn, scope.session_id, mutation):
                 raise RecoveryRefused("invalid_write_permit")
             result = fn(conn)
+        if mutation == "message":
+            from hermes_state_recovery_message_result import read_message_result
+
+            result = read_message_result(result).to_ack_value()
         conn.execute(
             "UPDATE recovery_sessions SET revision=revision+1 WHERE session_id=?",
             (scope.session_id,),

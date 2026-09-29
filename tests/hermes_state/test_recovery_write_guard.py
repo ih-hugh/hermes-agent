@@ -115,7 +115,9 @@ def test_guarded_transcript_ack_prevents_duplicate_after_lost_response(
         with bind_write_permit(writer):
             db.create_session(scope.session_id, "api_server")
         rows = [{"role": "user", "content": "one"}]
-        digest = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+        from hermes_state_recovery_message_result import prepare_message_batch
+
+        digest = prepare_message_batch(rows).payload_sha256
         assert (
             db.append_messages_batch(
                 scope.session_id,
@@ -198,6 +200,21 @@ def test_failed_guarded_batch_keeps_a_durable_negative_ack(tmp_path: Path) -> No
                 (scope.session_id,),
             )[0]
         )
+    finally:
+        db.close()
+
+
+def test_message_guard_refuses_legacy_count_only_ack_before_commit(tmp_path: Path) -> None:
+    db, store, scope, handoff = _protected_db(tmp_path)
+    try:
+        producer = issue_producer_permit(store, handoff)
+        writer = issue_write_permit(producer, store, scope, "root", 0)
+        with bind_write_permit(writer):
+            db.create_session(scope.session_id, "api_server")
+        with pytest.raises(RecoveryRefused, match="invalid_message_write_result"):
+            guarded_write(db, writer, "message", "legacy-count", "c" * 64, lambda _conn: 1)
+        assert db.read_write_ack(scope, "legacy-count").state == "failed"
+        assert db._read_one("SELECT 1 FROM messages WHERE session_id=?", (scope.session_id,)) is None
     finally:
         db.close()
 
@@ -297,9 +314,9 @@ def test_bound_permit_guards_old_and_new_session_ids(tmp_path: Path) -> None:
         with bind_write_permit(writer), pytest.raises(sqlite3.DatabaseError):
             db.append_message(scope.session_id, "user", "unacknowledged")
         protected_rows = [{"role": "user", "content": "protected"}]
-        protected_digest = hashlib.sha256(
-            json.dumps(protected_rows, sort_keys=True).encode()
-        ).hexdigest()
+        from hermes_state_recovery_message_result import prepare_message_batch
+
+        protected_digest = prepare_message_batch(protected_rows).payload_sha256
         db.append_messages_batch(
             scope.session_id,
             protected_rows,

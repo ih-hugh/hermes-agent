@@ -8,6 +8,8 @@ import sqlite3
 from typing import Any, Callable, Dict, List
 
 from agent.context_compressor import _DB_PERSISTED_MARKER
+from hermes_state_recovery import RecoveryRefused
+from hermes_state_recovery_message_result import MessageOutcomeV1
 
 
 def is_content_blank(content: Any) -> bool:
@@ -27,12 +29,13 @@ def resolve_and_repair_transcript_batch(
     messages: List[Dict[str, Any]],
     encode_content_fn: Callable[[Any], Any],
     decode_content_fn: Callable[[Any], Any],
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], list[MessageOutcomeV1 | None]]:
     """Partition a message batch within an active write transaction. An assistant message carrying an
     existing integer ``_row_id`` targets its active SQLite row (or the active clone a watermark compaction
     made of it): a blank row is updated in place; a non-blank one (concurrent winner) has its canonical
-    content adopted without overwrite. Returns the messages that must be inserted as fresh rows."""
+    content adopted without overwrite. Returns fresh rows and ordered dispositions."""
     inserted_rows: List[Dict[str, Any]] = []
+    dispositions: list[MessageOutcomeV1 | None] = []
     for msg in messages:
         existing_row_id = msg.get("_row_id") if isinstance(msg, dict) else None
         target_row = None
@@ -40,19 +43,24 @@ def resolve_and_repair_transcript_batch(
             target_row = _active_assistant_row(conn, session_id, existing_row_id)
         if target_row is None:
             inserted_rows.append(msg)
+            dispositions.append(None)
             continue
         target_id = int(target_row["id"])
         decoded = decode_content_fn(target_row["content"])
         msg["_row_id"] = target_id
         if is_content_blank(decoded):
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE messages SET content = ? "
                 "WHERE id = ? AND session_id = ? AND active = 1",
                 (encode_content_fn(msg.get("content")), target_id, session_id),
             )
+            if updated.rowcount != 1:
+                raise RecoveryRefused("message_repair_target_lost")
+            dispositions.append(MessageOutcomeV1("repaired", existing_row_id, target_id))
         else:
             msg["_canonical_content"] = decoded  # concurrent winner: adopt, don't overwrite
-    return inserted_rows
+            dispositions.append(MessageOutcomeV1("adopted", existing_row_id, target_id))
+    return inserted_rows, dispositions
 
 
 def _active_assistant_row(conn: sqlite3.Connection, session_id: str, row_id: int):
