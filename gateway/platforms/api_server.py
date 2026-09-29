@@ -906,6 +906,9 @@ def _invalid_request(message: str) -> "web.Response":
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None)
+_api_protected_deadline: ContextVar[Optional[float]] = ContextVar(
+    "api_protected_deadline", default=None)
+_PROTECTED_ADMISSION_SECONDS = 5.0
 
 
 def _admit_api_agent_request(handler):
@@ -926,10 +929,47 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        retained_task: asyncio.Task | None = None
         try:
+            if request.headers.get("Idempotency-Key", "").strip().startswith("byf-recovery-v1:"):
+                # The strict handler still decides whether this is a valid
+                # protected request. This early marker only retains its pending
+                # reservation if the HTTP waiter times out or disconnects.
+                if len(self._protected_admission_tasks) >= 2:
+                    return _error_response(
+                        "Protected admission workers are busy", 429,
+                        code="recovery_workers_busy",
+                    )
+                deadline = time.monotonic() + _PROTECTED_ADMISSION_SECONDS
+                deadline_token = _api_protected_deadline.set(deadline)
+                try:
+                    task = retained_task = asyncio.create_task(handler(self, request, *args, **kwargs))
+                finally:
+                    _api_protected_deadline.reset(deadline_token)
+                self._protected_admission_tasks.add(task)
+
+                def _settled(done: asyncio.Task) -> None:
+                    self._protected_admission_tasks.discard(done)
+                    _release_pending_api_work(self, reservation)
+                    try:
+                        done.exception()
+                    except asyncio.CancelledError:
+                        pass
+
+                task.add_done_callback(_settled)
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(task), timeout=max(0.0, deadline - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    return _error_response(
+                        "Protected admission deadline exceeded", 504,
+                        code="recovery_deadline_exceeded",
+                    )
             return await handler(self, request, *args, **kwargs)
         finally:
-            _release_pending_api_work(self, reservation)
+            if retained_task is None:
+                _release_pending_api_work(self, reservation)
             _api_agent_request_reservation.reset(token)
     return _wrapped
 
@@ -1188,6 +1228,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
+        self._protected_admission_tasks: set[asyncio.Task] = set()
         # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
@@ -2146,10 +2187,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from hermes_state_recovery_exclusions import authorize_or_claim_agent_construction
 
         actual_id = session_id or new_session_id(datetime.now())
-        db = getattr(self, "_session_db", None)
+        registry = current_registry()
+        db = registry.store.db if registry is not None else getattr(self, "_session_db", None)
         path = selected_state_db_path(db)
         authorize_or_claim_agent_construction(
-            actual_id, path, db, current_registry(), current_lease(), current_write_permit())
+            actual_id, path, db, registry, current_lease(), current_write_permit())
         return actual_id, path
 
     def _create_agent(
@@ -2160,7 +2202,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        protected_runtime: Any = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2169,11 +2212,61 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from hermes_recovery_dispatch import selected_state_db_path
         from hermes_state_recovery import RecoveryRefused
 
-        session_db = self._ensure_session_db()
+        if protected_runtime is None:
+            session_db = self._ensure_session_db()
+        else:
+            from agent.recovery_producers import current_registry
+            registry = current_registry()
+            session_db = registry.store.db if registry is not None else None
         if (session_db is None
                 or selected_state_db_path(session_db).resolve() != claimed_path.resolve()):
             raise RecoveryRefused("protected_session_authority_unavailable")
         from run_agent import AIAgent
+        if protected_runtime is not None:
+            from agent.recovery_producers import FrozenProtectedRuntime
+            from gateway.run import _current_max_iterations
+            if (
+                type(protected_runtime) is not FrozenProtectedRuntime
+                or session_id != protected_runtime.session_id
+                or claimed_path.resolve() != (protected_runtime.home / "state.db").resolve()
+                or any(value is not None for value in (
+                    gateway_session_key, requested_model, requested_provider,
+                    model_options, route, session_model, room_dispatch,
+                    room_execution_policy,
+                ))
+            ):
+                raise RecoveryRefused("unsupported_configuration")
+            agent = AIAgent(
+                model=protected_runtime.model,
+                provider=protected_runtime.provider,
+                api_mode=protected_runtime.api_mode,
+                base_url=protected_runtime.base_url,
+                api_key=protected_runtime.api_key,
+                max_iterations=_current_max_iterations(),
+                quiet_mode=True,
+                verbose_logging=False,
+                ephemeral_system_prompt=ephemeral_system_prompt or None,
+                enabled_toolsets=["terminal_only"],
+                session_id=session_id,
+                platform="api_server",
+                stream_delta_callback=stream_delta_callback,
+                tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                session_db=session_db,
+                fallback_model=None,
+                credential_pool=None,
+                request_overrides=None,
+                skip_memory=True,
+                skip_background_review=True,
+                skip_context_files=True,
+            )
+            agent._hermes_api_runtime = {
+                "provider": protected_runtime.provider,
+                "model": protected_runtime.model,
+                "route_source": "protected_static",
+            }
+            return agent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
             _resolve_gateway_model, _load_gateway_config, GatewayRunner)
@@ -4055,6 +4148,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        admission_cancelled = False
+        while self._protected_admission_tasks:
+            tasks = tuple(self._protected_admission_tasks)
+            try:
+                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+            except asyncio.CancelledError:
+                admission_cancelled = True
+            # Done callbacks release pending reservations and retire the set.
+            await asyncio.sleep(0)
         recovery_cancelled = await self._recovery_workers.join()
         await _api_runs._drain_protected_status(self)
         if self._response_store is not None:
@@ -4074,7 +4176,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._close_cached_session_dbs()
             self._app = None
         logger.info("[%s] API server stopped", self.name)
-        if recovery_cancelled:
+        if admission_cancelled or recovery_cancelled:
             raise asyncio.CancelledError
 
     async def send(

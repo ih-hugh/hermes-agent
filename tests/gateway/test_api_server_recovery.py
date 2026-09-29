@@ -281,6 +281,42 @@ async def test_served_capability_requires_explicit_yaml_and_owner(
 
 
 @pytest.mark.asyncio
+async def test_capability_source_only_read_uses_selected_owner_and_worker_deadline(
+    tmp_path, monkeypatch
+) -> None:
+    from gateway.platforms import api_server_recovery_runtime
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+    )
+    adapter = _adapter()
+    loop_thread = threading.get_ident()
+    observed = []
+
+    def source_only(owner, *, deadline):
+        observed.append((owner.home, deadline, threading.get_ident()))
+        return True
+
+    monkeypatch.setattr(api_server_recovery_runtime, "static_runtime_ready", source_only)
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.get(
+                "/v1/recovery/capabilities",
+                headers={"Authorization": f"Bearer {_KEY}"},
+            )
+            assert response.status == 200
+            assert (await response.json())["ready"] is True
+        assert len(observed) == 1
+        assert observed[0][0] == tmp_path
+        assert observed[0][1] > time.monotonic()
+        assert observed[0][2] != loop_thread
+        assert not (tmp_path / "state.db").exists()
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_named_base_multiplex_default_mirror_uses_default_profile_key(
     tmp_path, monkeypatch
 ) -> None:

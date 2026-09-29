@@ -142,7 +142,9 @@ class SelectedProviderCapture:
         return self.provider
 
 
-def capture_selected_provider_admission(session_id: str) -> SelectedProviderCapture:
+def capture_selected_provider_admission(
+    session_id: str, *, deadline: float | None = None,
+) -> SelectedProviderCapture:
     """Inspect the terminal backend selected by the active profile, then capture it."""
     from tools.terminal_tool import _get_env_config
     from tools.terminal_tool_config import _get_plugin_env_provider
@@ -161,7 +163,10 @@ def capture_selected_provider_admission(session_id: str) -> SelectedProviderCapt
         capture = getattr(provider, "capture_recovery_admission", None)
         if not callable(capture):
             raise RecoveryRefused("unsupported_provider")
-        raw = capture(session_id)
+        # The selected fork shim owns its own read deadline context. H's
+        # ContextVar does not cross into that package, so pass the same absolute
+        # request deadline rather than starting another local budget there.
+        raw = capture(session_id) if deadline is None else capture(session_id, deadline=deadline)
         # The selected plugin returns the F strict DTO. Its own capture verifies
         # installed source, imported Hermes pin and the active signed grant.
         if (type(raw).__name__ != "RecoveryProviderAdmission"

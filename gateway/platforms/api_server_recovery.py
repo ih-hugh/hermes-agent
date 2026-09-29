@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import hmac
+import math
 import re
 import sqlite3
 import stat
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, TypeVar, cast
+from typing import TYPE_CHECKING, Callable, Generic, Iterator, Literal, TypeVar, cast
 
 try:
     from aiohttp import web
@@ -29,6 +30,7 @@ from gateway.platforms.api_server_recovery_artifacts import (
     strict_json_loads,
 )
 from gateway.platforms.api_server_recovery_contract import (
+    RecoveryAdmission,
     RecoveryCapabilities,
     RecoveryLimits,
     RecoveryReason,
@@ -50,6 +52,7 @@ _REQUEST_BYTES = 16_384
 _WORKER_SECONDS = 5.0
 _MAX_WORKERS = 2
 _ReadResult = TypeVar("_ReadResult")
+_WorkResult = TypeVar("_WorkResult")
 
 
 class RecoveryHttpRefused(ValueError):
@@ -69,9 +72,22 @@ class RecoveryOwnerContext:
 
 
 @dataclass(frozen=True, slots=True)
-class RecoveryWork:
-    future: concurrent.futures.Future[bytes]
+class RecoveryWork(Generic[_WorkResult]):
+    future: concurrent.futures.Future[_WorkResult]
     deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedKeyReplay:
+    outcome: Literal["replayed", "conflict"]
+    run_id: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedRunRead:
+    store_id: str
+    status: dict[str, object]
 
 
 def _authorization_values(request: web.Request) -> tuple[str, ...]:
@@ -147,45 +163,61 @@ class RecoveryWorkerPool:
         )
         self._permits = threading.BoundedSemaphore(_MAX_WORKERS)
         self._lock = threading.Lock()
-        self._futures: set[concurrent.futures.Future[bytes]] = set()
+        self._futures: set[concurrent.futures.Future[object]] = set()
         self._accepting = True
 
-    def submit(self, fn: Callable[[float], bytes]) -> RecoveryWork:
+    def submit(
+        self,
+        fn: Callable[[float], _WorkResult],
+        *,
+        deadline: float | None = None,
+    ) -> RecoveryWork[_WorkResult]:
         # The loop calls this before any store acquisition or provider work.
         with self._lock:
             if not self._accepting:
                 raise RecoveryHttpRefused(503, "recovery_shutting_down")
             if not self._permits.acquire(blocking=False):
                 raise RecoveryHttpRefused(429, "recovery_workers_busy")
-            deadline = time.monotonic() + _WORKER_SECONDS
+            now = time.monotonic()
+            if deadline is not None and (
+                type(deadline) is not float or not math.isfinite(deadline)
+            ):
+                self._permits.release()
+                raise RecoveryDeadlineExceeded("recovery_deadline_invalid")
+            deadline = (
+                min(deadline, now + _WORKER_SECONDS)
+                if deadline is not None
+                else now + _WORKER_SECONDS
+            )
+            if deadline <= now:
+                self._permits.release()
+                raise RecoveryDeadlineExceeded("recovery_deadline_exceeded")
             context = copy_context()
             try:
                 future = cast(
-                    concurrent.futures.Future[bytes],
+                    concurrent.futures.Future[_WorkResult],
                     self._executor.submit(context.run, self._run, fn, deadline),
                 )
             except BaseException:
                 self._permits.release()
                 raise
-            self._futures.add(future)
+            self._futures.add(cast(concurrent.futures.Future[object], future))
         future.add_done_callback(self._settled)
         return RecoveryWork(future, deadline)
 
     @staticmethod
-    def _run(fn: Callable[[float], bytes], deadline: float) -> bytes:
+    def _run(fn: Callable[[float], _WorkResult], deadline: float) -> _WorkResult:
         with recovery_deadline(deadline):
-            result = fn(deadline)
-            require_time()
-            return result
+            return fn(deadline)
 
-    def _settled(self, future: concurrent.futures.Future[bytes]) -> None:
+    def _settled(self, future: concurrent.futures.Future[_WorkResult]) -> None:
         try:
             future.exception()  # collect even when its HTTP awaiter disappeared
         except concurrent.futures.CancelledError:
             pass
         finally:
             with self._lock:
-                self._futures.discard(future)
+                self._futures.discard(cast(concurrent.futures.Future[object], future))
                 self._permits.release()
 
     async def join(self) -> bool:
@@ -232,15 +264,13 @@ class _ReadOnlyRecoveryView:
 
 
 @contextmanager
-def _read_scope_for_root(
-    owner: RecoveryOwnerContext, root_id: str
-) -> Iterator[tuple[_ReadOnlyRecoveryView, RecoveryScope, tuple[int, int]]]:
-    """Prove an existing protected root without a writable SessionDB open."""
+def _protected_read_snapshot(
+    owner: RecoveryOwnerContext,
+) -> Iterator[tuple[sqlite3.Connection, str, tuple[int, int]]]:
+    """One tracked, protected, query-only snapshot on the selected physical home."""
     from hermes_state_dbfile import _connect_tracked_db
     from hermes_state_recovery_exclusions import _catalog, _protected_exists
 
-    if not root_id or len(root_id) > 255:
-        raise RecoveryHttpRefused(404, "recovery_not_found")
     path = owner.home / "state.db"
     try:
         before = path.lstat()
@@ -294,48 +324,17 @@ def _read_scope_for_root(
             store_id = conn.execute(
                 "SELECT store_id FROM recovery_store WHERE singleton=1"
             ).fetchone()[0]
-            metadata = conn.execute(
-                "SELECT typeof(s.session_id),"
-                "length(substr(CAST(s.session_id AS BLOB),1,256)) "
-                "FROM recovery_sessions s JOIN recovery_members m "
-                "ON m.run_id=s.root_run_id AND m.session_id=s.session_id "
-                "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? "
-                "AND m.generation=0 AND m.profile=? AND m.scope_digest=? LIMIT 2",
-                (
-                    root_id,
-                    owner.profile,
-                    owner.scope_digest,
-                    owner.profile,
-                    owner.scope_digest,
-                ),
-            ).fetchall()
+            yield conn, store_id, identity
+            if conn.in_transaction:
+                conn.execute("COMMIT")
             require_time()
-            if (
-                len(metadata) != 1
-                or metadata[0][0] != "text"
-                or type(metadata[0][1]) is not int
-                or not 0 < metadata[0][1] <= 255
-            ):
-                raise RecoveryHttpRefused(404, "recovery_not_found")
-            row = conn.execute(
-                "SELECT s.session_id FROM recovery_sessions s "
-                "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? LIMIT 2",
-                (root_id, owner.profile, owner.scope_digest),
-            ).fetchall()
-            require_time()
-            if (
-                len(row) != 1
-                or type(row[0][0]) is not str
-                or len(row[0][0].encode()) != metadata[0][1]
-            ):
-                raise RecoveryHttpRefused(404, "recovery_not_found")
-            scope = RecoveryScope(
-                store_id, owner.profile, owner.scope_digest, row[0][0]
-            )
-            conn.execute("COMMIT")
+            current = path.lstat()
+            if (current.st_dev, current.st_ino) != identity:
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
         except sqlite3.OperationalError as exc:
             conn.set_progress_handler(None, 0)
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             try:
                 require_time()
             except RecoveryDeadlineExceeded as deadline_exc:
@@ -343,21 +342,198 @@ def _read_scope_for_root(
             raise
         except BaseException:
             conn.set_progress_handler(None, 0)
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             raise
-        finally:
-            conn.set_progress_handler(None, 0)
-        require_time()
-        current = path.lstat()
-        if (current.st_dev, current.st_ino) != identity:
-            raise RecoveryHttpRefused(503, "recovery_store_unavailable")
-        yield _ReadOnlyRecoveryView(conn, scope), scope, identity
-        require_time()
-        current = path.lstat()
-        if (current.st_dev, current.st_ino) != identity:
-            raise RecoveryHttpRefused(503, "recovery_store_unavailable")
     finally:
+        conn.set_progress_handler(None, 0)
         conn.close()
+
+
+@contextmanager
+def _read_scope_for_root(
+    owner: RecoveryOwnerContext, root_id: str
+) -> Iterator[tuple[_ReadOnlyRecoveryView, RecoveryScope, tuple[int, int]]]:
+    """Prove an existing protected root without a writable SessionDB open."""
+    if not root_id or len(root_id) > 255:
+        raise RecoveryHttpRefused(404, "recovery_not_found")
+    with _protected_read_snapshot(owner) as (conn, store_id, identity):
+        metadata = conn.execute(
+            "SELECT typeof(s.session_id),"
+            "length(substr(CAST(s.session_id AS BLOB),1,256)) "
+            "FROM recovery_sessions s JOIN recovery_members m "
+            "ON m.run_id=s.root_run_id AND m.session_id=s.session_id "
+            "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? "
+            "AND m.generation=0 AND m.profile=? AND m.scope_digest=? LIMIT 2",
+            (
+                root_id,
+                owner.profile,
+                owner.scope_digest,
+                owner.profile,
+                owner.scope_digest,
+            ),
+        ).fetchall()
+        require_time()
+        if (
+            len(metadata) != 1
+            or metadata[0][0] != "text"
+            or type(metadata[0][1]) is not int
+            or not 0 < metadata[0][1] <= 255
+        ):
+            raise RecoveryHttpRefused(404, "recovery_not_found")
+        row = conn.execute(
+            "SELECT s.session_id FROM recovery_sessions s "
+            "WHERE s.root_run_id=? AND s.profile=? AND s.scope_digest=? LIMIT 2",
+            (root_id, owner.profile, owner.scope_digest),
+        ).fetchall()
+        require_time()
+        if (
+            len(row) != 1
+            or type(row[0][0]) is not str
+            or len(row[0][0].encode()) != metadata[0][1]
+        ):
+            raise RecoveryHttpRefused(404, "recovery_not_found")
+        scope = RecoveryScope(store_id, owner.profile, owner.scope_digest, row[0][0])
+        conn.execute("COMMIT")
+        conn.set_progress_handler(None, 0)
+        yield _ReadOnlyRecoveryView(conn, scope), scope, identity
+
+
+def read_protected_key(
+    owner: RecoveryOwnerContext,
+    session_id: str,
+    key: str,
+    fingerprint: str,
+    admission: RecoveryAdmission,
+) -> ProtectedKeyReplay | None:
+    """Read one committed admission without creating a writer or granting work."""
+    from gateway.platforms.api_server_recovery_artifacts import strict_json_loads
+
+    try:
+        with _protected_read_snapshot(owner) as (conn, _store_id, _identity):
+            metadata = conn.execute(
+                "SELECT typeof(run_id),length(substr(CAST(run_id AS BLOB),1,256)),"
+                "typeof(session_id),length(substr(CAST(session_id AS BLOB),1,256)),"
+                "typeof(parent_run_id),length(substr(CAST(parent_run_id AS BLOB),1,256)),"
+                "typeof(request_sha256),length(substr(CAST(request_sha256 AS BLOB),1,65)),"
+                "typeof(status_json),length(substr(CAST(status_json AS BLOB),1,131073)),"
+                "typeof(generation),generation FROM recovery_members "
+                "WHERE profile=? AND scope_digest=? AND idempotency_key=?",
+                (owner.profile, owner.scope_digest, key),
+            ).fetchone()
+            require_time()
+            if metadata is None:
+                return None
+            if (
+                metadata[0] != "text"
+                or type(metadata[1]) is not int
+                or not 0 < metadata[1] <= 255
+                or metadata[2] != "text"
+                or type(metadata[3]) is not int
+                or not 0 < metadata[3] <= 255
+                or not (
+                    (metadata[4] == "null" and metadata[5] is None)
+                    or (
+                        metadata[4] == "text"
+                        and type(metadata[5]) is int
+                        and 0 < metadata[5] <= 255
+                    )
+                )
+                or metadata[6] != "text"
+                or metadata[7] != 64
+                or metadata[8] != "text"
+                or type(metadata[9]) is not int
+                or not 0 < metadata[9] <= MAX_RESPONSE_BYTES
+                or metadata[10] != "integer"
+                or metadata[11] not in (0, 1)
+            ):
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+            row = conn.execute(
+                "SELECT run_id,session_id,generation,parent_run_id,request_sha256,status_json "
+                "FROM recovery_members WHERE profile=? AND scope_digest=? AND idempotency_key=?",
+                (owner.profile, owner.scope_digest, key),
+            ).fetchone()
+            require_time()
+            if row is None or any(
+                type(row[index]) is not str for index in (0, 1, 4, 5)
+            ):
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+            if (
+                row[1] != session_id
+                or row[2] != admission.generation
+                or row[3] != admission.parent_run_id
+                or not hmac.compare_digest(row[4], fingerprint)
+            ):
+                return ProtectedKeyReplay("conflict", row[0], "queued")
+            try:
+                status = strict_json_loads(
+                    row[5].encode("utf-8"), max_bytes=MAX_RESPONSE_BYTES
+                )
+                state = (
+                    cast(dict[str, object], status).get("status")
+                    if type(status) is dict
+                    else None
+                )
+                if type(state) is not str or not state or len(state) > 64:
+                    raise ValueError("invalid protected status")
+            except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable") from exc
+            return ProtectedKeyReplay("replayed", row[0], state)
+    except RecoveryHttpRefused as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def read_protected_run_status(
+    owner: RecoveryOwnerContext, run_id: str
+) -> ProtectedRunRead | None:
+    """Read one owned protected status from its physical home, without a writer."""
+    if type(run_id) is not str or not 0 < len(run_id) <= 255:
+        return None
+    try:
+        with _protected_read_snapshot(owner) as (conn, store_id, _identity):
+            metadata = conn.execute(
+                "SELECT typeof(status_json),"
+                "length(substr(CAST(status_json AS BLOB),1,131073)) "
+                "FROM recovery_members WHERE run_id=? AND profile=? AND scope_digest=?",
+                (run_id, owner.profile, owner.scope_digest),
+            ).fetchone()
+            require_time()
+            if metadata is None:
+                return None
+            if (
+                metadata[0] != "text"
+                or type(metadata[1]) is not int
+                or not 0 < metadata[1] <= MAX_RESPONSE_BYTES
+            ):
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+            row = conn.execute(
+                "SELECT status_json FROM recovery_members "
+                "WHERE run_id=? AND profile=? AND scope_digest=?",
+                (run_id, owner.profile, owner.scope_digest),
+            ).fetchone()
+            require_time()
+            if (
+                row is None
+                or type(row[0]) is not str
+                or len(row[0].encode()) != metadata[1]
+            ):
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
+            try:
+                value = strict_json_loads(row[0].encode(), max_bytes=MAX_RESPONSE_BYTES)
+                if type(value) is not dict:
+                    raise ValueError("invalid status")
+                status = cast(dict[str, object], value).get("status")
+                if type(status) is not str or not status or len(status) > 64:
+                    raise ValueError("invalid status")
+            except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+                raise RecoveryHttpRefused(503, "recovery_store_unavailable") from exc
+            return ProtectedRunRead(store_id, cast(dict[str, object], value))
+    except RecoveryHttpRefused as exc:
+        if exc.status == 404:
+            return None
+        raise
 
 
 def _cached_writer_for_scope(
@@ -588,16 +764,19 @@ async def handle_capabilities(
         max_active_seal_seconds=5,
         max_workers=_MAX_WORKERS,
     )
-    wire = RecoveryCapabilities.model_validate({
-        "schema": "hermes.recovery-capabilities/v1",
-        "enabled": True,
-        "ready": False,
-        "limits": limits.model_dump(),
-    })
-    return web.Response(
-        body=wire.model_dump_json(by_alias=True).encode(),
-        content_type="application/json",
-    )
+
+    def _capabilities_worker(deadline: float) -> bytes:
+        from gateway.platforms.api_server_recovery_runtime import static_runtime_ready
+
+        wire = RecoveryCapabilities.model_validate({
+            "schema": "hermes.recovery-capabilities/v1",
+            "enabled": True,
+            "ready": static_runtime_ready(owner, deadline=deadline),
+            "limits": limits.model_dump(),
+        })
+        return wire.model_dump_json(by_alias=True).encode()
+
+    return await _run(adapter, _capabilities_worker)
 
 
 async def handle_post_seal(

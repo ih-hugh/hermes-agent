@@ -18,6 +18,23 @@ from hermes_state_recovery_provider import capture_selected_provider_admission
 from tests.recovery_provider_fixture import selected_provider
 
 
+def test_selected_provider_capture_passes_exact_optional_fork_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = selected_provider(monkeypatch)
+    original = provider.capture_recovery_admission
+    observed: list[float] = []
+
+    def capture(session_id: str, *, deadline: float):
+        observed.append(deadline)
+        return original(session_id)
+
+    monkeypatch.setattr(provider, "capture_recovery_admission", capture)
+    selected = capture_selected_provider_admission("exact-session", deadline=1234.5)
+    assert selected.provider is provider
+    assert observed == [1234.5]
+
+
 def test_selected_provider_reacquired_after_transport_prune_and_replacement_refused(
     tmp_path, monkeypatch,
 ):
