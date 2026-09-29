@@ -4,15 +4,19 @@ state.db, even where SQLite's own lock probe is blind (``journal_mode=DELETE`` r
 from __future__ import annotations
 
 import select
+import sqlite3
 import subprocess
 import sys
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_repair import repair_state_db_schema
+from hermes_state_repair import (
+    _db_opens_cleanly, _recovery_repair_classification, repair_state_db_schema,
+)
 
 _HOLDER = """
 import sqlite3, sys
@@ -22,6 +26,14 @@ print("ready", flush=True)
 sys.stdin.read(1)
 conn.close()
 """
+
+
+def _corrupt_classifiable_fts(db: Path) -> None:
+    # The FTS index becomes unreadable while the recovery catalog remains
+    # classifiable. A smashed schema page would rightly refuse before the
+    # live-holder preflight and would not test that guard.
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute("UPDATE messages_fts_data SET block = X'DEADBEEFDEADBEEF'")
 
 
 @pytest.fixture
@@ -42,13 +54,13 @@ def test_repair_refuses_delete_mode_db_held_open_by_another_process(delete_mode_
     """A held DELETE-mode reader takes only SHARED, so ``BEGIN IMMEDIATE`` succeeds and the lock probe sees
     nothing; the holder scan must still refuse — REINDEX/VACUUM from a second process is the #103339 class."""
     db = delete_mode_db
+    _corrupt_classifiable_fts(db)
+    assert _recovery_repair_classification(db) == "legacy"
+    assert _db_opens_cleanly(db) is not None
     holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(db)], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert select.select([holder.stdout], [], [], 10)[0] and holder.stdout.readline().strip() == "ready"
-        with open(db, "r+b") as fh:  # schema page garbage under the holder: the shape repair is invoked on
-            fh.seek(100)
-            fh.write(b"\xff" * (4096 - 100))
         report = repair_state_db_schema(db, backup=False)
     finally:
         holder.stdin.write("x")
@@ -56,6 +68,12 @@ def test_repair_refuses_delete_mode_db_held_open_by_another_process(delete_mode_
         holder.wait(timeout=10)
     assert report["repaired"] is False
     assert "stop the gateway" in (report["error"] or "").lower()
+
+
+def test_delete_mode_repair_fixture_stays_classifiable(delete_mode_db: Path) -> None:
+    _corrupt_classifiable_fts(delete_mode_db)
+    assert _recovery_repair_classification(delete_mode_db) == "legacy"
+    assert _db_opens_cleanly(delete_mode_db) is not None
 
 
 def test_holder_scan_sees_through_a_symlinked_home(tmp_path):
