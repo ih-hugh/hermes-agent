@@ -471,23 +471,27 @@ describe('quickstart', () => {
   })
 
   it('pins the quickstart progress view while the job runs', async () => {
-    $localRuntimeJobs.set([
-      {
-        job_id: 'q1',
-        kind: 'quickstart',
-        target: 'Qwen3.6 27B',
-        model_id: 'qwen3.6-27b',
-        status: 'running',
-        phase: 'downloading',
-        detail: 'Qwen3.6 27B — 17.6 GB',
-        total_bytes: 100,
-        done_bytes: 30,
-        percent: 30,
-        error: null
-      }
-    ])
+    const job: LocalRuntimeJob = {
+      job_id: 'q1',
+      kind: 'quickstart',
+      target: 'Qwen3.6 27B',
+      model_id: 'qwen3.6-27b',
+      status: 'running',
+      phase: 'downloading',
+      detail: 'Qwen3.6 27B — 17.6 GB',
+      total_bytes: 100,
+      done_bytes: 30,
+      percent: 30,
+      error: null
+    }
+
+    // The backend job registry is authoritative; its first poll must agree
+    // with the running row seeded in the renderer cache.
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [job] })
+    $localRuntimeJobs.set([job])
     renderPane()
 
+    await waitFor(() => expect(mocked.getLocalModelsJobs).toHaveBeenCalled())
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()
     // One job, one view: no setup or model-choice buttons while it runs.
     expect(screen.queryByRole('button', { name: /set up for me/i })).toBeNull()
