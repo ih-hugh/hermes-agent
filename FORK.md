@@ -268,6 +268,100 @@ At the pre-merge 2026-09-29 source refresh, fork main remained
   [PR #5](https://github.com/ih-hugh/hermes-agent/pull/5) tracks its review. The aggregate CI, installed source-pair, Factory pin
   and deployment gates remain separate.
 
+### R0 qualification follow-up — full-suite compatibility
+
+The first full hosted run at `9cadc68d` completed 4,222 test files with 49,943
+passing tests, 60 failures and 505 skips. It exposed paths outside the earlier
+affected selection. The corrections below preserve the admission/store boundary;
+a focused green run is not full hosted CI or an installed Factory source-pair proof.
+
+- `9db4df6f` updates gateway fixtures to include admission-worker shutdown state,
+  the selected profile's configured owner key, and the actual scratch SessionDB.
+  Independent canonical checks passed all 22 affected tests.
+- `e2f8672d` and `9c34f643` apply the existing named-profile liveness guard before
+  ordinary exclusion claims and raw delegation reads can create directories.
+  An archived named profile remains archived. Direct and served regressions were
+  reviewed; the respective independent affected runs passed 42 and 30 tests.
+- `47a7a935`, `aa07fb25` and `8b98ec74` synchronize test fixtures with actual
+  producer retirement or an explicit owner-release event. Run status alone does
+  not prove retirement. DELETE-journal contention retains its typed immediate
+  refusal; no product deadline was widened. The latter commit also supplies the
+  declared exception and redaction interfaces in a terminal-provider SDK stub.
+- `bca76d30` recognizes an ordinary legacy completion only when the entire
+  missing-ledger catalog is the exact canonical exclusion-only bootstrap. Ledger
+  and bounded catalog probes share an explicit read transaction. Extra, incomplete
+  or altered catalogs still refuse. Independent affected checks passed 71 tests.
+  First-ever concurrent initialization may still safely refuse against an unknown
+  zero-byte inode; no repair exception was added.
+- `92849cd7` closes the raw async schema-check/reconciliation race. The raw opener
+  now holds an exact durable schema claim until successful initialization and
+  hardening; uncertainty retains the claim. The shared SQLite helper's optional
+  existing-file mode uses an escaped `mode=rw` URI and does not recreate a missing
+  main file or parent. This mode is not inode attestation; the caller separately
+  validates its retained claim against the connection. Both admission orderings,
+  failed cleanup, vanished paths and escaped filenames are covered. Independent
+  qualification from that committed source passed 157 tests without retries.
+- `20142282` accepts effective DELETE mode for a settled ordinary database when
+  the existing vulnerable-SQLite gate forces it, even if WAL was requested.
+  Fixed-runtime external mode changes still reconcile. The catalog, source epoch,
+  identity and FTS checks remain required; the WAL safety gate is unchanged.
+- `ed9e2eb3` retains the new file's exclusive-creation descriptor through SQLite's
+  first open and the pathname/inode check. This prevents immediate inode reuse
+  from hiding an unlink/replacement during bootstrap. Refusal and error paths
+  close the retained descriptor; existing files do not acquire this descriptor.
+  This is not adversarial opened-inode attestation. Independent affected checks
+  passed 32 tests. `a566c439` explicitly selects a fixed SQLite runtime in the
+  separate WAL-sidecar ownership test and asserts that its fixture is in WAL.
+- `44987b15` makes repair fixtures reach their intended live-holder guards by
+  retaining a classifiable recovery catalog. Concurrent repairers may refuse a
+  live holder; an explicit later operator retry must leave exactly one surgery
+  and one forensic backup. Product repair behavior is unchanged. Independent
+  checks passed 38 tests with one Linux-only skip; Linux remains a separate gate.
+- `4453db94` tests one recovery read snapshot against a real concurrent protected
+  writer in both journal modes. WAL must commit the newer revision before the
+  reader fetches members while the reader still sees its old revision and member;
+  DELETE must delay commit until that read ends. A fresh read must then see the
+  committed closed member in both cases. Independent canonical checks passed 44
+  tests. No product snapshot or write behavior changed.
+- `bcc03c1c` prevents a disabled toolset alias from subtracting Blank Slate's kept
+  terminal tool. It also returns a static 503 for unclassifiable session-store
+  authority instead of claiming an empty session list; a pre-existing zero-byte
+  file is not bootstrapped or rewritten. Quickstart happy-path tests now use a
+  supported simulated hardware budget while retaining the real catalog decision.
+  The immutable combined journal-mode and CLI selection at `bcc03c1c` passed 513
+  tests in six files without retries.
+- `13127f7f` gives ordinary agent fixtures explicit ordinary DB identity and updates
+  private initialization arguments and spies to match their current contracts.
+  `d46cb483` makes the model-picker fixture explicitly simulate absent Anthropic
+  OAuth instead of consulting the operator's home. Original behavior assertions
+  are retained; these commits do not change model routing or protected persistence.
+- `c97e3431` corrects a desktop quickstart fixture whose authoritative mocked
+  backend returned no jobs while its renderer cache claimed a running job. The
+  actual initial poll now returns that same job. All 21 affected tests passed
+  independently; the full local UI suite passed 7,721 tests in 819 files. Product
+  desktop behavior is unchanged.
+- `4406c783` anchors the existing whole-input launchctl/Hermes approval lookaheads
+  once instead of rescanning every suffix. Matching order, descriptions and stored
+  approval keys remain unchanged. The unchanged 2,000/4,000-segment benchmark
+  timed out locally and in hosted CI before the change; independent review passes
+  it in 1.6 seconds afterward. Four affected approval files passed 478 tests,
+  failed three pre-existing macOS real-binary subprocess fixtures and skipped one.
+  The same three sort/man cases failed before the regex edit and never call the
+  detector. They remain host qualification failures, not a globally green claim.
+
+At this pre-merge checkpoint, an immutable 272-file selection at `4453db94`
+passed 4,717 tests, failed those same three macOS binary fixtures and skipped 43,
+without retries. The second full hosted run, at `58686a7b`, had 49,949 passing tests,
+59 failures and 500 skips, including a benchmark timeout; it predates the final
+corrections and remains failed evidence. Fresh full Linux CI on the final PR
+commit is required before readiness. A mixed-source local
+run, where another worker changed initializer files after import, is invalid
+evidence for the source-epoch checks and was discarded in favor of an immutable
+checkout. No upstream submission is recorded for these follow-ups. Preserve their
+behavioral regressions during upstream intake; retire compatibility-only fixture
+changes when the corresponding upstream fixture and contract agree. The fork
+merge, Factory pin, installed source-pair qualification and deployment are separate.
+
 ## Upstream maintenance plan
 
 This is the proposed operating cadence; no recurring job or automatic update has
