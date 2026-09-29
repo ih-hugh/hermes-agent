@@ -110,6 +110,104 @@ def test_ordinary_delegation_uses_existing_schema_in_mixed_store(tmp_path, monke
         ad._reset_for_tests()
 
 
+def test_batch_id_collision_preserves_historical_protected_origin(
+    tmp_path, monkeypatch,
+):
+    db, _store, scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    monkeypatch.setattr(ad, "_get_executor", lambda *_: pytest.fail("worker pool started"))
+    ad._reset_for_tests()
+    try:
+        with sqlite3.connect(db.db_path) as raw:
+            raw.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, origin_session_id, "
+                "state, dispatched_at, updated_at, delivery_state, delivery_attempts, task_json) "
+                "VALUES ('deleg_existing', 'key', ?, '', 'completed', 1, 1, 'pending', 0, 'historic')",
+                (scope.session_id,),
+            )
+        result = ad.dispatch_async_delegation_batch(
+            delegation_id="deleg_existing", goals=["ordinary work"], context=None,
+            toolsets=None, role="worker", model=None, session_key="key",
+            parent_session_id="ordinary-parent",
+            runner=lambda: pytest.fail("runner started"),
+        )
+        assert result["status"] == "rejected"
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT parent_session_id, task_json FROM async_delegations "
+                "WHERE delegation_id='deleg_existing'"
+            ).fetchone() == (scope.session_id, "historic")
+    finally:
+        db.close()
+        ad._reset_for_tests()
+
+
+def test_failed_submit_never_deletes_replaced_ledger_row(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    ad._reset_for_tests()
+
+    class ReplacingExecutor:
+        def submit(self, _worker):
+            with sqlite3.connect(db.db_path) as raw:
+                raw.execute(
+                    "UPDATE async_delegations SET parent_session_id='other-origin', "
+                    "task_json='other-record' WHERE delegation_id='deleg_replaced'"
+                )
+            raise RuntimeError("submit failed after replacement")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda *_: ReplacingExecutor())
+    try:
+        result = ad.dispatch_async_delegation_batch(
+            delegation_id="deleg_replaced", goals=["ordinary work"], context=None,
+            toolsets=None, role="worker", model=None, session_key="key",
+            parent_session_id="ordinary-parent",
+            runner=lambda: pytest.fail("runner started"),
+        )
+        assert result["status"] == "unknown"
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT parent_session_id, task_json FROM async_delegations "
+                "WHERE delegation_id='deleg_replaced'"
+            ).fetchone() == ("other-origin", "other-record")
+    finally:
+        db.close()
+        ad._reset_for_tests()
+
+
+def test_failed_submit_cleans_only_its_unchanged_row(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_db_path", lambda: db.db_path)
+    ad._reset_for_tests()
+
+    class FailingExecutor:
+        def submit(self, _worker):
+            raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda *_: FailingExecutor())
+    try:
+        result = ad.dispatch_async_delegation_batch(
+            delegation_id="deleg_new", goals=["ordinary work"], context=None,
+            toolsets=None, role="worker", model=None, session_key="key",
+            parent_session_id="ordinary-parent",
+            runner=lambda: pytest.fail("runner started"),
+        )
+        assert result["status"] == "rejected"
+        assert result["code"] == "scheduling_failed"
+        with sqlite3.connect(db.db_path) as raw:
+            assert raw.execute(
+                "SELECT 1 FROM async_delegations WHERE delegation_id='deleg_new'"
+            ).fetchone() is None
+    finally:
+        db.close()
+        ad._reset_for_tests()
+
+
 @pytest.mark.parametrize("parent_id,expected_kind", [
     ("ordinary-parent", "ordinary_session"), (None, "unscoped_ordinary"),
 ])

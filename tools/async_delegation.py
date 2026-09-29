@@ -236,6 +236,8 @@ def _capture_routing_origin() -> Dict[str, Any]:
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
+    from hermes_state_recovery import RecoveryRefused
+
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -246,21 +248,45 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_KEYS)
         if key in record}
+    task_payload["_dispatch_token"] = record.setdefault("_dispatch_token", uuid.uuid4().hex)
+    task_json = record["_persisted_task_json"] = json.dumps(task_payload)
     with _DB_LOCK, _transaction() as conn:
-        conn.execute("""INSERT OR REPLACE INTO async_delegations
+        try:
+            conn.execute("""INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id)
                VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
-             record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
-             json.dumps(task_payload), record.get("origin_session_id", "")))
+                (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
+                 record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
+                 task_json, record.get("origin_session_id", "")))
+        except sqlite3.IntegrityError as exc:
+            raise RecoveryRefused("delegation_id_conflict") from exc
     try:
         _prune_durable_records()
     except Exception:
         # Dispatch has already committed; retention maintenance cannot undo it.
         logger.warning("Async delegation retention prune failed after dispatch", exc_info=True)
+
+
+def _cleanup_failed_dispatch(record: Dict[str, Any]) -> bool:
+    """Delete only this dispatch's still-running row after an executor refused submission."""
+    task_json = record.get("_persisted_task_json")
+    if type(task_json) is not str:
+        return False
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT parent_session_id, origin_session_id, task_json, state "
+            "FROM async_delegations WHERE delegation_id=?", (record["delegation_id"],),
+        ).fetchone()
+        if row != (record.get("parent_session_id"), record.get("origin_session_id", ""),
+                   task_json, "running"):
+            return False
+        return conn.execute(
+            "DELETE FROM async_delegations WHERE delegation_id=? AND task_json=? "
+            "AND state='running'", (record["delegation_id"], task_json),
+        ).rowcount == 1
 
 
 def _prune_durable_records() -> None:
@@ -759,9 +785,17 @@ def _dispatch(
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+            if _records.get(delegation_id) is record:
+                _records.pop(delegation_id, None)
+        try:
+            cleaned = _cleanup_failed_dispatch(record)
+        except Exception:
+            cleaned = False
+            logger.warning("Async delegation cleanup outcome unknown for %s", delegation_id,
+                           exc_info=True)
+        if not cleaned:
+            return {"status": "unknown", "code": "delegation_cleanup_unknown",
+                    "error": "delegation_cleanup_unknown", "delegation_id": delegation_id}
         return {"status": "rejected", "code": "scheduling_failed",
                 "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:

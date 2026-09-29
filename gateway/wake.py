@@ -60,9 +60,10 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     The public handler return stays unchanged. This receipt means scheduled/queued,
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
-    claim = await _claim_wake(adapter, getattr(event, "session_id", ""))
-    if claim is not None:
-        event.session_id = claim.resolved_ids[0]
+    # Push adapters route from event.source inside handle_message, where the
+    # target may be created or rotated before the eventual agent guard. An
+    # optional event.session_id is not evidence of that effective target.
+    await _claim_wake(adapter)
     event._gateway_accepted = False
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:

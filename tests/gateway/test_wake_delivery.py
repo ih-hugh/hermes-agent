@@ -83,6 +83,49 @@ async def test_idless_push_wake_refuses_existing_protected_store_before_handler(
 
 
 @pytest.mark.asyncio
+async def test_push_event_decoy_id_cannot_bypass_protected_source_route(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from gateway.wake import admit_internal_event
+    from tests.agent.test_recovery_runtime import _admitted
+
+    db, _store, _scope, _registry = _admitted(tmp_path)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    event = SimpleNamespace(session_id="ordinary-decoy", source=_source())
+    adapter = PushAdapter()
+    try:
+        with pytest.raises(ValueError, match="protected_session_dispatch"):
+            await admit_internal_event(adapter, event)
+        assert adapter.handled == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_push_event_decoy_id_still_claims_unscoped_before_ordinary_handler(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+    from gateway.wake import admit_internal_event
+
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    event = SimpleNamespace(session_id="ordinary-decoy", source=_source())
+
+    class AcceptedAdapter(PushAdapter):
+        async def handle_message(self, received):
+            with sqlite3.connect(tmp_path / "state.db") as raw:
+                assert raw.execute(
+                    "SELECT 1 FROM recovery_exclusions WHERE kind='unscoped_ordinary'"
+                ).fetchone() == (1,)
+            assert received.session_id == "ordinary-decoy"
+            received._gateway_accepted = True
+            await super().handle_message(received)
+
+    adapter = AcceptedAdapter()
+    await admit_internal_event(adapter, event)
+    assert adapter.handled == [event]
+
+
+@pytest.mark.asyncio
 async def test_protected_wake_refuses_before_self_post(tmp_path, monkeypatch):
     from tests.agent.test_recovery_runtime import _admitted
 
