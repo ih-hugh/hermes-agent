@@ -740,6 +740,7 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             kind="message.user",
             actor=USER,
             payload={"text": "x" * 180, "index": index},
+            now=20 + index,
         )
 
     one_event = rooms.read_events(db, room_id="room-1", limit=1)
@@ -750,16 +751,22 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
     ) + 1
     monkeypatch.setattr(rooms, "MAX_LOG_PAGE_BYTES", budget)
 
-    first = rooms.read_events(db, room_id="room-1", limit=4)
-    assert len(first["events"]) == 1
-    assert first["has_more"] is True
-    second = rooms.read_events(
-        db,
-        room_id="room-1",
-        since_seq=first["cursor"],
-        limit=4,
-    )
-    assert second["events"][0]["seq"] == first["cursor"] + 1
+    cursor = 0
+    for expected_seq in range(1, 5):
+        page = rooms.read_events(db, room_id="room-1", since_seq=cursor, limit=4)
+        assert len(page["events"]) == 1
+        assert page["events"][0]["seq"] == expected_seq
+        assert page["cursor"] == expected_seq
+        assert page["has_more"] is (expected_seq < 4)
+        assert (
+            len(
+                json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            <= budget
+        )
+        cursor = page["cursor"]
 
 
 def test_room_log_pages_bound_multibyte_utf8_and_advance_cursor(tmp_path, monkeypatch):
