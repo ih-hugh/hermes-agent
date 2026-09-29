@@ -117,10 +117,13 @@ def test_repaired_db_search_works(tmp_path):
 
 
 def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
-    """A still-broken DB must not loop: the second open just raises."""
+    """A failed repair on a readable, unclaimed DB is attempted only once."""
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
-    _corrupt_duplicate_fts(db_path)
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM recovery_exclusions").fetchone()[0] == 0
+        )
     monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
 
     calls = {"n": 0}
@@ -131,19 +134,52 @@ def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
         # Pretend repair failed so the guard's one-shot behavior is exercised.
         return {"repaired": False, "strategy": None, "backup_path": None, "error": "x"}
 
-    monkeypatch.setattr(hermes_state, "repair_state_db_schema", fake_repair)
+    def malformed_open(*_args, **_kwargs):
+        raise sqlite3.DatabaseError(
+            "malformed database schema (messages_fts) - table messages_fts already exists"
+        )
 
-    with pytest.raises(sqlite3.DatabaseError):
+    monkeypatch.setattr(hermes_state, "repair_state_db_schema", fake_repair)
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", malformed_open)
+
+    with pytest.raises(sqlite3.DatabaseError, match="malformed database schema"):
         SessionDB(db_path=db_path)
-    with pytest.raises(sqlite3.DatabaseError):
+    with pytest.raises(sqlite3.DatabaseError, match="malformed database schema"):
         SessionDB(db_path=db_path)
     assert calls["n"] == 1  # repair attempted only once across both opens
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+            ).fetchone()[0]
+            >= 1
+        )
 
     monkeypatch.setattr(hermes_state, "repair_state_db_schema", real_repair)
 
 
+def test_auto_open_refuses_unreadable_catalog_before_repair(tmp_path, monkeypatch):
+    from hermes_state_recovery import RecoveryRefused
 
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    original = db_path.read_bytes()
+    calls = {"n": 0}
 
+    def fake_repair(*_args, **_kwargs):
+        calls["n"] += 1
+        return {"repaired": True}
+
+    monkeypatch.setattr(hermes_state, "repair_state_db_schema", fake_repair)
+    for _ in range(2):
+        with pytest.raises(RecoveryRefused) as refused:
+            SessionDB(db_path=db_path)
+        assert refused.value.code == "protected_session_authority_unavailable"
+    assert calls["n"] == 0
+    assert db_path.read_bytes() == original
+    assert not list(tmp_path.glob("state.db.malformed-backup-*"))
+    assert not list(tmp_path.glob("state.db.repair-scratch*"))
 
 
 def test_unclassifiable_file_refuses_repair_before_artifacts(tmp_path):
