@@ -65,6 +65,13 @@ def test_full_sealed_fixture_reconstructs_independent_roots():
     assert b"Caf\xc3\xa9 \xe2\x9c\x93" in canonical_json_bytes(fixture["sealed_pages"])
 
 
+def test_complete_stream_rejects_trailing_none_page():
+    fixture = _fixture()
+    receipt = SealReceipt.model_validate(fixture["seal_receipt"])
+    with pytest.raises(ValueError, match="unexpected extra page"):
+        verify_sealed_pages(receipt, [*_pages(fixture), None])
+
+
 def test_unused_provider_fixture_requires_empty_inventory_root():
     fixture = _fixture()
     receipt = SealReceipt.model_validate(fixture["unused_seal_receipt"])

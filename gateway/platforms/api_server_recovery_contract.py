@@ -472,7 +472,8 @@ def verify_sealed_pages(receipt: SealReceipt, pages: Iterable[SealedArtifactPage
             if (kind == "transcript" and section_counts[kind] > MAX_TRANSCRIPT_ROWS
                     or kind == "accounting" and section_bytes[kind] > MAX_ACCOUNTING_BYTES):
                 raise ValueError("sealed section exceeds its fixed bound")
-    if next(iterator, None) is not None:
+    exhausted = object()
+    if next(iterator, exhausted) is not exhausted:
         raise ValueError("sealed page stream contains unexpected extra page")
     if tuple(section_counts[kind] for kind in section_order) != expected_counts:
         raise ValueError("sealed row inventory is incomplete")
