@@ -538,3 +538,176 @@ def test_iter_darwin_judges_by_identity_not_by_pathname(tmp_path):
         assert any(target == os.path.realpath(str(sidecar)) for _pid, target in holders)
     finally:
         held.close()
+
+
+@pytest.mark.macos_only
+def test_iter_darwin_ignores_fd_closed_after_libproc_enumeration(tmp_path, monkeypatch):
+    """A vanished candidate cannot keep an unlinked WAL generation alive."""
+    path = tmp_path / "state.db"
+    sidecar = Path(str(path) + "-wal")
+    sidecar.write_bytes(b"scratch generation")
+    held = sidecar.open("rb")
+    fd = held.fileno()
+    sidecar.unlink()
+    original = hermes_state_dbfile._iter_darwin_fd_targets
+    enumerated = []
+
+    def close_after_real_enumeration():
+        for pid, candidate_fd, target, identity in original():
+            if (pid == os.getpid() and candidate_fd == fd
+                    and target == os.path.realpath(str(sidecar))):
+                enumerated.append(identity)
+                held.close()
+            yield pid, candidate_fd, target, identity
+
+    monkeypatch.setattr(
+        hermes_state_dbfile, "_iter_darwin_fd_targets", close_after_real_enumeration
+    )
+    try:
+        holders = iter_deleted_sqlite_sidecar_holders(path)
+    finally:
+        if not held.closed:
+            held.close()
+    assert enumerated, "the real libproc scan must observe the scratch fd"
+    assert not any(pid == os.getpid() for pid, _ in holders)
+
+
+@pytest.mark.macos_only
+def test_iter_darwin_refuses_reused_fd_holding_new_stale_wal(tmp_path, monkeypatch):
+    """Revalidation must judge the fresh watched descriptor, not clear the old one."""
+    path = tmp_path / "state.db"
+    sidecar = Path(str(path) + "-wal")
+    sidecar.write_bytes(b"first retired generation")
+    held = sidecar.open("rb")
+    fd = held.fileno()
+    sidecar.unlink()
+    original = hermes_state_dbfile._iter_darwin_fd_targets
+    replacement = []
+    enumerated = []
+
+    def reuse_after_real_enumeration():
+        for pid, candidate_fd, target, identity in original():
+            if (pid == os.getpid() and candidate_fd == fd
+                    and target == os.path.realpath(str(sidecar))):
+                enumerated.append(identity)
+                held.close()
+                sidecar.write_bytes(b"second retired generation")
+                new_fd = os.open(sidecar, os.O_RDONLY)
+                if new_fd != fd:
+                    os.dup2(new_fd, fd)
+                    os.close(new_fd)
+                replacement.append(os.fdopen(fd, "rb"))
+                sidecar.unlink()
+                sidecar.write_bytes(b"current generation")
+            yield pid, candidate_fd, target, identity
+
+    monkeypatch.setattr(
+        hermes_state_dbfile, "_iter_darwin_fd_targets", reuse_after_real_enumeration
+    )
+    try:
+        holders = iter_deleted_sqlite_sidecar_holders(path)
+    finally:
+        if not held.closed:
+            held.close()
+        for item in replacement:
+            item.close()
+    assert enumerated and replacement
+    assert any(pid == os.getpid() for pid, _ in holders)
+
+
+@pytest.mark.macos_only
+def test_iter_darwin_ignores_reused_fd_away_from_watched_sidecar(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    sidecar = Path(str(path) + "-wal")
+    sidecar.write_bytes(b"retired generation")
+    held = sidecar.open("rb")
+    fd = held.fileno()
+    sidecar.unlink()
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_bytes(b"other")
+    original = hermes_state_dbfile._iter_darwin_fd_targets
+    replacement = []
+    enumerated = []
+
+    def reuse_after_real_enumeration():
+        for pid, candidate_fd, target, identity in original():
+            if (pid == os.getpid() and candidate_fd == fd
+                    and target == os.path.realpath(str(sidecar))):
+                enumerated.append(identity)
+                held.close()
+                new_fd = os.open(unrelated, os.O_RDONLY)
+                if new_fd != fd:
+                    os.dup2(new_fd, fd)
+                    os.close(new_fd)
+                replacement.append(os.fdopen(fd, "rb"))
+            yield pid, candidate_fd, target, identity
+
+    monkeypatch.setattr(
+        hermes_state_dbfile, "_iter_darwin_fd_targets", reuse_after_real_enumeration
+    )
+    try:
+        holders = iter_deleted_sqlite_sidecar_holders(path)
+    finally:
+        if not held.closed:
+            held.close()
+        for item in replacement:
+            item.close()
+    assert enumerated and replacement
+    assert not any(pid == os.getpid() for pid, _ in holders)
+
+
+@pytest.mark.macos_only
+def test_iter_darwin_ambiguous_requery_keeps_live_mismatch(tmp_path, monkeypatch):
+    path = tmp_path / "state.db"
+    sidecar = Path(str(path) + "-wal")
+    sidecar.write_bytes(b"retired generation")
+    held = sidecar.open("rb")
+    sidecar.unlink()
+    sidecar.write_bytes(b"current generation")
+
+    def uncertain(*_args):
+        raise RuntimeError("scratch requery unavailable")
+
+    monkeypatch.setattr(hermes_state_dbfile, "_recheck_darwin_fd_target", uncertain)
+    try:
+        holders = iter_deleted_sqlite_sidecar_holders(path)
+        assert any(pid == os.getpid() for pid, _ in holders)
+    finally:
+        held.close()
+
+
+@pytest.mark.macos_only
+def test_recheck_darwin_enoent_does_not_prove_fd_closed(monkeypatch):
+    """XNU vnode-path lookup may return ENOENT after finding a live fd."""
+    import ctypes
+
+    class VnodePathUnavailable:
+        def proc_pidfdinfo(self, *_args):
+            ctypes.set_errno(errno.ENOENT)
+            return 0
+
+    monkeypatch.setattr(
+        hermes_state_dbfile, "_darwin_libproc", lambda: VnodePathUnavailable()
+    )
+    target, identity = "/scratch/state.db-wal", (1, 2)
+    assert hermes_state_dbfile._recheck_darwin_fd_target(
+        os.getpid(), 99, target, identity,
+    ) == (target, identity)
+
+
+@pytest.mark.macos_only
+def test_recheck_darwin_full_record_without_path_stays_ambiguous(monkeypatch):
+    """XNU can copy out a full vnode record after vn_getpath fails."""
+    import struct
+
+    class MissingVnodePath:
+        def proc_pidfdinfo(self, _pid, _fd, _flavor, record, size):
+            struct.pack_into("<I", record, hermes_state_dbfile._DARWIN_FD_DEV_OFFSET, 7)
+            struct.pack_into("<Q", record, hermes_state_dbfile._DARWIN_FD_INO_OFFSET, 8)
+            return size
+
+    monkeypatch.setattr(hermes_state_dbfile, "_darwin_libproc", lambda: MissingVnodePath())
+    target, identity = "/scratch/state.db-wal", (1, 2)
+    assert hermes_state_dbfile._recheck_darwin_fd_target(
+        os.getpid(), 99, target, identity,
+    ) == (target, identity)
