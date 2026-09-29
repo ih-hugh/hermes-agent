@@ -20782,7 +20782,7 @@ def test_native_vision_turn_persists_a_renderable_image_ref(tmp_path):
     assert not skipped
 
     agent = AIAgent.__new__(AIAgent)
-    agent._session_db = MagicMock()
+    agent._session_db = MagicMock(spec=["append_messages_batch"])
     agent._session_db_created = True
     agent.session_id = "s-1"
     agent._last_flushed_db_idx = 0
