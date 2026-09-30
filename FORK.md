@@ -404,14 +404,44 @@ for the next run. Full hosted CI at `0206efd4` passed every selected lane,
 including JavaScript/desktop and Python's 50,125 tests with 501 skips, in
 [run 36607723776](https://github.com/ih-hugh/hermes-agent/actions/runs/36607723776).
 That Python result includes one retried hosted-room fixture, corrected above;
-it is not a retry-free result. Fresh full CI on the final fixture-corrected PR
-commit remains required before readiness. A mixed-source local
-run, where another worker changed initializer files after import, is invalid
+it is not a retry-free result. The next full run at `91e71461` passed 50,125
+Python tests with zero failures and 501 skips in 2,751 seconds, with no recorded
+test retry. Its desktop UI suite failed one group follow-up scheduling test
+(7,720 passed, one failed); the aggregate run remains failed. The test exposed
+same-millisecond local entries being reordered by the UUID tie-breaker during
+an echo merge, while delivery watermarks still referenced append positions.
+The narrow ordering correction and deterministic regression qualification are
+recorded below. Fresh exact-head aggregate CI remains required before readiness.
+A mixed-source local run, where another worker changed initializer files after import, is invalid
 evidence for the source-epoch checks and was discarded in favor of an immutable
 checkout. No upstream submission is recorded for these follow-ups. Preserve their
 behavioral regressions during upstream intake; retire compatibility-only fixture
 changes when the corresponding upstream fixture and contract agree. The fork
 merge, Factory pin, installed source-pair qualification and deployment are separate.
+
+
+### R0 qualification follow-up — desktop local message ordering
+
+- `2f93c02e` keeps newly appended room messages after the usable timestamp
+  maximum in the bounded retained log. Echo merges sort by timestamp and UUID;
+  the old same-tick timestamps could reorder entries beneath index-based member
+  watermarks, dropping or repeating a queued follow-up. Deterministic same-tick
+  and backward-clock regressions fail against the exact fork base and pass with
+  the correction. No persisted field, sync schema, dependency or check changes.
+- Local timestamps can lead wall time during bursts or clock rollback. This
+  preserves local append order, not causal ordering between independent peers.
+  Unorderable legacy timestamps are not repaired, and safe-integer exhaustion
+  refuses a new append. Existing duplicate suppression remains unchanged.
+- Independent review passed 102 room tests. Final focused tests, TypeScript and
+  scoped ESLint passed after padding-only cleanup. The full local desktop run
+  passed 9,947 tests and failed one unchanged Electron fixture, which invokes
+  `/bin/true`, absent on this Mac. That test and its production dependencies are
+  byte-identical to fork base `47e1cea1`; its isolated run reproduced the same
+  failure. All local UI tests passed. The local desktop result remains non-green;
+  only fresh hosted aggregate CI on the final commit can clear the merge gate.
+- No upstream submission is recorded for this fix. Retain the behavior tests
+  during upstream intake and retire the patch when the equivalent invariant is
+  present upstream. Shared gateway/runtime deployment remains a separate step.
 
 ## Upstream maintenance plan
 
