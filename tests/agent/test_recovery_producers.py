@@ -32,6 +32,88 @@ from hermes_state_recovery import (
 )
 
 
+@pytest.fixture
+def native_selected_provider(tmp_path: Path):
+    """Exercise the loader's implicit policy lease and explicit provider lease."""
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    home = tmp_path / "native-profile"
+    home.mkdir()
+    (home / "config.yaml").write_text("plugins:\n  entries:\n    byf_workspace: {}\n")
+    plugin = home / "plugins" / "byf_workspace"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text(
+        "from agent.terminal_env_provider import TerminalEnvironmentProvider\n"
+        "class SelectedProvider(TerminalEnvironmentProvider):\n"
+        "    name = 'byf_workspace'\n"
+        "    def is_available(self):\n"
+        "        raise AssertionError('selected callback invoked')\n"
+        "    def create_environment(self, **kwargs):\n"
+        "        raise AssertionError('selected callback invoked')\n"
+        "provider = SelectedProvider()\n"
+        "def register(ctx):\n"
+        "    ctx.register_terminal_environment_provider(provider)\n"
+    )
+    manager = PluginManager(scope_key=str(home))
+    manifest = PluginManifest(
+        name="byf_workspace", source="user", kind="backend", path=str(plugin)
+    )
+    manager._load_plugin(manifest)
+    manager._discovered = True
+    loaded = manager._plugins["byf_workspace"]
+    assert loaded.enabled, loaded.error
+    try:
+        yield manager, loaded.module.provider, manifest
+    finally:
+        manager.unload()
+
+
+def test_native_selected_provider_qualifies_with_its_inert_scoped_policy(
+    native_selected_provider,
+):
+    from agent.recovery_producers import loaded_selected_provider_supported
+
+    manager, provider, _ = native_selected_provider
+    assert loaded_selected_provider_supported(manager, provider)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["enabled", "missing", "foreign", "duplicate_policy", "duplicate_provider", "hook", "wrong_scope"],
+)
+def test_native_selected_provider_refuses_nonexact_or_enabled_policy(
+    native_selected_provider, change: str,
+):
+    from agent.recovery_producers import loaded_selected_provider_supported
+    from hermes_cli.plugins_ledger import PluginRegistration
+    from tools.registry import registry as tool_registry
+
+    manager, provider, _ = native_selected_provider
+    owned = manager._ownership_ledger["byf_workspace"]
+    policy = next(record for record in owned if record.kind == "tool_override_policy")
+    module_name = policy.key
+    if change == "enabled":
+        tool_registry.register_plugin_override_policy(module_name, True, scope=manager.scope_key)
+    elif change == "missing":
+        policy.dispose()
+    elif change == "foreign":
+        policy.key = "foreign_plugin"
+    elif change == "wrong_scope":
+        current = tool_registry.snapshot_plugin_override_policy(module_name, scope=manager.scope_key)
+        assert current is not None
+        assert tool_registry.restore_plugin_override_policy(module_name, current, None, scope=manager.scope_key)
+        tool_registry.register_plugin_override_policy(module_name, False, scope=None)
+    else:
+        kind, key = {
+            "duplicate_policy": ("tool_override_policy", module_name),
+            "duplicate_provider": ("terminal_environment_provider", "byf_workspace"),
+            "hook": ("hook", "pre_api_request"),
+        }[change]
+        owned.append(PluginRegistration(kind, key, lambda: None, plugin_key="byf_workspace"))
+    assert not loaded_selected_provider_supported(manager, provider)
+
+
 def _admitted(tmp_path: Path):
     db = SessionDB(tmp_path / "state.db")
     store = RecoveryStore(db)

@@ -307,6 +307,7 @@ def require_unmanaged_dispatch() -> None:
 def loaded_selected_provider_supported(manager: PluginManager, provider: object) -> bool:
     """Inspect only settled registration slots; invoke no selected plugin method."""
     from hermes_cli.plugins_manifest import manifest_key
+    from tools.registry import registry as tool_registry
     from agent.tool_diagnostic_transport import (
         _BUNDLED_PLUGIN_ROOT,
         _UNOBSERVED_CALLBACK_REGISTRIES,
@@ -341,9 +342,15 @@ def loaded_selected_provider_supported(manager: PluginManager, provider: object)
                 or loaded.module is not sys.modules.get(type(provider).__module__)):
             return False
         owned = [r for r in manager._ownership_ledger.get(manifest_key(manifest), ()) if r.active]
-        if len(owned) != 1 or (owned[0].kind, owned[0].key) != (
-            "terminal_environment_provider", "byf_workspace"
-        ):
+        module_name = loaded.module.__name__
+        # The native loader owns an inert override-policy lease even without opt-in.
+        if len(owned) != 2 or {(r.kind, r.key) for r in owned} != {
+            ("terminal_environment_provider", "byf_workspace"),
+            ("tool_override_policy", module_name),
+        }:
+            return False
+        policy = tool_registry.snapshot_plugin_override_policy(module_name, scope=manager.scope_key)
+        if policy is None or policy.allowed is not False:
             return False
         selected_plugin_seen = True
     return selected_plugin_seen

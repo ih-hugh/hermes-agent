@@ -131,6 +131,15 @@ At the pre-merge 2026-09-29 source refresh, fork main remained
   This restricted path is implemented, but the actual installed H/F source pair is
   still pin-mismatched and capability readiness remains false. Frontier Terminal's
   existing Nous configuration is not qualified by this candidate.
+- Native selected-plugin qualification requires both the exact workspace-provider
+  registration and its loader-owned tool-override policy in the same manager scope.
+  The policy must remain disabled; absent, foreign, duplicate or enabled policy
+  registrations and extra callbacks refuse protected admission. The native loader
+  installs the disabled policy even without operator opt-in, so it is part of the
+  supported registration inventory rather than an additional callback. Qualification
+  inspects the settled policy slot without invoking selected-provider methods.
+  Loader-backed regressions cover this inventory; installed-pair served qualification,
+  the separate Factory pin and deployment remain independent evidence.
 - Protected startup requires completed local turn-machinery warmup. Initial, rebuilt
   and per-request clients use the same stock OpenAI transport with SDK retries disabled;
   automatic auxiliary title generation is suppressed. Native usage is validated before
