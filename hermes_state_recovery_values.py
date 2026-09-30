@@ -19,6 +19,7 @@ from typing import Annotated, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     TypeAdapter,
@@ -31,6 +32,15 @@ _INT = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
 _HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_I64 = (1 << 63) - 1
+
+
+def _integer_generation(value: object) -> int:
+    if type(value) is not int:
+        raise ValueError("generation must be an integer")
+    return value
+
+
+_Generation: TypeAlias = Annotated[Literal[0, 1], BeforeValidator(_integer_generation)]
 
 
 def _columns(raw: str) -> tuple[tuple[str, str, int], ...]:
@@ -220,7 +230,7 @@ class WriteAckValue(_Value):
     write_id: str = Field(min_length=1, max_length=255)
     session_id: str = Field(min_length=1, max_length=255)
     run_id: str = Field(min_length=1, max_length=255)
-    generation: Literal[0, 1]
+    generation: _Generation
     mutation: Literal["message", "session", "completion"]
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     state: Literal["committed"]
@@ -281,7 +291,7 @@ class InvocationValue(_Value):
     invocation_id: str = Field(min_length=1, max_length=64)
     session_id: str = Field(min_length=1, max_length=255)
     run_id: str = Field(min_length=1, max_length=255)
-    generation: Literal[0, 1]
+    generation: _Generation
     producer_id: str = Field(min_length=1, max_length=64)
     sequence: int = Field(ge=0, lt=16384)
     kind: Literal["create_environment", "execute"]
@@ -409,7 +419,7 @@ class SemanticContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
     session_id: str = Field(min_length=1, max_length=255)
-    members: tuple[tuple[str, Literal[0, 1]], ...] = Field(min_length=1, max_length=2)
+    members: tuple[tuple[str, _Generation], ...] = Field(min_length=1, max_length=2)
     provider_container_id: str | None = Field(
         default=None, min_length=1, max_length=255
     )

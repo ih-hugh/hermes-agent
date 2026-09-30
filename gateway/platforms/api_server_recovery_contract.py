@@ -170,6 +170,13 @@ class RecoveryMember(_Wire):
     request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     producer_state: Literal["open", "closed", "incomplete"]
 
+    @field_validator("generation", mode="before")
+    @classmethod
+    def _integer_generation(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError("generation must be an integer")
+        return value
+
     @model_validator(mode="after")
     def _lineage(self):
         if (self.generation == 0) != (self.parent_run_id is None):

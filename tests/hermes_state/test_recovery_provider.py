@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,29 @@ from hermes_state_recovery_provider import (
     capture_selected_provider_admission,
 )
 from tests.recovery_provider_fixture import provider_admission, selected_provider
+
+
+@pytest.mark.parametrize("mode", ["python", "json"])
+@pytest.mark.parametrize("generation", [0, 1, False, True, 0.0, 1.0, "0", "1", None, 2])
+def test_provider_invocation_generation_preserves_exact_integer_identity(mode, generation):
+    from hermes_state_recovery_provider import ProviderInvocationRow
+
+    value = {
+        "invocation_id": "invocation", "session_id": "session", "run_id": "root",
+        "generation": generation, "producer_id": "producer", "sequence": 0,
+        "kind": "create_environment", "state": "invoking",
+    }
+    parse = (
+        lambda: ProviderInvocationRow.model_validate(value)
+        if mode == "python" else ProviderInvocationRow.model_validate_json(json.dumps(value))
+    )
+    if type(generation) is int and generation in (0, 1):
+        parsed = parse()
+        assert type(parsed.generation) is int and parsed.generation == generation
+        assert parsed.generation == parsed.model_dump(mode="json")["generation"]
+    else:
+        with pytest.raises(ValueError):
+            parse()
 
 
 def _setup(tmp_path: Path):

@@ -15,7 +15,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator, Literal, Never, SupportsIndex
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from gateway.platforms.api_server_recovery_artifacts import canonical_json_bytes
 from gateway.platforms.api_server_recovery_contract import WorkspaceRefWire
@@ -105,6 +105,13 @@ class ProviderInvocationRow(_Strict):
     container_attestation_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     exit_code: int | None = Field(default=None, ge=-(2**31), lt=2**31)
     outcome_reason: Literal["provider_exception", "lost_result"] | None = None
+
+    @field_validator("generation", mode="before")
+    @classmethod
+    def _integer_generation(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError("generation must be an integer")
+        return value
 
 
 class ProviderInvocationPermit:

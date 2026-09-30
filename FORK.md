@@ -140,6 +140,12 @@ At the pre-merge 2026-09-29 source refresh, fork main remained
   inspects the settled policy slot without invoking selected-provider methods.
   Loader-backed regressions cover this inventory; installed-pair served qualification,
   the separate Factory pin and deployment remain independent evidence.
+- Recovery member, provider-invocation and sealed-value generation parsing requires
+  exact integer zero or one before Literal coercion, including each nested semantic
+  member tuple. Booleans, floats, strings and missing/unsupported generations refuse
+  at Python and JSON boundaries. The accepted integer values and published JSON
+  schemas are unchanged; existing admission and admission-result checks remain strict.
+  This evidence-type correction does not qualify a served runtime or authorize cleanup.
 - Protected startup requires completed local turn-machinery warmup. Initial, rebuilt
   and per-request clients use the same stock OpenAI transport with SDK retries disabled;
   automatic auxiliary title generation is suppressed. Native usage is validated before

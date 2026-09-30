@@ -121,6 +121,29 @@ def test_protected_admission_result_requires_exact_versioned_identity():
         })
 
 
+@pytest.mark.parametrize("mode", ["python", "json"])
+@pytest.mark.parametrize("generation", [0, 1, False, True, 0.0, 1.0, "0", "1", None, 2])
+def test_recovery_member_generation_preserves_exact_integer_identity(mode, generation):
+    value = {
+        "run_id": "run_nudge" if generation == 1 else "run_root",
+        "generation": generation,
+        "parent_run_id": "run_root" if generation == 1 else None,
+        "request_sha256": "a" * 64,
+        "producer_state": "closed",
+    }
+    parse = (
+        lambda: recovery_wire.RecoveryMember.model_validate(value)
+        if mode == "python" else recovery_wire.RecoveryMember.model_validate_json(json.dumps(value))
+    )
+    if type(generation) is int and generation in (0, 1):
+        parsed = parse()
+        assert type(parsed.generation) is int and parsed.generation == generation
+        assert parsed.model_dump(mode="json", by_alias=True) == value
+    else:
+        with pytest.raises(ValueError):
+            parse()
+
+
 def test_capabilities_fixture_is_strict_bounded_wire():
     fixture = _fixture()
     assert {"RecoveryCapabilities", "RecoveryLimits"} <= fixture["schema_sha256"].keys()
