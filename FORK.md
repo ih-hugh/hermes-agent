@@ -505,3 +505,36 @@ This register does not freshly attest the running gateway. R0's fork merge is
 recorded above; it still requires qualification of its follow-up fixes, the separate
 Factory pin, release and deployment. The much
 larger upstream catch-up remains a separate reviewed compatibility scope.
+
+## Protected structured reasoning — qualification checkpoint
+
+The Factory's five role defaults request low reasoning. The protected runs route
+previously refused their structured model_options, and passing reasoning_config
+alone would still omit the scalar on direct OpenAI Chat Completions. This maintained
+patch admits only model_options={reasoning:{effort:low|medium|high}}. Absence retains
+the previously qualified wire behavior. Unknown levels and keys, generic overrides,
+service tiers, disabled reasoning and alternate routes remain refused.
+
+The immutable, actually issued preparation retains the scalar; the real constructor
+checks its exact configuration before effects. The request builder projects that
+choice into top-level SDK reasoning_effort and the final streaming/nonstreaming guard
+rechecks it before each physical send. Mutable request or agent configuration does
+not replace the issued choice; copied preparations, changed constructor inputs and
+dropped/substituted send fields refuse. Existing selected-provider, terminal-only,
+no-MCP, producer, hidden-retry and no-override boundaries remain in force. Complete
+normalized-body fingerprints bind effort changes to keyed root/nudge requests.
+
+Behavioral qualification uses the canonical isolated test runner, real Hermes
+imports, scratch state stores and actual served root/nudge-to-AIAgent-to-OpenAI SDK
+paths. Only the SDK transport boundary and the existing selected-provider fixture
+are substituted; no provider call, installed Factory bundle, shared runtime or
+production deployment is qualified here. The affected suite retains producer
+closure, source accounting, exact retries, constructor drift and effective tool
+guards. Fixture repairs preserve the same issued selected-plugin identity and give
+minimal sender fixtures genuine supported-route absence preparations.
+
+Upstream equivalence has not been qualified at this checkpoint. Retire the patch
+when a released upstream protected route passes strict structured shape, immutable
+issued-choice binding, absence, changed-body idempotency and actual root/nudge SDK
+propagation/substitution regressions. Independent fork review/CI/merge precede the
+separate Factory grammar mirror, reviewed pin and installed-pair qualification.

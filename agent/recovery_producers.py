@@ -101,6 +101,7 @@ class FrozenProtectedRuntime:
     selected_provider: object = field(repr=False, compare=False)
     tool_generation: int
     terminal_registry_generation: tuple[int, int]
+    reasoning_effort: str | None = None
 
     def agent_config(self) -> dict[str, object]:
         """Give constructor helpers a fresh copy of the validated safe subset."""
@@ -253,11 +254,73 @@ def bind_protected_constructor(prepared: FrozenProtectedRuntime) -> Iterator[Non
         lock.release()
 
 
+def _matching_protected_reasoning(
+    prepared: FrozenProtectedRuntime, config: object
+) -> bool:
+    effort = prepared.reasoning_effort
+    if effort is None:
+        return config is None
+    if (
+        type(effort) is not str
+        or effort not in {"low", "medium", "high"}
+        or type(config) is not dict
+    ):
+        return False
+    mapping = cast(dict[str, object], config)
+    return (
+        set(mapping) == {"enabled", "effort"}
+        and mapping["enabled"] is True
+        and type(mapping["effort"]) is str
+        and mapping["effort"] == effort
+    )
+
+
+def protected_reasoning_config(agent: object) -> dict[str, object] | None:
+    """Bind every protected request to its actual issued constructor choice."""
+    prepared = getattr(agent, "_recovery_constructor_prepared", None) or getattr(
+        agent, "_recovery_client_inputs", None
+    )
+    if type(prepared) is not FrozenProtectedRuntime:
+        refuse_untracked_work()
+    prepared = cast(FrozenProtectedRuntime, prepared)
+    _require_preparation_current(prepared)
+    if not _matching_protected_reasoning(
+        prepared, getattr(agent, "reasoning_config", None)
+    ) or bool(getattr(agent, "_ephemeral_reasoning_off", False)):
+        refuse_untracked_work()
+    return (
+        {"enabled": True, "effort": prepared.reasoning_effort}
+        if prepared.reasoning_effort is not None
+        else None
+    )
+
+
+def protected_reasoning_kwargs(
+    agent: object, kwargs: dict[str, object]
+) -> dict[str, object]:
+    """Project the issued scalar without widening ordinary transport options."""
+    if current_registry() is None:
+        return kwargs
+    config = protected_reasoning_config(agent)
+    if config is None:
+        if "reasoning_effort" in kwargs:
+            refuse_untracked_work()
+        return kwargs
+    effort = config["effort"]
+    if "reasoning_effort" in kwargs and (
+        type(kwargs["reasoning_effort"]) is not str
+        or kwargs["reasoning_effort"] != effort
+    ):
+        refuse_untracked_work()
+    return {**kwargs, "reasoning_effort": effort}
+
+
 def require_protected_constructor(
     session_id: str, *, model: str, provider: str | None, api_mode: str | None,
     base_url: str | None, api_key: str | None, enabled_toolsets: list[str] | None,
     disabled_toolsets: list[str] | None, fallback_model: object, credential_pool: object,
-    request_overrides: object, skip_memory: bool, skip_background_review: bool,
+    request_overrides: object, reasoning_config: object,
+    skip_memory: bool, skip_background_review: bool,
     skip_context_files: bool, platform: str | None,
 ) -> FrozenProtectedRuntime | None:
     """Refuse unprepared protected construction before session/client/tool effects."""
@@ -277,7 +340,8 @@ def require_protected_constructor(
             or credential_pool is not None
             or request_overrides not in (None, {})
             or not skip_memory or not skip_background_review or not skip_context_files
-            or platform != "api_server"):
+            or platform != "api_server"
+            or not _matching_protected_reasoning(prepared, reasoning_config)):
         raise RecoveryRefused("unsupported_configuration")
     _require_preparation_current(prepared)
     return prepared
@@ -433,6 +497,8 @@ def require_effective_chat_request(
     if current_registry() is None:
         return
     require_supported_chat_agent(agent)
+    config = protected_reasoning_config(agent)
+    expected_effort = config["effort"] if config is not None else None
     allowed = frozenset({
         "model", "messages", "tools", "timeout", "temperature", "max_tokens",
         "max_completion_tokens", "reasoning_effort", "prompt_cache_key", "stream",
@@ -449,19 +515,24 @@ def require_effective_chat_request(
                        for part in parts)
         return False
 
-    if (type(kwargs) is not dict
-            or not set(kwargs).issubset(allowed)
-            or type(kwargs.get("model")) is not str
-            or kwargs["model"] != getattr(agent, "model", None)
-            or type(kwargs.get("messages")) is not list
-            or type(kwargs.get("tools")) is not list
-            or kwargs.get("tools") != agent.tools
-            or ("timeout" in kwargs and not valid_timeout(kwargs["timeout"]))
-            or (expected_stream and kwargs.get("stream") is not True)
-            or (expected_stream and kwargs.get("stream_options") != {"include_usage": True})
+    mapping = cast(dict[str, object], kwargs)
+    if (type(mapping) is not dict
+            or not set(mapping).issubset(allowed)
+            or (expected_effort is None and "reasoning_effort" in mapping)
+            or (expected_effort is not None and (
+                type(mapping.get("reasoning_effort")) is not str
+                or mapping["reasoning_effort"] != expected_effort))
+            or type(mapping.get("model")) is not str
+            or mapping["model"] != getattr(agent, "model", None)
+            or type(mapping.get("messages")) is not list
+            or type(mapping.get("tools")) is not list
+            or mapping.get("tools") != agent.tools
+            or ("timeout" in mapping and not valid_timeout(mapping["timeout"]))
+            or (expected_stream and mapping.get("stream") is not True)
+            or (expected_stream and mapping.get("stream_options") != {"include_usage": True})
             or (expected_stream and bool(getattr(agent, "_stream_options_unsupported", False)))
-            or (not expected_stream and "stream" in kwargs and kwargs["stream"] is not False)
-            or (not expected_stream and "stream_options" in kwargs)):
+            or (not expected_stream and "stream" in mapping and mapping["stream"] is not False)
+            or (not expected_stream and "stream_options" in mapping)):
         refuse_untracked_work()
 
 

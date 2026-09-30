@@ -559,13 +559,19 @@ def _prepare_and_reserve_protected(
     from pathlib import Path
 
     from agent.recovery_context import current_incarnation
-    from gateway.platforms.api_server_recovery_runtime import prepare_static_chat_runtime
+    from gateway.platforms.api_server_recovery_runtime import (
+        prepare_static_chat_runtime, protected_request_reasoning_effort,
+    )
     from hermes_state_recovery import AdmissionIdentity, RecoveryRefused, RecoveryScope, RecoveryStore
     from hermes_state_recovery_deadline import require_time
     from hermes_state_recovery_provider import capture_selected_provider_admission
 
     require_time()
-    runtime = prepare_static_chat_runtime(owner, session_id=body["session_id"])
+    runtime = prepare_static_chat_runtime(
+        owner, session_id=body["session_id"],
+        reasoning_effort=(protected_request_reasoning_effort(body["model_options"])
+                          if "model_options" in body else None),
+    )
     require_time()
     if (("model" in body and body["model"] != runtime.model)
             or ("provider" in body and body["provider"] != runtime.provider)):
@@ -724,7 +730,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             session_id_bytes = len(body["session_id"].encode("utf-8"))
         except UnicodeError:
             session_id_bytes = 0
-        protected_fields = {"input", "session_id", "recovery", "instructions", "model", "provider"}
+        protected_fields = {"input", "session_id", "recovery", "instructions", "model", "provider", "model_options"}
         if (
             type(body) is not dict
             or set(body) - protected_fields
@@ -741,6 +747,14 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         ):
             return _json_error(_openai_error, "Unsupported protected request shape",
                                code="recovery_request_unsupported", status=400)
+        if "model_options" in body:
+            from gateway.platforms.api_server_recovery_runtime import protected_request_reasoning_effort
+            from hermes_state_recovery import RecoveryRefused
+            try:
+                protected_request_reasoning_effort(body["model_options"])
+            except RecoveryRefused:
+                return _json_error(_openai_error, "Unsupported protected request shape",
+                                   code="recovery_request_unsupported", status=400)
         key_values = request.headers.getall("Idempotency-Key", [])
         if (
             len(key_values) != 1

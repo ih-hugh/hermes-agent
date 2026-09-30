@@ -25,11 +25,13 @@ from tests.agent.test_recovery_runtime import (
 from tests.gateway.test_api_server_recovery_runtime import _profile
 
 
-def _prepared(tmp_path: Path, monkeypatch):
+def _prepared(tmp_path: Path, monkeypatch, *, effort: str | None = None):
     owner = _profile(tmp_path, monkeypatch)
     db, store, scope, registry = _admitted(owner.home)
     manager, _ = _install_selected_plugin_fixture(registry, monkeypatch)
-    prepared = prepare_static_chat_runtime(owner, session_id=scope.session_id)
+    prepared = prepare_static_chat_runtime(
+        owner, session_id=scope.session_id, reasoning_effort=effort
+    )
     writer = issue_write_permit(
         registry.permit, store, scope, registry.run_id, registry.generation
     )
@@ -219,7 +221,7 @@ def test_cold_protected_constructor_and_prompt_never_start_environment_probe(
         db.close()
 
 
-@pytest.mark.parametrize("change", ["base_url", "model", "config_json"])
+@pytest.mark.parametrize("change", ["base_url", "model", "config_json", "reasoning_effort"])
 def test_replaced_preparation_refuses_before_client(
     tmp_path: Path, monkeypatch, change: str
 ) -> None:
@@ -229,6 +231,7 @@ def test_replaced_preparation_refuses_before_client(
     replacement = {
         "base_url": "https://other.example/v1",
         "model": "redirected-model",
+        "reasoning_effort": "low",
         "config_json": b'{"agent":{"environment_probe":true}}',
     }[change]
     changed = replace(prepared, **{change: replacement})
@@ -453,5 +456,131 @@ def test_preparation_does_not_serialize_or_represent_credential(
         assert prepared.api_key.encode() not in prepared.config_json
         with pytest.raises(TypeError, match="cannot be serialized"):
             pickle.dumps(prepared)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        {"enabled": True, "effort": "low"},
+        {"enabled": False},
+        {"enabled": True, "effort": "medium", "extra": True},
+    ],
+)
+def test_unissued_constructor_reasoning_refuses_before_client(
+    tmp_path: Path, monkeypatch, reasoning: dict
+) -> None:
+    import openai
+
+    _, db, scope, _, _, prepared, writer, executor = _prepared(tmp_path, monkeypatch)
+    clients: list[object] = []
+    real_openai = openai.OpenAI
+
+    def client(**kwargs):
+        result = real_openai(**kwargs)
+        clients.append(result)
+        return result
+
+    monkeypatch.setattr(openai, "OpenAI", client)
+
+    def construct() -> None:
+        with bind_write_permit(writer), bind_protected_constructor(prepared):
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                AIAgent(
+                    api_key=prepared.api_key,
+                    base_url=prepared.base_url,
+                    provider=prepared.provider,
+                    api_mode=prepared.api_mode,
+                    model=prepared.model,
+                    enabled_toolsets=["terminal_only"],
+                    session_id=scope.session_id,
+                    session_db=db,
+                    platform="api_server",
+                    quiet_mode=True,
+                    skip_memory=True,
+                    skip_background_review=True,
+                    skip_context_files=True,
+                    reasoning_config=reasoning,
+                )
+        assert clients == []
+
+    try:
+        executor.run(construct)
+    finally:
+        for created in clients:
+            created.close()
+        db.close()
+
+
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_actual_prepared_reasoning_governs_final_sdk_kwargs(
+    tmp_path: Path, monkeypatch, effort: str | None, stream: bool
+) -> None:
+    from agent.recovery_producers import require_effective_chat_request
+
+    _, db, scope, _, _, prepared, writer, executor = _prepared(
+        tmp_path, monkeypatch, effort=effort
+    )
+
+    def construct() -> None:
+        with bind_write_permit(writer), bind_protected_constructor(prepared):
+            agent = AIAgent(
+                api_key=prepared.api_key,
+                base_url=prepared.base_url,
+                provider=prepared.provider,
+                api_mode=prepared.api_mode,
+                model=prepared.model,
+                enabled_toolsets=["terminal_only"],
+                session_id=scope.session_id,
+                session_db=db,
+                platform="api_server",
+                quiet_mode=True,
+                skip_memory=True,
+                skip_background_review=True,
+                skip_context_files=True,
+                reasoning_config=(
+                    {"enabled": True, "effort": effort} if effort else None
+                ),
+            )
+        try:
+            kwargs = agent._build_api_kwargs([{"role": "user", "content": "work"}])
+            if stream:
+                kwargs.update(stream=True, stream_options={"include_usage": True})
+            require_effective_chat_request(agent, kwargs, expected_stream=stream)
+            if effort is None:
+                assert "reasoning_effort" not in kwargs
+            else:
+                assert kwargs["reasoning_effort"] == effort
+            for value in (None, True, "medium" if effort != "medium" else "low"):
+                bad = {**kwargs, "reasoning_effort": value}
+                with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                    require_effective_chat_request(agent, bad, expected_stream=stream)
+            if effort is not None:
+                bad = dict(kwargs)
+                del bad["reasoning_effort"]
+                with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                    require_effective_chat_request(agent, bad, expected_stream=stream)
+            original = agent.reasoning_config
+            for config in (
+                None,
+                {"enabled": 1, "effort": "low"},
+                {"enabled": True, "effort": "other"},
+            ):
+                if config is None and effort is None:
+                    continue
+                agent.reasoning_config = config
+                with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                    agent._build_api_kwargs([{"role": "user", "content": "work"}])
+            agent.reasoning_config = original
+            agent._ephemeral_reasoning_off = True
+            with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+                agent._build_api_kwargs([{"role": "user", "content": "work"}])
+        finally:
+            agent.client.close()
+
+    try:
+        executor.run(construct)
     finally:
         db.close()

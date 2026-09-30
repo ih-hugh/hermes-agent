@@ -39,6 +39,40 @@ def _profile(
     return RecoveryOwnerContext("factory", home, "b" * 64)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        True,
+        [],
+        {},
+        {"reasoning": None},
+        {"reasoning": []},
+        {"reasoning": {}},
+        {"reasoning": {"effort": None}},
+        {"reasoning": {"effort": True}},
+        {"reasoning": {"effort": 1}},
+        {"reasoning": {"effort": "LOW"}},
+        {"reasoning": {"effort": " low"}},
+        {"reasoning": {"effort": "none"}},
+        {"reasoning": {"effort": "minimal"}},
+        {"reasoning": {"effort": "xhigh"}},
+        {"reasoning": {"effort": "max"}},
+        {"reasoning": {"effort": "ultra"}},
+        {"reasoning": {"effort": "low", "enabled": True}},
+        {"reasoning": {"effort": "low"}, "service_tier": "priority"},
+        {"reasoning_effort": "low"},
+    ],
+)
+def test_protected_reasoning_options_refuse_every_other_shape(options: object) -> None:
+    from gateway.platforms.api_server_recovery_runtime import (
+        protected_request_reasoning_effort,
+    )
+
+    with pytest.raises(RecoveryRefused, match="unsupported_configuration"):
+        protected_request_reasoning_effort(options)
+
+
 def _selected_source_fixture(registry, monkeypatch, on_source: Callable[[float], None]):
     import sys
     from types import ModuleType

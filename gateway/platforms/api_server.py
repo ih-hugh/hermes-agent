@@ -2242,6 +2242,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 api_mode=protected_runtime.api_mode,
                 base_url=protected_runtime.base_url,
                 api_key=protected_runtime.api_key,
+                reasoning_config=(
+                    {"enabled": True, "effort": protected_runtime.reasoning_effort}
+                    if protected_runtime.reasoning_effort is not None else None
+                ),
                 max_iterations=_current_max_iterations(),
                 quiet_mode=True,
                 verbose_logging=False,

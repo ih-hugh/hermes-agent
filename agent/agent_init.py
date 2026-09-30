@@ -2288,7 +2288,7 @@ def init_agent(
         base_url=base_url, api_key=api_key, enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets, fallback_model=fallback_model,
         credential_pool=credential_pool, request_overrides=request_overrides,
-        skip_memory=skip_memory, skip_background_review=skip_background_review,
+        reasoning_config=reasoning_config, skip_memory=skip_memory, skip_background_review=skip_background_review,
         skip_context_files=skip_context_files, platform=platform,
     )
     authorize_or_claim_agent_construction(

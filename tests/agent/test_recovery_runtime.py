@@ -93,10 +93,38 @@ def _supported_send_stub(registry: ProducerRegistry, monkeypatch, **extra):
     from tools import terminal_tool
     from tools.registry import registry as tool_registry
 
+    import run_agent  # noqa: F401 — complete machinery before static inspection
+    from gateway.platforms.api_server_recovery import RecoveryOwnerContext
+    from gateway.platforms.api_server_recovery_runtime import prepare_static_chat_runtime
+    from hermes_cli.plugins import get_plugin_manager
+
+    home = Path(registry.store.db.db_path).parent.resolve()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-scratch-constructor-only")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: registry.scope.profile)
+    (home / "config.yaml").write_text(
+        "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+        "platform_toolsets:\n  api_server: [terminal_only, no_mcp]\n"
+        "tools:\n  tool_search:\n    enabled: 'off'\n"
+        "terminal:\n  backend: byf_workspace\n"
+        "context:\n  engine: compressor\n"
+        "model:\n  provider: openai-api\n  api_mode: chat_completions\n"
+        "  default: gpt-4.1\n  context_length: 128000\n",
+        encoding="utf-8",
+    )
+    # This fixture remains a minimal sender, with an actual issued absence choice.
+    # It no longer bypasses the supported route's constructor-input provenance.
+    monkeypatch.setattr(get_plugin_manager(), "home_path", home)
     _install_selected_plugin_fixture(registry, monkeypatch)
+    prepared = prepare_static_chat_runtime(
+        RecoveryOwnerContext(registry.scope.profile, home, registry.scope.scope_digest),
+        session_id=registry.scope.session_id,
+    )
     agent = SimpleNamespace(
-        api_mode="chat_completions", provider="openai", model="test",
-        base_url="https://provider.invalid", is_subagent=False, _fallback_index=0,
+        api_mode=prepared.api_mode, provider=prepared.provider, model=prepared.model,
+        base_url=prepared.base_url, reasoning_config=None, _recovery_client_inputs=prepared,
+        is_subagent=False, _fallback_index=0,
         _fallback_chain=[], enabled_toolsets=["terminal_only"],
         tools=[{"type": "function", "function": terminal_tool.TERMINAL_SCHEMA}],
         valid_tool_names={"terminal"},
