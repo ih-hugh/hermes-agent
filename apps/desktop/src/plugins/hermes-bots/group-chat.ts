@@ -1427,9 +1427,23 @@ export function appendGroupChatEntry(
   thread?: null | string,
   images?: Attachment[]
 ): GroupMessage {
+  const priorLog = ($groupChats.get()[group] || {}).log || []
+
+  // Echo merges sort by timestamp, then UUID. Keep local append order when
+  // messages share a tick or the clock moves backwards: watermarks index it.
+  const latestAt = priorLog.reduce((latest, prior) => {
+    const at = Number(prior.at)
+
+    return Number.isSafeInteger(at) && at < Number.MAX_SAFE_INTEGER ? Math.max(latest, at) : latest
+  }, 0)
+
+  if (latestAt >= Number.MAX_SAFE_INTEGER - 1) {
+    throw new RangeError('Room message timestamp exhausted')
+  }
+
   const entry: GroupMessage = {
     id: groupChatEntryId(),
-    at: Date.now(),
+    at: Math.max(Date.now(), latestAt + 1),
     from,
     text: normalizeGroupChatText(text),
     thread: thread || 'legacy'
@@ -1445,7 +1459,6 @@ export function appendGroupChatEntry(
   // loop both committing the same member reply) lands back-to-back and
   // byte-identical. Drop the echo instead of flooding the room. User
   // entries and non-adjacent repeats are never touched.
-  const priorLog = ($groupChats.get()[group] || {}).log || []
   const lastEntry = priorLog[priorLog.length - 1]
 
   if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {

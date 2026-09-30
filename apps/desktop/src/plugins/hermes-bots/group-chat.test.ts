@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 
 import type * as groupChat from './group-chat'
 import type * as groupRounds from './group-rounds'
@@ -65,6 +65,39 @@ beforeEach(() => {
 })
 
 describe('log window', () => {
+  it('appends after the retained valid timestamp maximum and ignores unorderable timestamps', async () => {
+    const { chat } = await loadRoom()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000)
+    onTestFinished(() => clock.mockRestore())
+
+    for (const invalidAt of [NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER, 1.5]) {
+      chat.$groupChats.set({
+        Room: {
+          log: [
+            { at: 2000, from: { kind: 'user', name: 'You' }, id: 'future', text: 'earlier future entry' },
+            { at: invalidAt, from: { kind: 'user', name: 'You' }, id: 'invalid', text: 'invalid entry' },
+            { at: 500, from: { kind: 'user', name: 'You' }, id: 'tail', text: 'last entry' }
+          ],
+          watermarks: {}
+        }
+      })
+      const appended = chat.appendGroupChatEntry('Room', { kind: 'member', name: 'impl' }, 'new reply', 't1')
+      expect(Number.isSafeInteger(appended.at)).toBe(true)
+      expect(appended.at).toBeGreaterThan(2000)
+      // Duplicate delivery still returns the retained entry without another append.
+      expect(chat.appendGroupChatEntry('Room', { kind: 'member', name: 'impl' }, 'new reply', 't1')).toBe(appended)
+      expect(chat.$groupChats.get().Room.log).toHaveLength(4)
+    }
+
+    chat.$groupChats.set({
+      Exhausted: {
+        log: [{ at: Number.MAX_SAFE_INTEGER - 1, from: { kind: 'user', name: 'You' }, text: 'too far ahead' }],
+        watermarks: {}
+      }
+    })
+    expect(() => chat.appendGroupChatEntry('Exhausted', { kind: 'user', name: 'You' }, 'new')).toThrow(RangeError)
+    expect(chat.$groupChats.get().Exhausted.log).toHaveLength(1)
+  })
   it('trimming keeps watermarks consistent with the trimmed array', async () => {
     const { chat } = await loadRoom()
 
