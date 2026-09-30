@@ -83,6 +83,44 @@ _CAPABILITY_LIMIT_KEYS = (
 )
 
 
+def test_protected_admission_result_requires_exact_versioned_identity():
+    model = recovery_wire.RecoveryAdmissionResult
+    value = {
+        "schema": "hermes.recovery-admission-result/v1",
+        "store_id": "00000000-0000-0000-0000-000000000001",
+        "profile": "default",
+        "scope_digest": "a" * 64,
+        "session_id": "scratch-session",
+        "run_id": "run_root",
+        "generation": 0,
+        "parent_run_id": None,
+        "idempotency_key_sha256": "b" * 64,
+        "request_sha256": "c" * 64,
+        "gateway_incarnation": "original-owner",
+        "provider_admission_sha256": "d" * 64,
+    }
+    parsed = model.model_validate(value)
+    assert parsed.model_dump(mode="json", by_alias=True) == value
+    for field in value:
+        with pytest.raises(ValueError):
+            model.model_validate({key: item for key, item in value.items() if key != field})
+    for changed in (
+        {**value, "schema_": value["schema"]},
+        {**value, "schema": "hermes.recovery-admission-result/v2"},
+        {**value, "generation": True},
+        {**value, "generation": True, "parent_run_id": "run_root"},
+        {**value, "store_id": "not-a-uuid"},
+        {**value, "extra": "untrusted"},
+    ):
+        with pytest.raises(ValueError):
+            model.model_validate(changed)
+    with pytest.raises(ValueError):
+        recovery_wire.RecoveryAdmission.model_validate({
+            "schema": "hermes.recovery/v1", "generation": True,
+            "parent_run_id": "run_root",
+        })
+
+
 def test_capabilities_fixture_is_strict_bounded_wire():
     fixture = _fixture()
     assert {"RecoveryCapabilities", "RecoveryLimits"} <= fixture["schema_sha256"].keys()

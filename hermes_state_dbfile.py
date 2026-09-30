@@ -289,6 +289,42 @@ def _iter_darwin_fd_targets():
             yield pid, fd, target, identity
 
 
+def _recheck_darwin_fd_target(
+    pid: int, fd: int, target: str, identity: Tuple[int, int],
+) -> Optional[Tuple[str, Tuple[int, int]]]:
+    """Requery one libproc candidate immediately before judging a stale sidecar.
+
+    A descriptor can close (or be reused) after the enumeration yielded it.
+    Only a proven vanished fd clears the candidate; an ambiguous libproc
+    response retains the original fail-closed observation.
+    """
+    import ctypes
+
+    record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
+    ctypes.set_errno(0)
+    used = _darwin_libproc().proc_pidfdinfo(
+        pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record, _DARWIN_FD_RECORD_SIZE,
+    )
+    if used <= 0:
+        # ENOENT can arise after fp_get_ftype found a live descriptor when
+        # XNU's vnode-path lookup fails; it is not proof that the fd closed.
+        if ctypes.get_errno() in (errno.EBADF, errno.ESRCH):
+            return None
+        return target, identity
+    if used < _DARWIN_FD_RECORD_SIZE:
+        return target, identity
+    raw = record.raw
+    fresh_identity = (struct.unpack_from("<I", raw, _DARWIN_FD_DEV_OFFSET)[0],
+                      struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
+    fresh_target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+    if (not fresh_target.startswith("/") or "\ufffd" in fresh_target
+            or not all(fresh_identity)):
+        # XNU may return a full record even if vn_getpath could not supply
+        # the path. Only a valid new pathname can clear or replace a match.
+        return target, identity
+    return fresh_target, fresh_identity
+
+
 def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     """The macOS leg of :func:`iter_deleted_sqlite_sidecar_holders`: libproc enumeration matched
     against the watched sidecar paths, judged by identity.
@@ -301,10 +337,22 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
     holders: List[Tuple[int, str]] = []
-    for pid, _fd, target, identity in _iter_darwin_fd_targets():
+    for pid, fd, target, identity in _iter_darwin_fd_targets():
         literal = watched.get(target.casefold())
-        if literal is not None and _identity_is_truly_unlinked(identity, literal):
-            holders.append((pid, target))
+        if literal is None:
+            continue
+        try:
+            fresh = _recheck_darwin_fd_target(pid, fd, target, identity)
+        except Exception:
+            # A requery failure must not turn a previously observed mismatch
+            # into a missing holder through the outer scan's fail-open path.
+            fresh = (target, identity)
+        if fresh is None:
+            continue
+        fresh_target, fresh_identity = fresh
+        literal = watched.get(fresh_target.casefold())
+        if literal is not None and _identity_is_truly_unlinked(fresh_identity, literal):
+            holders.append((pid, fresh_target))
     return holders
 
 

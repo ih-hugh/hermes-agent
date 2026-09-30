@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Never, SupportsIndex
 
+from hermes_constants import assert_named_profile_home_live, mkdir_under_hermes_home
 from hermes_state_recovery import RecoveryRefused
 
 if TYPE_CHECKING:
@@ -239,7 +240,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files, has_invalid_sqlite_header_preopen
     from hermes_state_repair import preflight_db_writability
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_under_hermes_home(path.parent)
     # O_EXCL distinguishes our new empty inode from a pre-existing zero-byte
     # state.db. SQLite accepts the latter as an empty catalog, but its previous
     # authority is unknowable and must not be replaced by bootstrap DDL.
@@ -249,6 +250,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     newly_created = False
+    created_fd: int | None = None
     try:
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
@@ -287,22 +289,34 @@ def _connect(path: Path) -> sqlite3.Connection:
     else:
         try:
             identity = os.fstat(fd)
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        created_fd = fd
         newly_created = True
-    if newly_created:
-        _secure_state_db_files(path)
-    conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
     try:
-        current = path.lstat()
-        if ((current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
-                or not stat.S_ISREG(current.st_mode)):
-            raise RecoveryRefused("protected_session_authority_unavailable")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
-    except BaseException:
-        conn.close()
-        raise
+        if newly_created:
+            _secure_state_db_files(path)
+        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+        try:
+            # Force SQLite's main-file open before comparing the pathname with
+            # the still-held O_EXCL inode. Closing it earlier permits immediate
+            # inode reuse after an unlink/replacement on some filesystems.
+            databases = conn.execute("PRAGMA database_list").fetchall()
+            main = [row[2] for row in databases if row[1] == "main"]
+            current = path.lstat()
+            if (len(main) != 1 or not main[0] or Path(main[0]).resolve() != path.resolve()
+                    or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
+                    or not stat.S_ISREG(current.st_mode)):
+                raise RecoveryRefused("protected_session_authority_unavailable")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
+    finally:
+        if created_fd is not None:
+            os.close(created_fd)
 
 
 def _authorize_one(conn: sqlite3.Connection, operation: str, claim_id: str,
@@ -322,6 +336,7 @@ def _authorize_one(conn: sqlite3.Connection, operation: str, claim_id: str,
 
 def _claim(path: Path, kind: Literal["ordinary_session", "unscoped_ordinary", "raw_schema"],
            session_ids: tuple[str, ...] = ()) -> str | None:
+    assert_named_profile_home_live(path.parent)
     try:
         with closing(_connect(path)) as conn:
             conn.execute("BEGIN IMMEDIATE")

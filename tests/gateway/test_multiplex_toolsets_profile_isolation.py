@@ -43,6 +43,7 @@ def hermes_root(tmp_path, monkeypatch):
         "platform_toolsets:\n  api_server: [web, file]\n",
         encoding="utf-8",
     )
+    (root / ".env").write_text(f"API_SERVER_KEY={OWNER_KEY}\n", encoding="utf-8")
     (lokaj / "config.yaml").write_text(
         "platform_toolsets:\n  api_server: [web, file, computer_use]\n",
         encoding="utf-8",

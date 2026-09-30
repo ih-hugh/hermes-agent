@@ -133,7 +133,10 @@ async function main() {
   if (failed.length > 0) {
     for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
     console.error(`::error::${failed.length} of ${results.length} checks failed`)
-    process.exit(1)
+    // stdout can still have a large failed-check group queued on a CI pipe.
+    // Natural exit preserves that evidence and the summary before returning 1.
+    process.exitCode = 1
+    return
   }
   console.log(`\nall ${results.length} checks passed`)
 }

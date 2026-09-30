@@ -83,6 +83,7 @@ def _make_agent(ra, session_id, tmp_path):
         skip_memory=True,
     )
     agent._session_db = MagicMock()
+    agent._session_db._read_one.return_value = None  # no recovery row in this ordinary test DB
     agent._session_db_created = True
 
     agent.logs_dir = tmp_path / "logs"

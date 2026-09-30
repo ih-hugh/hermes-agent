@@ -20,7 +20,7 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
@@ -93,6 +93,9 @@ def _db_path():
 def _connect() -> sqlite3.Connection:
     from hermes_recovery_refusal import require_unprotected_store
     from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import (
+        assert_raw_schema_lease_target, begin_raw_schema_claim, finish_raw_schema_claim,
+    )
 
     # A raw opener must not repair/reconcile an opted store, even before its
     # own ledger write. This probe does not instantiate SessionDB or create a DB.
@@ -110,14 +113,34 @@ def _connect() -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files
 
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _secure_state_db_files(path, create_main=True)
+    mkdir_under_hermes_home(path.parent)
+    # The raw initializer needs durable exclusion authority through its last
+    # schema write. A connection-local precheck alone races a root reserve.
+    lease = None if protected_store else begin_raw_schema_claim(path)
+    if lease is not None:
+        assert_raw_schema_lease_target(lease)
+    _secure_state_db_files(path)
+
+    def initialize(conn: sqlite3.Connection) -> None:
+        if lease is None:
+            _initialize_existing_schema(conn)
+            return
+        assert_raw_schema_lease_target(lease, conn=conn)
+        _initialize_schema(conn)
+
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
     conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None,
-                   initialize=_initialize_existing_schema if protected_store else _initialize_schema)
-    _secure_state_db_files(path)
-    return conn
+                   wal=False, row_factory=None, existing_only=True, initialize=initialize)
+    try:
+        if lease is not None:
+            assert_raw_schema_lease_target(lease, conn=conn)
+        _secure_state_db_files(path)
+        if lease is not None:
+            finish_raw_schema_claim(lease, conn=conn)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -167,6 +190,39 @@ def _transaction():
     return transaction(_connect())
 
 
+def _exact_exclusion_only_catalog(conn: sqlite3.Connection) -> bool:
+    """Recognize only the complete ordinary-claim bootstrap, on this read snapshot."""
+    from hermes_state_recovery import RecoveryRefused
+    from hermes_state_recovery_exclusions import EXCLUSION_NAMES, _canonical_exclusion_shape
+
+    limit = len(EXCLUSION_NAMES) + 1
+    metadata = conn.execute(
+        "SELECT length(CAST(type AS BLOB)),length(CAST(name AS BLOB)) "
+        "FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' LIMIT ?", (limit,)
+    ).fetchall()
+    if len(metadata) != len(EXCLUSION_NAMES) or any(
+        type(type_size) is not int or not 0 < type_size <= 8
+        or type(name_size) is not int or not 0 < name_size <= 128
+        for type_size, name_size in metadata
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT substr(CAST(type AS BLOB),1,9),substr(CAST(name AS BLOB),1,129) "
+        "FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' LIMIT ?", (limit,)
+    ).fetchall()
+    if len(rows) != len(EXCLUSION_NAMES):
+        return False
+    try:
+        actual = {(raw_type.decode("utf-8"), raw_name.decode("utf-8"))
+                  for raw_type, raw_name in rows
+                  if type(raw_type) is bytes and type(raw_name) is bytes}
+    except UnicodeError as exc:
+        raise RecoveryRefused("protected_session_authority_unavailable") from exc
+    expected = {("table" if name == "recovery_exclusions" else "trigger", name)
+                for name in EXCLUSION_NAMES}
+    return actual == expected and _canonical_exclusion_shape(conn)
+
+
 def _read_durable_identities(where: str, params: tuple = ()) -> dict[str, tuple[str, str]]:
     """Read persisted origins without opening a writable/reconciling SessionDB."""
     from hermes_state_recovery import RecoveryRefused
@@ -177,6 +233,16 @@ def _read_durable_identities(where: str, params: tuple = ()) -> dict[str, tuple[
     try:
         with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as conn:
             conn.execute("PRAGMA query_only=ON")
+            # sqlite3's implicit transactions do not cover SELECT statements.
+            # Hold one read snapshot across the ledger and full-catalog probes.
+            conn.execute("BEGIN")
+            ledger = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name='async_delegations' LIMIT 2"
+            ).fetchall()
+            if ledger != [("table",)]:
+                if not ledger and _exact_exclusion_only_catalog(conn):
+                    return {}
+                raise RecoveryRefused("protected_session_authority_unavailable")
             rows = conn.execute(
                 "SELECT delegation_id, parent_session_id, origin_session_id "
                 f"FROM async_delegations WHERE {where} ORDER BY delegation_id LIMIT ?",

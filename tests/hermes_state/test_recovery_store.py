@@ -45,6 +45,7 @@ def _served_static_route(
     *,
     events: list[str] | None = None,
     threads: list[int] | None = None,
+    journal_mode: str | None = None,
 ) -> tuple[SessionDB, api_server.APIServerAdapter, RecoveryOwnerContext]:
     """Build the real scratch static-preparation prerequisites without a live provider."""
     import run_agent  # noqa: F401  # completed ordinary gateway warm-up
@@ -54,6 +55,11 @@ def _served_static_route(
     from tests.gateway.test_api_server_recovery_runtime import _profile
 
     profile = _profile(tmp_path, monkeypatch)
+    if journal_mode is not None:
+        config = profile.home / "config.yaml"
+        config.write_text(
+            f"database:\n  journal_mode: {journal_mode}\n" + config.read_text()
+        )
     db, _store, _scope, registry = _admitted(profile.home)
     _install_selected_plugin_fixture(registry, monkeypatch)
     selected = registry.provider_capture.provider
@@ -292,27 +298,54 @@ def test_lookup_root_requires_recorded_close(tmp_path: Path):
         second.db.close()
 
 
-def test_readback_keeps_revision_and_members_in_one_snapshot(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("wal_reset_vulnerable", [False, True])
+def test_readback_keeps_revision_and_members_in_one_snapshot(tmp_path: Path, monkeypatch,
+                                                             wal_reset_vulnerable: bool):
+    import hermes_state_wal
+
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda: wal_reset_vulnerable)
     first, second = _stores(tmp_path)
+    expected_mode = "delete" if wal_reset_vulnerable else "wal"
+    assert first.db._conn.execute("PRAGMA journal_mode").fetchone()[0] == expected_mode
     identity = _identity(first, owner=current_incarnation())
     try:
         admitted = first.reserve(_root(), identity)
         permit = issue_producer_permit(first, admitted.handoff)
         first.begin_close(identity.scope, _seal())
         original_view = RecoveryStore._view
+        original_settle = RecoveryStore._settle_member
+        updated = threading.Event()
         changed = False
+
+        def signal_after_update(conn, scope, run_id):
+            original_settle(conn, scope, run_id)
+            updated.set()
 
         def change_between_reads(cls, conn, row):
             nonlocal changed
             if not changed:
                 changed = True
-                first.close_producer(identity.scope, "run_root", permit)
+                future = pool.submit(first.close_producer, identity.scope, "run_root", permit)
+                futures.append(future)
+                assert updated.wait(timeout=5), "writer did not update during the read snapshot"
+                if wal_reset_vulnerable:
+                    assert not future.done(), "DELETE-mode commit completed before the read ended"
+                else:
+                    future.result(timeout=5)  # WAL must commit before the member SELECT.
             return original_view(conn, row)
 
+        futures = []
+        monkeypatch.setattr(RecoveryStore, "_settle_member", staticmethod(signal_after_update))
         monkeypatch.setattr(RecoveryStore, "_view", classmethod(change_between_reads))
-        view = second.lookup_root(_identity(second).scope, "run_root")
-        assert view.revision == 2
-        assert view.members[0].producer_state == "open"
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            view = second.lookup_root(_identity(second).scope, "run_root")
+            assert view.revision == 2
+            assert view.members[0].producer_state == "open"
+            assert len(futures) == 1
+            futures[0].result(timeout=5)
+        changed_view = second.lookup_root(_identity(second).scope, "run_root")
+        assert changed_view.revision == 3
+        assert changed_view.members[0].producer_state == "closed"
     finally:
         first.db.close()
         second.db.close()
@@ -553,8 +586,10 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
     admission_events: list[str] = []
     capture_threads: list[int] = []
     db, adapter, profile = _served_static_route(
-        tmp_path, monkeypatch, events=admission_events, threads=capture_threads
+        tmp_path, monkeypatch, events=admission_events, threads=capture_threads,
+        journal_mode="delete",
     )
+    assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     original_reserve = RecoveryStore.reserve
 
     def observed_reserve(store, admission, identity):
@@ -564,10 +599,12 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
 
     monkeypatch.setattr(RecoveryStore, "reserve", observed_reserve)
     dispatched: list[str] = []
+    dispatched_event = asyncio.Event()
 
     async def fake_execute(owner, launch, *, _api_server):
         assert launch.recovery_handoff is not None
         dispatched.append(launch.run_id)
+        dispatched_event.set()
         launch.recovery_execution_settled.set()
         launch.recovery_registry.request_close()
         launch.recovery_coroutine_settled.set()
@@ -606,11 +643,29 @@ async def test_trusted_ready_route_admits_replays_and_reads_status(tmp_path: Pat
             assert admission_events == ["capture", "reserve"]
             assert capture_threads and capture_threads[0] != threading.get_ident()
             first_id = (await first.json())["run_id"]
+            await asyncio.wait_for(dispatched_event.wait(), timeout=5)
+            await api_server_runs._await_protected_status(adapter, first_id)
+
+            async def quiesced() -> None:
+                while first_id in adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(quiesced(), timeout=5)
+            member_count = db._read_one(
+                "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                ("exact-session",),
+            )[0]
             config.write_text(enabled_config.replace("enabled: true", "enabled: false", 1))
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202
             assert admission_events == ["capture", "reserve"]
-            assert (await replay.json())["run_id"] == first_id
+            replay_body = await replay.json()
+            assert replay_body["run_id"] == first_id
+            assert replay_body["replayed"] is True
+            assert db._read_one(
+                "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                ("exact-session",),
+            )[0] == member_count
             adapter._run_statuses.clear()
             adapter._run_owners.clear()
             adapter._protected_run_ids.clear()

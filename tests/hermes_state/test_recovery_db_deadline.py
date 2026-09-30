@@ -189,17 +189,30 @@ def test_late_commit_busy_refuses_before_shared_deadline(tmp_path, monkeypatch) 
         blocker = sqlite3.connect(db.db_path, isolation_level=None)
         blocker.execute("BEGIN")
         blocker.execute("SELECT * FROM deadline_probe").fetchall()
-        began = time.monotonic()
-        with recovery_deadline(began + 0.20):
+        writer_sql: list[str] = []
+        with db._lock:
+            assert db._conn is not None
+            db._conn.set_trace_callback(writer_sql.append)
+        real_monotonic = time.monotonic
+        wall_began = real_monotonic()
+        ticks = [100.0]
+        monkeypatch.setattr(deadline_module.time, "monotonic", lambda: ticks[0])
+
+        def late_insert(conn: sqlite3.Connection) -> None:
+            # Reach SQLite COMMIT with time remaining, independent of host load.
+            ticks[0] = 100.16
+            conn.execute("INSERT INTO deadline_probe VALUES (1)")
+
+        with recovery_deadline(100.20):
             with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
-                db._execute_write(
-                    lambda conn: (
-                        time.sleep(0.16),
-                        conn.execute("INSERT INTO deadline_probe VALUES (1)"),
-                    ),
-                    patience_s=1.0,
-                )
-        assert time.monotonic() - began < 0.30
+                db._execute_write(late_insert, patience_s=1.0)
+        assert "COMMIT" in writer_sql
+        assert real_monotonic() - wall_began < 1.0
+        blocker.rollback()
+        blocker.close()
+        blocker = None
+        row = db._read_one("SELECT COUNT(*) FROM deadline_probe")
+        assert row is not None and row[0] == 0
     finally:
         if blocker is not None:
             blocker.rollback()
@@ -219,16 +232,23 @@ def test_late_read_sql_busy_refuses_before_shared_deadline(
         )
         blocker = sqlite3.connect(db.db_path, isolation_level=None)
         blocker.execute("BEGIN EXCLUSIVE")
-        began = time.monotonic()
-        with recovery_deadline(began + 0.20):
+        real_monotonic = time.monotonic
+        wall_began = real_monotonic()
+        ticks = [100.0]
+        attempted = 0
+        monkeypatch.setattr(deadline_module.time, "monotonic", lambda: ticks[0])
+
+        def late_read(conn: sqlite3.Connection) -> sqlite3.Cursor:
+            nonlocal attempted
+            attempted += 1
+            ticks[0] = 100.16
+            return conn.execute("SELECT value FROM deadline_probe")
+
+        with recovery_deadline(100.20):
             with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
-                db._read_retrying_ioerr(
-                    lambda conn: (
-                        time.sleep(0.16),
-                        conn.execute("SELECT value FROM deadline_probe"),
-                    )[1]
-                )
-        assert time.monotonic() - began < 0.30
+                db._read_retrying_ioerr(late_read)
+        assert attempted == 1
+        assert real_monotonic() - wall_began < 1.0
     finally:
         if blocker is not None:
             blocker.rollback()

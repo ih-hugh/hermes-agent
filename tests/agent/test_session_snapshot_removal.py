@@ -18,7 +18,7 @@ def test_persistence_never_snapshots_but_explicit_save_works(tmp_path, monkeypat
     db = SessionDB(db_path=tmp_path / "state.db")
     agent = SessionPersistenceMixin()
     agent.max_iterations = 1
-    _init_session_state(agent, "snapshot-removal", db, None, None, None, False, 1, 1, 1)
+    _init_session_state(agent, "snapshot-removal", None, db, None, None, None, False, 1, 1, 1)
     agent.model = "fixture"
     agent.base_url = "http://127.0.0.1:1/v1"
     agent.platform = "cli"

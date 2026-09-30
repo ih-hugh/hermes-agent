@@ -43,8 +43,12 @@ def _make_agent(session_db, *, platform: str):
     return agent
 
 
-def test_run_conversation_persists_tokens_for_telegram_sessions():
+def test_run_conversation_persists_tokens_for_telegram_sessions(tmp_path):
     session_db = MagicMock()
+    session_db.db_path = tmp_path / "state.db"
+    session_db.read_only = False
+    session_db._read_all.return_value = []
+    session_db._read_one.return_value = None
     agent = _make_agent(session_db, platform="telegram")
 
     result = agent.run_conversation("hello")
@@ -62,13 +66,6 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     sentinel_db = object()
     captured = {}
 
-    class FakeSessionDB:
-        def __new__(cls):
-            return sentinel_db
-
-    hermes_state = ModuleType("hermes_state")
-    hermes_state.SessionDB = FakeSessionDB
-    monkeypatch.setitem(sys.modules, "hermes_state", hermes_state)
     hermes_state_registry = ModuleType("hermes_state_registry")
     hermes_state_registry.acquire = lambda db_path=None: sentinel_db
     monkeypatch.setitem(sys.modules, "hermes_state_registry", hermes_state_registry)
@@ -96,8 +93,12 @@ def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeyp
     assert agent._session_db is sentinel_db
 
 
-def test_sequential_session_search_forwards_detail(monkeypatch):
+def test_sequential_session_search_forwards_detail(monkeypatch, tmp_path):
     session_db = MagicMock()
+    session_db.db_path = tmp_path / "state.db"
+    session_db.read_only = False
+    session_db._read_all.return_value = []
+    session_db._read_one.return_value = None
     captured = {}
 
     session_search_mod = ModuleType("tools.session_search_tool")

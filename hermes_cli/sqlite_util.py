@@ -27,8 +27,13 @@ def open_db(
     check_same_thread: bool = True,
     wal_lock_retries: int = 1,
     initialize: Callable[[sqlite3.Connection], None] | None = None,
+    existing_only: bool = False,
 ) -> sqlite3.Connection:
-    """Open ``path`` (parent created), apply the PRAGMA set, run ``initialize``; closed if anything raises.
+    """Open ``path``, apply the PRAGMA set, run ``initialize``; closed if anything raises.
+
+    ``existing_only`` opens an existing file without creating its parent or a
+    replacement database. Callers retaining an inode-bound claim must validate
+    the opened connection separately.
 
     ``busy_timeout_ms`` is the single busy knob: it is passed as ``connect(timeout=)`` AND set as the
     explicit PRAGMA so it is observable. ``wal=True`` goes through ``apply_wal_with_fallback`` — the
@@ -40,9 +45,14 @@ def open_db(
     from hermes_state_wal import apply_wal_with_fallback
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not existing_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.
-    conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
+    target = path.absolute().as_uri() + "?mode=rw" if existing_only else path
+    conn = sqlite3.connect(
+        target, uri=existing_only, timeout=busy_timeout_ms / 1000,
+        check_same_thread=check_same_thread,
+    )
     try:
         conn.row_factory = row_factory
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")

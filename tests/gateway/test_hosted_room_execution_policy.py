@@ -149,9 +149,10 @@ def test_grant_and_recipient_dispatch_bind_the_exact_policy_digest():
         verify_room_grant(b"s" * 32, token, changed, now=120)
 
 
-def test_room_agent_uses_target_policy_toolsets_and_turn_limit(monkeypatch):
+def test_room_agent_uses_target_policy_toolsets_and_turn_limit(monkeypatch, tmp_path):
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.platforms.base import PlatformConfig
+    from hermes_state import SessionDB
 
     captured = {}
 
@@ -181,13 +182,16 @@ def test_room_agent_uses_target_policy_toolsets_and_turn_limit(monkeypatch):
         lambda *_: {"terminal", "file", "web"},
     )
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
-
-    adapter._create_agent(
-        session_id="room-session",
-        room_dispatch={"room_id": "room-1"},
-        room_execution_policy=policy,
-    )
+    db = SessionDB(tmp_path / "state.db")
+    adapter._session_db = db
+    try:
+        adapter._create_agent(
+            session_id="room-session",
+            room_dispatch={"room_id": "room-1"},
+            room_execution_policy=policy,
+        )
+    finally:
+        db.close()
 
     assert captured["enabled_toolsets"] == policy["enabled_toolsets"]
     assert captured["max_iterations"] == 7

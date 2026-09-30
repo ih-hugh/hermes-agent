@@ -146,6 +146,97 @@ class TestRefusalOutsideScope:
 
 class TestSkips:
 
+    @pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+    @pytest.mark.parametrize("vanish_at", ["access", "chmod"])
+    def test_disappeared_sqlite_sidecar_is_not_reported_readonly(
+        self, hermes_home, monkeypatch, suffix, vanish_at,
+    ):
+        db = hermes_home / "state.db"
+        _make_db(db)
+        original = db.read_bytes()
+        sidecar = db.with_name(db.name + suffix)
+        sidecar.write_bytes(b"ephemeral scratch sidecar")
+        real_access, real_chmod = os.access, os.chmod
+        checks = 0
+
+        def access(path, mode):
+            nonlocal checks
+            if Path(path) == sidecar and checks == 0:
+                checks += 1
+                if vanish_at == "access":
+                    sidecar.unlink()
+                return False
+            return real_access(path, mode)
+
+        def chmod(path, mode):
+            if Path(path) == sidecar and vanish_at == "chmod":
+                sidecar.unlink()
+                raise FileNotFoundError(sidecar)
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(os, "access", access)
+        monkeypatch.setattr(os, "chmod", chmod)
+        preflight_db_writability(db)
+        assert checks == 1
+        assert not sidecar.exists()
+        assert db.read_bytes() == original
+
+    def test_disappeared_main_db_still_refuses(self, hermes_home, monkeypatch):
+        db = hermes_home / "state.db"
+        _make_db(db)
+        real_access = os.access
+
+        def access(path, mode):
+            if Path(path) == db and db.exists():
+                db.unlink()
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", access)
+        with pytest.raises(sqlite3.OperationalError, match="state.db is not writable"):
+            preflight_db_writability(db)
+
+    def test_disappeared_parent_directory_still_refuses(
+        self, hermes_home, monkeypatch,
+    ):
+        directory = hermes_home / "scratch"
+        directory.mkdir()
+        db = directory / "state.db"
+        real_access = os.access
+
+        def access(path, mode):
+            if Path(path) == directory and directory.exists():
+                directory.rmdir()
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", access)
+        with pytest.raises(sqlite3.OperationalError, match="directory .* is read-only"):
+            preflight_db_writability(db)
+
+    def test_parent_disappearing_during_sidecar_check_still_refuses(
+        self, hermes_home, monkeypatch,
+    ):
+        directory = hermes_home / "scratch"
+        directory.mkdir()
+        db = directory / "state.db"
+        _make_db(db)
+        sidecar = directory / "state.db-shm"
+        sidecar.write_bytes(b"ephemeral scratch sidecar")
+        real_access = os.access
+
+        def access(path, mode):
+            if Path(path) == sidecar and directory.exists():
+                sidecar.unlink()
+                db.unlink()
+                directory.rmdir()
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", access)
+        with pytest.raises(sqlite3.OperationalError, match="state.db-shm is read-only"):
+            preflight_db_writability(db)
+
 
 
     def test_healthy_db_untouched(self, hermes_home):

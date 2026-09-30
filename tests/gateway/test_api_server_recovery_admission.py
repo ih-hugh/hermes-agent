@@ -44,6 +44,68 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def test_ordinary_202_payload_bytes_unchanged() -> None:
+    from gateway.platforms.api_server_runs import _accepted_response
+
+    response = _accepted_response("run_plain", "started", None, replayed=False)
+    expected = web.json_response(
+        {"run_id": "run_plain", "status": "started", "replayed": False}, status=202,
+    )
+    assert response.body == expected.body
+    assert "recovery_admission" not in json.loads(response.body)
+
+
+def test_committed_nudge_identity_uses_its_member_and_original_provider(
+    tmp_path: Path,
+) -> None:
+    from agent.recovery_context import issue_producer_permit
+    from gateway.platforms.api_server_recovery import (
+        RecoveryOwnerContext, read_protected_key,
+    )
+    from hermes_state_recovery_deadline import recovery_deadline
+
+    db = SessionDB(tmp_path / "state.db")
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "default", "a" * 64, "root-and-nudge")
+    provider = provider_admission(scope.session_id)
+    root_admission = RecoveryAdmission.model_validate({
+        "schema": "hermes.recovery/v1", "generation": 0, "parent_run_id": None,
+    })
+    nudge_admission = RecoveryAdmission.model_validate({
+        "schema": "hermes.recovery/v1", "generation": 1,
+        "parent_run_id": "run_root",
+    })
+    root_key, nudge_key = "byf-recovery-v1:root", "byf-recovery-v1:nudge"
+    root = store.reserve(root_admission, AdmissionIdentity(
+        scope, root_key, "b" * 64, "run_root", current_incarnation(), provider,
+        {"status": "queued"},
+    ))
+    assert root.outcome == "created"
+    store.close_producer(scope, "run_root", issue_producer_permit(store, root.handoff))
+    nudge = store.reserve(nudge_admission, AdmissionIdentity(
+        scope, nudge_key, "c" * 64, "run_nudge", current_incarnation(), provider,
+        {"status": "queued"},
+    ))
+    assert nudge.outcome == "created"
+    db.close()
+    try:
+        with recovery_deadline(time.monotonic() + 5):
+            result = read_protected_key(
+                RecoveryOwnerContext(scope.profile, tmp_path, scope.scope_digest),
+                scope.session_id, nudge_key, "c" * 64, nudge_admission,
+            )
+        assert result is not None and result.admission_identity is not None
+        identity = result.admission_identity
+        assert identity.store_id == store.store_id
+        assert identity.run_id == "run_nudge"
+        assert identity.generation == 1 and identity.parent_run_id == "run_root"
+        assert identity.idempotency_key_sha256 == hashlib.sha256(nudge_key.encode()).hexdigest()
+        assert identity.provider_admission_sha256 == hashlib.sha256(
+            provider.canonical_bytes()).hexdigest()
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_protected_waiter_cancel_keeps_reservation_and_third_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -341,6 +403,8 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
     db = SessionDB(home / "state.db")
     store = RecoveryStore(db)
     scope = RecoveryScope(store.store_id, "default", digest, session_id)
+    # Model a replay after the original gateway incarnation has disappeared.
+    original_owner = "original-gateway-incarnation"
     result = store.reserve(
         RecoveryAdmission.model_validate(body["recovery"]),
         AdmissionIdentity(
@@ -348,7 +412,7 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
             key,
             fingerprint,
             "run_committed",
-            current_incarnation(),
+            original_owner,
             provider_admission(session_id),
             {"status": "queued"},
         ),
@@ -383,6 +447,22 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
                 "run_id": "run_committed",
                 "status": "queued",
                 "replayed": True,
+                "recovery_admission": {
+                    "schema": "hermes.recovery-admission-result/v1",
+                    "store_id": store.store_id,
+                    "profile": "default",
+                    "scope_digest": digest,
+                    "session_id": session_id,
+                    "run_id": "run_committed",
+                    "generation": 0,
+                    "parent_run_id": None,
+                    "idempotency_key_sha256": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                    "request_sha256": fingerprint,
+                    "gateway_incarnation": original_owner,
+                    "provider_admission_sha256": hashlib.sha256(
+                        provider_admission(session_id).canonical_bytes()
+                    ).hexdigest(),
+                },
             }
             changed = await client.post(
                 "/v1/runs",
@@ -391,6 +471,7 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
             )
             assert changed.status == 409, await changed.text()
             assert (await changed.json())["error"]["code"] == "idempotency_key_conflict"
+            assert "recovery_admission" not in await changed.json()
             new_key = await client.post(
                 "/v1/runs",
                 json=body,
@@ -400,6 +481,43 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
                 },
             )
             assert new_key.status == 503, await new_key.text()
+            with sqlite3.connect(home / "state.db") as corrupt:
+                # Simulate an externally damaged file. A normal writer cannot
+                # mutate the immutable provider row through the guard trigger.
+                corrupt.create_function("recovery_store_guard", 0, lambda: 1)
+                corrupt.execute(
+                    "UPDATE recovery_members SET status_json=? WHERE run_id=?",
+                    (json.dumps({"status": "unknown" if session_id == "protected"
+                                 else "started"}), "run_committed"),
+                )
+            invalid_status = await client.post(
+                "/v1/runs", json=body,
+                headers={"Authorization": f"Bearer {_KEY}", "Idempotency-Key": key},
+            )
+            assert invalid_status.status == 503, await invalid_status.text()
+            assert "recovery_admission" not in await invalid_status.json()
+            with sqlite3.connect(home / "state.db") as corrupt:
+                corrupt.create_function("recovery_store_guard", 0, lambda: 1)
+                corrupt.execute(
+                    "UPDATE recovery_members SET status_json=? WHERE run_id=?",
+                    ('{"status":"queued"}', "run_committed"),
+                )
+                if session_id == "protected":
+                    corrupt.execute(
+                        "DELETE FROM recovery_provider_admissions WHERE session_id=?",
+                        (session_id,),
+                    )
+                else:
+                    corrupt.execute(
+                        "UPDATE recovery_provider_admissions SET admission_sha256=? "
+                        "WHERE session_id=?", ("0" * 64, session_id),
+                    )
+            unavailable = await client.post(
+                "/v1/runs", json=body,
+                headers={"Authorization": f"Bearer {_KEY}", "Idempotency-Key": key},
+            )
+            assert unavailable.status == 503, await unavailable.text()
+            assert "recovery_admission" not in await unavailable.json()
     finally:
         await adapter.disconnect()
 
@@ -606,9 +724,11 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(
         "platforms:\n  api_server:\n    recovery:\n      enabled: true\n"
+        "database:\n  journal_mode: delete\n"
     )
     selected = type("Selected", (), {})()
     calls: list[str] = []
+    dispatched = asyncio.Event()
 
     def prepare(owner, *, session_id):
         calls.append("prepare")
@@ -632,6 +752,7 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
         run.recovery_registry.request_close()
         run.recovery_coroutine_settled.set()
         api_server_runs._retire_live_run(adapter, run.run_id)
+        dispatched.set()
 
     monkeypatch.setattr(
         api_server_recovery_runtime, "prepare_static_chat_runtime", prepare
@@ -665,6 +786,25 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
             assert accepted.status == 202, await accepted.text()
             first = await accepted.json()
             assert first["replayed"] is False
+            identity = first["recovery_admission"]
+            assert identity == {
+                "schema": "hermes.recovery-admission-result/v1",
+                "store_id": identity["store_id"],
+                "profile": "default",
+                "scope_digest": hashlib.sha256(f"default\0{_KEY}".encode()).hexdigest(),
+                "session_id": "protected",
+                "run_id": first["run_id"],
+                "generation": 0,
+                "parent_run_id": None,
+                "idempotency_key_sha256": hashlib.sha256(
+                    headers["Idempotency-Key"].encode("utf-8")
+                ).hexdigest(),
+                "request_sha256": identity["request_sha256"],
+                "gateway_incarnation": current_incarnation(),
+                "provider_admission_sha256": hashlib.sha256(
+                    provider_admission("protected").canonical_bytes()
+                ).hexdigest(),
+            }
             assert calls == ["prepare", "capture"]
             db = adapter._session_dbs[str(home)]
             assert tuple(
@@ -673,6 +813,101 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
                     (first["run_id"],),
                 )
             ) == ("protected",)
+            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+            await asyncio.wait_for(dispatched.wait(), timeout=5)
+            await api_server_runs._await_protected_status(adapter, first["run_id"])
+
+            async def quiesced() -> None:
+                while first["run_id"] in adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(quiesced(), timeout=5)
+            original_members = db._read_one(
+                "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                ("protected",),
+            )[0]
+            # Simulate the preflight read losing a race to an exact reserve.
+            # The reserve-race branch must return the committed member rather
+            # than the new candidate run or its current capture.
+            from gateway.platforms.api_server_recovery import RecoveryOwnerContext
+            from hermes_state_recovery_deadline import recovery_deadline
+
+            deadline = time.monotonic() + 5
+            fingerprint = hashlib.sha256(json.dumps(
+                {"body": body, "gateway_session_key": ""}, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+
+            def race_reserve():
+                with recovery_deadline(deadline):
+                    return api_server_runs._prepare_and_reserve_protected(
+                        adapter,
+                        RecoveryOwnerContext("default", home, identity["scope_digest"]),
+                        body, RecoveryAdmission.model_validate(body["recovery"]),
+                        headers["Idempotency-Key"], fingerprint, "run_lost_race",
+                        {"status": "queued"}, deadline,
+                    )
+
+            raced = await asyncio.to_thread(race_reserve)
+            assert raced.result.outcome == "replayed"
+            assert raced.result.member.run_id == first["run_id"]
+            assert raced.result.admission_identity.model_dump(
+                mode="json", by_alias=True,
+            ) == identity
+            assert raced.result.replay_status == "queued"
+
+            # Lose the HTTP response after the durable reserve and dispatch;
+            # the exact retry must recover the same member without recapture.
+            actual_accepted = api_server_runs._accepted_response
+
+            def lost_response(run_id, status, session_key, *, replayed,
+                              recovery_admission=None):
+                if (recovery_admission is not None
+                        and recovery_admission.session_id == "protected-postcommit"
+                        and not replayed):
+                    raise web.HTTPServiceUnavailable(text="response lost")
+                return actual_accepted(
+                    run_id, status, session_key, replayed=replayed,
+                    recovery_admission=recovery_admission,
+                )
+
+            monkeypatch.setattr(api_server_runs, "_accepted_response", lost_response)
+            postcommit_body = {**body, "session_id": "protected-postcommit"}
+            postcommit_headers = {
+                **headers, "Idempotency-Key": "byf-recovery-v1:postcommit",
+            }
+            postcommit = await client.post(
+                "/v1/runs", json=postcommit_body, headers=postcommit_headers,
+            )
+            assert postcommit.status == 503, await postcommit.text()
+            assert "recovery_admission" not in await postcommit.text()
+            assert db._read_one(
+                "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                ("protected-postcommit",),
+            )[0] == 1
+            postcommit_run = db._read_one(
+                "SELECT run_id FROM recovery_members WHERE session_id=?",
+                ("protected-postcommit",),
+            )[0]
+            await api_server_runs._await_protected_status(adapter, postcommit_run)
+
+            async def postcommit_quiesced() -> None:
+                while postcommit_run in adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(postcommit_quiesced(), timeout=5)
+            monkeypatch.setattr(api_server_runs, "_accepted_response", actual_accepted)
+            captures_before_replay = calls.count("capture")
+            recovered = await client.post(
+                "/v1/runs", json=postcommit_body, headers=postcommit_headers,
+            )
+            assert recovered.status == 202, await recovered.text()
+            recovered_body = await recovered.json()
+            assert recovered_body["replayed"] is True
+            assert recovered_body["run_id"] == postcommit_run
+            assert calls.count("capture") == captures_before_replay
+            assert recovered_body["recovery_admission"]["session_id"] == "protected-postcommit"
+            assert recovered_body["recovery_admission"]["run_id"] == recovered_body["run_id"]
 
             def retired(_session_id, *, deadline):
                 raise AssertionError("committed retry recaptured retired provider")
@@ -682,12 +917,33 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
                 "capture_selected_provider_admission",
                 retired,
             )
+            blocker = sqlite3.connect(
+                home / "state.db", isolation_level=None, timeout=0
+            )
+            try:
+                blocker.execute("BEGIN EXCLUSIVE")
+                blocked = await client.post("/v1/runs", json=body, headers=headers)
+                assert blocked.status == 503, await blocked.text()
+                assert (await blocked.json())["error"][
+                    "code"
+                ] == "recovery_store_unavailable"
+            finally:
+                blocker.rollback()
+                blocker.close()
+            assert (
+                db._read_one(
+                    "SELECT COUNT(*) FROM recovery_members WHERE session_id=?",
+                    ("protected",),
+                )[0]
+                == original_members
+            )
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202, await replay.text()
             assert await replay.json() == {
                 "run_id": first["run_id"],
                 "status": "queued",
                 "replayed": True,
+                "recovery_admission": identity,
             }
     finally:
         await adapter.disconnect()
@@ -902,6 +1158,7 @@ async def test_late_committed_reserve_dispatches_after_http_timeout_and_replays(
     monkeypatch.setattr(api_server, "_PROTECTED_ADMISSION_SECONDS", 1.0)
     selected = type("Selected", (), {})()
     captures = 0
+    executed = asyncio.Event()
 
     def prepare(owner, *, session_id):
         return SimpleNamespace(
@@ -920,6 +1177,7 @@ async def test_late_committed_reserve_dispatches_after_http_timeout_and_replays(
         return SelectedProviderCapture(provider_admission(session_id), selected)
 
     async def no_external_run(adapter, run, *, _api_server):
+        executed.set()
         run.recovery_execution_settled.set()
         run.recovery_registry.request_close()
         run.recovery_coroutine_settled.set()
@@ -978,6 +1236,13 @@ async def test_late_committed_reserve_dispatches_after_http_timeout_and_replays(
                     await asyncio.sleep(0.001)
 
             await asyncio.wait_for(settled(), timeout=1)
+            await asyncio.wait_for(executed.wait(), timeout=5)
+
+            async def quiesced() -> None:
+                while adapter._protected_run_registries:
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(quiesced(), timeout=5)
             replay = await client.post("/v1/runs", json=body, headers=headers)
             assert replay.status == 202, await replay.text()
             assert (await replay.json())["replayed"] is True

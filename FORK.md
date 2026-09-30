@@ -102,12 +102,13 @@ is not a builder-only action. No runtime update or restart accompanied this reco
   interrupt, HTTP 409, keyed persistence, redaction, and stopping/terminal race
   regressions, followed by exact-source scratch gateway qualification.
 
-## Unmerged candidate: R0 producer finalization
+## PR #4 — R0 producer finalization, qualification continuing
 
-This candidate is under implementation and review on `codex/recovery-session-seal`.
-It is not on fork main, in the BytFactory vendor pin, or deployed. The reviewed
+[PR #4](https://github.com/ih-hugh/hermes-agent/pull/4) was merged by the owner on
+2026-09-29 as `47e1cea164cf6abbef881bc7c3c470cdbd870c6a`. The merge does not clear
+the qualification items below. R0 is not in the BytFactory vendor pin or deployed. The reviewed
 BytFactory plan is `docs/superpowers/plans/2026-09-28-supported-recovery.md`.
-At the 2026-09-29 source refresh, fork main remained
+At the pre-merge 2026-09-29 source refresh, fork main remained
 `c8cc4723244cea6b994dab5974fcb11d7615f671` and BytFactory main remained
 `11414a16930c90de04b320bce2550c8746ed8018`, with vendor pin
 `2be8441ba14eb9cf5809d7f3084663066692206f`.
@@ -209,6 +210,239 @@ At the 2026-09-29 source refresh, fork main remained
   and disposable served-runtime qualification. A terminal status or dead PID is never
   sufficient replacement evidence.
 
+### R0 qualification follow-up — macOS WAL detector and fork CI
+
+- `85b32502f2fe046f40007bdbee56650bdda1af95` rechecks the same macOS process and
+  descriptor before using an enumerated WAL/SHM holder. A scratch real-libproc
+  barrier reproduced a false refusal after that descriptor closed. A live stale
+  descriptor still refuses; fd reuse is judged by its fresh identity. Only
+  `EBADF`/`ESRCH` clear a vanished candidate. Short, empty or otherwise ambiguous
+  results retain the earlier observation. This closes the reproduced race class;
+  it does not establish the cause of the earlier uninstrumented failure or make
+  the two observations atomic. Main seams are `hermes_state_dbfile.py` and
+  `tests/hermes_state/test_deleted_wal_generation_guard.py`. Independent focused
+  qualification passed 61 tests with 11 Linux-only skips on macOS. No upstream
+  submission is recorded; retain the real close/reuse/live/ambiguous regressions
+  when assessing an upstream equivalent.
+- On 2026-09-29 the fork's Actions tab still showed inherited workflows disabled
+  despite REST reporting Actions enabled and CI active. Enabling CI alone did not
+  clear that repository latch. After recording the prior state and disabling
+  unrelated workflows, the repository Actions permissions update enabled the
+  fork. The UI and REST state were checked: CI and its selected reusable workflow
+  files are present, while publishing, automatic source edits and unrelated workflows
+  remain disabled. Scheduled OSV retains GitHub's `disabled_fork` state; its reusable CI
+  scan and result jobs passed in the first manual run. Activation did not produce
+  a retrospective PR #4 run. Actual exact-source aggregate CI qualification remains open.
+- `95b88e67b06e28725f9395597bba9a102517d468` makes the existing CI usable on
+  forks with standard hosted runners: upstream retains its larger runner labels;
+  fork Linux tests use four workers with a bounded 60-minute full-suite job, and
+  fork Windows, JS and Rust lanes use standard labels. The selected tests, steps
+  and aggregate gate are unchanged. CI also accepts manual dispatch for future
+  exact-main qualification. Independent structural review passed; a hosted run
+  is still required. Retire these repository conditions if upstream CI becomes
+  portable across forks without changing test coverage.
+
+
+- `d3ed01fee8785a1d23da4a9cb1ef7b19822f02f5` makes the late SQLite contention
+  tests deterministic: controlled elapsed time reaches the real blocked commit,
+  its trace and rollback assertions, instead of consuming almost the entire
+  deadline in a deliberate sleep. Product deadlines are unchanged. Independent
+  canonical qualification passed all 14 tests in that file without retries.
+- `e37c999ab82b065f2943e77fb1728bef1cfcc78e` corrects five inherited test fixtures:
+  existing route enumeration, canonical temporary pathname, Linux-only detection,
+  macOS durability floor and tracing of the actual pooled FTS reader. Independent
+  canonical qualification passed all 452 tests across the five files without
+  retries. No production safety condition was relaxed.
+- The contributor check correctly refused the initial qualification branch because
+  its commit author lacked an existing-format mapping. `2022bc1fc1b2044e475ceeafe5d069c2c76e09f5`
+  adds the verified `ih-hugh` mapping without changing the gate. The adjacent
+  case-collision fixture now asserts exact stored spelling and unchanged contents;
+  a differently cased pathname can resolve to the original on macOS. All 11
+  contributor tests passed in independent canonical qualification without retries.
+- The first PR-triggered run failed before allocating any jobs with a GitHub
+  internal error. Manual run
+  [36590035558](https://github.com/ih-hugh/hermes-agent/actions/runs/36590035558)
+  at `9cadc68d5b2f8682f115439025d254e5455aedaa` proved standard runner allocation
+  and reusable security scanning, but it predates the fixture and mapping fixes
+  and is not a passing exact-source qualification. The qualification branch contains these follow-ups;
+  [PR #5](https://github.com/ih-hugh/hermes-agent/pull/5) tracks its review. The aggregate CI, installed source-pair, Factory pin
+  and deployment gates remain separate.
+
+### R0 qualification follow-up — full-suite compatibility
+
+The first full hosted run at `9cadc68d` completed 4,222 test files with 49,943
+passing tests, 60 failures and 505 skips. It exposed paths outside the earlier
+affected selection. The corrections below preserve the admission/store boundary;
+a focused green run is not full hosted CI or an installed Factory source-pair proof.
+
+- `9db4df6f` updates gateway fixtures to include admission-worker shutdown state,
+  the selected profile's configured owner key, and the actual scratch SessionDB.
+  Independent canonical checks passed all 22 affected tests.
+- `e2f8672d` and `9c34f643` apply the existing named-profile liveness guard before
+  ordinary exclusion claims and raw delegation reads can create directories.
+  An archived named profile remains archived. Direct and served regressions were
+  reviewed; the respective independent affected runs passed 42 and 30 tests.
+- `47a7a935`, `aa07fb25` and `8b98ec74` synchronize test fixtures with actual
+  producer retirement or an explicit owner-release event. Run status alone does
+  not prove retirement. DELETE-journal contention retains its typed immediate
+  refusal; no product deadline was widened. The latter commit also supplies the
+  declared exception and redaction interfaces in a terminal-provider SDK stub.
+- `bca76d30` recognizes an ordinary legacy completion only when the entire
+  missing-ledger catalog is the exact canonical exclusion-only bootstrap. Ledger
+  and bounded catalog probes share an explicit read transaction. Extra, incomplete
+  or altered catalogs still refuse. Independent affected checks passed 71 tests.
+  First-ever concurrent initialization may still safely refuse against an unknown
+  zero-byte inode; no repair exception was added.
+- `92849cd7` closes the raw async schema-check/reconciliation race. The raw opener
+  now holds an exact durable schema claim until successful initialization and
+  hardening; uncertainty retains the claim. The shared SQLite helper's optional
+  existing-file mode uses an escaped `mode=rw` URI and does not recreate a missing
+  main file or parent. This mode is not inode attestation; the caller separately
+  validates its retained claim against the connection. Both admission orderings,
+  failed cleanup, vanished paths and escaped filenames are covered. Independent
+  qualification from that committed source passed 157 tests without retries.
+- `20142282` accepts effective DELETE mode for a settled ordinary database when
+  the existing vulnerable-SQLite gate forces it, even if WAL was requested.
+  Fixed-runtime external mode changes still reconcile. The catalog, source epoch,
+  identity and FTS checks remain required; the WAL safety gate is unchanged.
+- `ed9e2eb3` retains the new file's exclusive-creation descriptor through SQLite's
+  first open and the pathname/inode check. This prevents immediate inode reuse
+  from hiding an unlink/replacement during bootstrap. Refusal and error paths
+  close the retained descriptor; existing files do not acquire this descriptor.
+  This is not adversarial opened-inode attestation. Independent affected checks
+  passed 32 tests. `a566c439` explicitly selects a fixed SQLite runtime in the
+  separate WAL-sidecar ownership test and asserts that its fixture is in WAL.
+- `44987b15` makes repair fixtures reach their intended live-holder guards by
+  retaining a classifiable recovery catalog. Concurrent repairers may refuse a
+  live holder; an explicit later operator retry must leave exactly one surgery
+  and one forensic backup. Product repair behavior is unchanged. Independent
+  checks passed 38 tests with one Linux-only skip; Linux remains a separate gate.
+- `4453db94` tests one recovery read snapshot against a real concurrent protected
+  writer in both journal modes. WAL must commit the newer revision before the
+  reader fetches members while the reader still sees its old revision and member;
+  DELETE must delay commit until that read ends. A fresh read must then see the
+  committed closed member in both cases. Independent canonical checks passed 44
+  tests. No product snapshot or write behavior changed.
+- `bcc03c1c` prevents a disabled toolset alias from subtracting Blank Slate's kept
+  terminal tool. It also returns a static 503 for unclassifiable session-store
+  authority instead of claiming an empty session list; a pre-existing zero-byte
+  file is not bootstrapped or rewritten. Quickstart happy-path tests now use a
+  supported simulated hardware budget while retaining the real catalog decision.
+  The immutable combined journal-mode and CLI selection at `bcc03c1c` passed 513
+  tests in six files without retries.
+- `13127f7f` gives ordinary agent fixtures explicit ordinary DB identity and updates
+  private initialization arguments and spies to match their current contracts.
+  `d46cb483` makes the model-picker fixture explicitly simulate absent Anthropic
+  OAuth instead of consulting the operator's home. Original behavior assertions
+  are retained; these commits do not change model routing or protected persistence.
+- `c97e3431` corrects a desktop quickstart fixture whose authoritative mocked
+  backend returned no jobs while its renderer cache claimed a running job. The
+  actual initial poll now returns that same job. All 21 affected tests passed
+  independently; the full local UI suite passed 7,721 tests in 819 files. Product
+  desktop behavior is unchanged.
+- `4406c783` anchors the existing whole-input launchctl/Hermes approval lookaheads
+  once instead of rescanning every suffix. Matching order, descriptions and stored
+  approval keys remain unchanged. The unchanged 2,000/4,000-segment benchmark
+  timed out locally and in hosted CI before the change; independent review passes
+  it in 1.6 seconds afterward. Four affected approval files passed 478 tests,
+  failed three pre-existing macOS real-binary subprocess fixtures and skipped one.
+  The same three sort/man cases failed before the regex edit and never call the
+  detector. They remain host qualification failures, not a globally green claim.
+- `c27c1bd2` lets the workspace-check wrapper drain its output before returning
+  failure. Immediate process exit truncated hosted desktop failures and even the
+  final summary. A real child-process regression reproduces the truncation with
+  a 2 MiB failed-check log; all 70 root JavaScript tests, types and lint pass with
+  the fix. Check selection, assertions and failure exit status are unchanged.
+- `238a302b` corrects the TUI unmount-measurement fixture's scroll geometry. The
+  old scroll position could unmount the row before the stale-cache update being
+  tested. The fixture now deliberately commits those updates separately and
+  still requires exactly one adjustment of one row. Independent review passed
+  all 17 affected tests; the full local TUI check passed. No production scrolling
+  behavior, timeout or retry policy changes.
+- `148a06fa` adds protected-only `hermes.recovery-admission-result/v1` metadata to
+  original and exact-replay 202 responses. The first store UUID and original
+  member incarnation now come from durable admission, so BytFactory need not
+  obtain its expected identity from the later seal being checked. A shared
+  bounded validator reads the store singleton, member, root relation and verified
+  provider admission in one transaction. Reserve returns that checked identity
+  only after commit; early replay uses a query-only snapshot without recapturing
+  a retired provider. Ordinary 202 bytes are unchanged. Strict integer generation,
+  status, response-loss replay and dispatch after HTTP-timeout checks passed
+  independent review with 121 affected tests. An immutable-checkout run covering
+  all direct reservation callers passed 463 tests in 25 files without retries.
+  The admission owner incarnation is distinct from the seal-time incarnation.
+  This adds no SQL schema or cleanup
+  authority; the corresponding Factory consumer and installed pair remain separate.
+- `2e954886` avoids a false read-only diagnosis when SQLite removes an optional
+  WAL or SHM sidecar between preflight enumeration and its permission check.
+  Only a missing sidecar with an extant parent is ignored; present unreadable
+  sidecars, the main database and its parent retain their existing refusal rules.
+  Deterministic disappearance tests failed before the fix. Two independent
+  reviews passed all 59 preflight and recovery-store tests without retries. No
+  WAL deletion, extra retry or permission-repair scope is introduced.
+- `6559afe5` keeps the real constants module in the slash-worker profile fixture
+  while directing its home lookup to scratch. Its old whole-module mock omitted
+  newly imported recovery helpers. The original subprocess/profile assertion
+  remains; independent review passed all five related tests without retries.
+- `12131a09` makes the hosted-room page-budget fixture use fixed per-row times.
+  The first event's serialized length cannot bound later independently sampled
+  floating-point timestamps: a deterministic reproduction produced singleton
+  pages of 512 and 520 bytes against a 513-byte fixture budget. The reader's
+  refusal was correct. The fixture now checks all four pages, their byte bounds,
+  advancing cursors and final `has_more`, without changing product limits or
+  retry policy. Two canonical runs passed all 45 tests without retries.
+
+At this pre-merge checkpoint, an immutable 272-file selection at `4453db94`
+passed 4,717 tests, failed those same three macOS binary fixtures and skipped 43,
+without retries. The second full hosted run, at `58686a7b`, had 49,949 passing tests,
+59 failures and 500 skips, including a benchmark timeout; it predates the final
+corrections and remains failed evidence. The later full run at `7eafc454` passed
+50,109 Python tests with one failure (the slash-worker fixture above) and 506
+skips. Its JavaScript lane failed TUI unmount and desktop checks; the desktop
+failure output was truncated. The output-drain correction preserves diagnostics
+for the next run. Full hosted CI at `0206efd4` passed every selected lane,
+including JavaScript/desktop and Python's 50,125 tests with 501 skips, in
+[run 36607723776](https://github.com/ih-hugh/hermes-agent/actions/runs/36607723776).
+That Python result includes one retried hosted-room fixture, corrected above;
+it is not a retry-free result. The next full run at `91e71461` passed 50,125
+Python tests with zero failures and 501 skips in 2,751 seconds, with no recorded
+test retry. Its desktop UI suite failed one group follow-up scheduling test
+(7,720 passed, one failed); the aggregate run remains failed. The test exposed
+same-millisecond local entries being reordered by the UUID tie-breaker during
+an echo merge, while delivery watermarks still referenced append positions.
+The narrow ordering correction and deterministic regression qualification are
+recorded below. Fresh exact-head aggregate CI remains required before readiness.
+A mixed-source local run, where another worker changed initializer files after import, is invalid
+evidence for the source-epoch checks and was discarded in favor of an immutable
+checkout. No upstream submission is recorded for these follow-ups. Preserve their
+behavioral regressions during upstream intake; retire compatibility-only fixture
+changes when the corresponding upstream fixture and contract agree. The fork
+merge, Factory pin, installed source-pair qualification and deployment are separate.
+
+
+### R0 qualification follow-up — desktop local message ordering
+
+- `2f93c02e` keeps newly appended room messages after the usable timestamp
+  maximum in the bounded retained log. Echo merges sort by timestamp and UUID;
+  the old same-tick timestamps could reorder entries beneath index-based member
+  watermarks, dropping or repeating a queued follow-up. Deterministic same-tick
+  and backward-clock regressions fail against the exact fork base and pass with
+  the correction. No persisted field, sync schema, dependency or check changes.
+- Local timestamps can lead wall time during bursts or clock rollback. This
+  preserves local append order, not causal ordering between independent peers.
+  Unorderable legacy timestamps are not repaired, and safe-integer exhaustion
+  refuses a new append. Existing duplicate suppression remains unchanged.
+- Independent review passed 102 room tests. Final focused tests, TypeScript and
+  scoped ESLint passed after padding-only cleanup. The full local desktop run
+  passed 9,947 tests and failed one unchanged Electron fixture, which invokes
+  `/bin/true`, absent on this Mac. That test and its production dependencies are
+  byte-identical to fork base `47e1cea1`; its isolated run reproduced the same
+  failure. All local UI tests passed. The local desktop result remains non-green;
+  only fresh hosted aggregate CI on the final commit can clear the merge gate.
+- No upstream submission is recorded for this fix. Retain the behavior tests
+  during upstream intake and retire the patch when the equivalent invariant is
+  present upstream. Shared gateway/runtime deployment remains a separate step.
+
 ## Upstream maintenance plan
 
 This is the proposed operating cadence; no recurring job or automatic update has
@@ -252,6 +486,7 @@ been installed.
 PR #2 was the next deployment candidate at the early 2026-09-28 checkpoint.
 [BytFactory PR #68](https://github.com/ih-hugh/BytFactory/pull/68) subsequently pinned
 it; the integration contract records the later dated deployment and bounded trials.
-This register does not freshly attest the running gateway. R0 requires a separate
-reviewed fork merge, Factory pin, release and deployment qualification. The much
+This register does not freshly attest the running gateway. R0's fork merge is
+recorded above; it still requires qualification of its follow-up fixes, the separate
+Factory pin, release and deployment. The much
 larger upstream catch-up remains a separate reviewed compatibility scope.

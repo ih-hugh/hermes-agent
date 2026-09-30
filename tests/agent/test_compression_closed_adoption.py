@@ -176,9 +176,10 @@ def test_flush_adopts_exactly_once_no_retry_loop(tmp_path: Path, monkeypatch) ->
         tip_calls = {"count": 0}
         orig_tip = SessionDB.get_compression_tip
 
-        def _counting_tip(self, session_id):
-            tip_calls["count"] += 1
-            return orig_tip(self, session_id)
+        def _counting_tip(self, session_id, *, strict=False):
+            if self is db:
+                tip_calls["count"] += 1
+            return orig_tip(self, session_id, strict=strict)
 
         monkeypatch.setattr(SessionDB, "get_compression_tip", _counting_tip)
 

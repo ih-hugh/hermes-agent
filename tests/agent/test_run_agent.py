@@ -101,6 +101,7 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
     ]
     agent._session_db = MagicMock()
+    agent._session_db._read_one.return_value = None  # ordinary session, no recovery row
     agent._session_db_created = True
     agent.session_id = "session-123"
     agent._last_flushed_db_idx = 0
@@ -6863,6 +6864,7 @@ class TestPersistUserMessageOverride:
 
     def test_persist_session_rewrites_current_turn_user_message(self, agent):
         agent._session_db = MagicMock()
+        agent._session_db._read_one.return_value = None  # ordinary session, no recovery row
         agent.session_id = "session-123"
         agent._last_flushed_db_idx = 0
         agent._persist_user_message_idx = 0

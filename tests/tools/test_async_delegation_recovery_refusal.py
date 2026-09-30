@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import queue
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,9 +68,109 @@ def test_raw_connect_creates_only_genuinely_absent_ordinary_store(tmp_path, monk
     try:
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone() is not None
+        assert conn.execute(
+            "SELECT 1 FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() is None
     finally:
         conn.close()
     assert path.exists()
+
+
+def test_legacy_completion_survives_exact_exclusion_only_claim(tmp_path, monkeypatch):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    claim_unscoped_ordinary(path)
+    assert ad.claim_completion_delivery("legacy-event", "claim-a") is True
+    assert ad.complete_completion_delivery("legacy-event", "claim-a") is False
+    assert ad.claim_completion_delivery("legacy-event", "claim-b") is True
+
+
+def test_bootstrap_catalog_reads_one_sqlite_snapshot(tmp_path, monkeypatch):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+
+    path = tmp_path / "state.db"
+    claim_unscoped_ordinary(path)
+    with sqlite3.connect(path) as setup:
+        assert setup.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    original_connect = sqlite3.connect
+    changed = threading.Event()
+    errors = []
+
+    def add_extra_table():
+        try:
+            with original_connect(path) as writer:
+                writer.execute("CREATE TABLE later_ordinary_table(value TEXT)")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            changed.set()
+
+    class CursorSnapshot:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    class ReadConnection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, params=()):
+            cursor = self.inner.execute(sql, params)
+            if "length(CAST(type AS BLOB))" in sql:
+                rows = cursor.fetchall()
+                worker = threading.Thread(target=add_extra_table)
+                worker.start()
+                assert changed.wait(5), "second connection could not commit in WAL mode"
+                worker.join(5)
+                assert not errors
+                return CursorSnapshot(rows)
+            return cursor
+
+        def close(self):
+            self.inner.close()
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(ad, "sqlite3", SimpleNamespace(
+        connect=lambda *a, **k: ReadConnection(original_connect(*a, **k)),
+        DatabaseError=sqlite3.DatabaseError,
+    ))
+    # The first metadata read saw the exact bootstrap. The later catalog read
+    # must see that same snapshot, not the writer's newly committed table.
+    assert ad.claim_completion_delivery("legacy-event", "claim-a") is True
+    assert changed.is_set()
+
+
+@pytest.mark.parametrize("damage", ["extra", "missing", "altered", "full_missing_ledger"])
+def test_legacy_completion_refuses_nonexact_bootstrap_catalog(tmp_path, monkeypatch, damage):
+    from hermes_state_recovery_exclusions import claim_unscoped_ordinary
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    if damage == "full_missing_ledger":
+        db = SessionDB(path)
+        db.close()
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP TABLE async_delegations")
+    else:
+        claim_unscoped_ordinary(path)
+        with sqlite3.connect(path) as conn:
+            if damage == "extra":
+                conn.execute("CREATE TABLE ordinary_extra(value TEXT)")
+            elif damage == "missing":
+                conn.execute("DROP TRIGGER recovery_guard_recovery_exclusions_update")
+            else:
+                conn.execute("DROP TRIGGER recovery_guard_recovery_exclusions_update")
+                conn.execute(
+                    "CREATE TRIGGER recovery_guard_recovery_exclusions_update "
+                    "BEFORE UPDATE ON recovery_exclusions BEGIN SELECT 1; END"
+                )
+    with pytest.raises(RecoveryRefused, match="protected_session_authority_unavailable"):
+        ad.claim_completion_delivery("legacy-event", "claim-a")
 
 
 def test_raw_connect_leaves_unreadable_existing_store_untouched(tmp_path, monkeypatch):
@@ -81,6 +182,227 @@ def test_raw_connect_leaves_unreadable_existing_store_untouched(tmp_path, monkey
         ad._connect()
     assert path.read_bytes() == b"not a sqlite database"
     assert set(tmp_path.iterdir()) == before
+
+
+def test_public_durable_read_does_not_recreate_deleted_named_profile(tmp_path):
+    from hermes_constants import (
+        mark_named_profile_deleted,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes-root"
+    root.mkdir()
+    (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+    profile = root / "profiles" / "archived"
+    profile.mkdir(parents=True)
+    mark_named_profile_deleted(profile)
+    profile.rmdir()
+    token = set_hermes_home_override(profile)
+    refused = False
+    try:
+        try:
+            ad.get_durable_delegation("no-such-delegation")
+        except FileNotFoundError as exc:
+            assert "Named profile home does not exist" in str(exc)
+            refused = True
+    finally:
+        reset_hermes_home_override(token)
+    assert not profile.exists()
+    assert not (profile / "state.db").exists()
+    assert refused
+
+
+def test_raw_schema_claim_blocks_protected_reserve_after_connection_precheck(
+    tmp_path, monkeypatch,
+):
+    from agent.recovery_context import current_incarnation
+    from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+    from hermes_state import SessionDB
+    from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
+    from tests.recovery_provider_fixture import provider_admission
+    import hermes_recovery_refusal
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
+    with sqlite3.connect(path) as setup:
+        setup.execute("DROP TABLE async_delegations")
+    original = hermes_recovery_refusal.require_unprotected_connection
+    outcomes = []
+
+    def reserve_after_precheck(conn):
+        original(conn)
+        result = store.reserve(
+            RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+            AdmissionIdentity(
+                scope, "byf-recovery-v1:root", "a" * 64, "run_root",
+                current_incarnation(), provider_admission(scope.session_id),
+            ),
+        )
+        outcomes.append((result.outcome, result.reason))
+
+    monkeypatch.setattr(hermes_recovery_refusal, "require_unprotected_connection", reserve_after_precheck)
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    try:
+        conn = ad._connect()
+        conn.close()
+        assert outcomes == [("refused", "raw_schema_active")]
+        with sqlite3.connect(path) as check:
+            assert check.execute(
+                "SELECT 1 FROM recovery_sessions WHERE session_id=?", (scope.session_id,)
+            ).fetchone() is None
+            assert check.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+            ).fetchone() is not None
+    finally:
+        db.close()
+
+
+def test_protected_reserve_winning_before_raw_claim_blocks_reconciliation(tmp_path, monkeypatch):
+    from agent.recovery_context import current_incarnation
+    from gateway.platforms.api_server_recovery_contract import RecoveryAdmission
+    from hermes_state import SessionDB
+    from hermes_state_recovery import AdmissionIdentity, RecoveryScope, RecoveryStore
+    from tests.recovery_provider_fixture import provider_admission
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    store = RecoveryStore(db)
+    scope = RecoveryScope(store.store_id, "factory", "b" * 64, "protected-session")
+    with sqlite3.connect(path) as setup:
+        setup.execute("DROP TABLE async_delegations")
+    original = exclusions.begin_raw_schema_claim
+    admitted = []
+
+    def admit_before_claim(target):
+        result = store.reserve(
+            RecoveryAdmission(schema="hermes.recovery/v1", generation=0, parent_run_id=None),
+            AdmissionIdentity(
+                scope, "byf-recovery-v1:root", "a" * 64, "run_root",
+                current_incarnation(), provider_admission(scope.session_id),
+            ),
+        )
+        admitted.append(result.outcome)
+        return original(target)
+
+    monkeypatch.setattr(exclusions, "begin_raw_schema_claim", admit_before_claim)
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    try:
+        with pytest.raises(RecoveryRefused, match="protected_session_dispatch"):
+            ad._connect()
+        assert admitted == ["created"]
+        with sqlite3.connect(path) as check:
+            assert check.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+            ).fetchone() is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failure", ["open", "initialize"])
+def test_failed_raw_schema_initialization_keeps_committed_claim(
+    tmp_path, monkeypatch, failure,
+):
+    from hermes_cli import sqlite_util
+    import hermes_state_schema
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected schema failure")
+
+    if failure == "open":
+        monkeypatch.setattr(sqlite_util, "open_db", fail)
+    else:
+        monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", fail)
+    with pytest.raises(RuntimeError, match="injected schema failure"):
+        ad._connect()
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+
+
+def test_raw_schema_connection_refuses_replaced_claimed_path(tmp_path, monkeypatch):
+    from hermes_cli import sqlite_util
+
+    path = tmp_path / "state.db"
+    displaced = tmp_path / "claimed.db"
+    real_open = sqlite_util.open_db
+
+    def replace_before_open(target, **kwargs):
+        path.rename(displaced)
+        with sqlite3.connect(path) as replacement:
+            replacement.execute("CREATE TABLE outsider(value TEXT)")
+        return real_open(target, **kwargs)
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", replace_before_open)
+    with pytest.raises(RecoveryRefused, match="invalid_raw_schema_lease"):
+        ad._connect()
+    with sqlite3.connect(displaced) as claimed:
+        assert claimed.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+    with sqlite3.connect(path) as replacement:
+        assert replacement.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='async_delegations'"
+        ).fetchone() is None
+
+
+def test_failed_raw_schema_release_closes_connection_and_keeps_claim(tmp_path, monkeypatch):
+    from hermes_cli import sqlite_util
+    import hermes_state_recovery_exclusions as exclusions
+
+    path = tmp_path / "state.db"
+    opened = []
+    real_open = sqlite_util.open_db
+
+    def track_open(*args, **kwargs):
+        conn = real_open(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    def fail_finish(*_args, **_kwargs):
+        raise RuntimeError("release failed")
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", track_open)
+    monkeypatch.setattr(exclusions, "finish_raw_schema_claim", fail_finish)
+    with pytest.raises(RuntimeError, match="release failed"):
+        ad._connect()
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT count(*) FROM recovery_exclusions WHERE kind='raw_schema'"
+        ).fetchone() == (1,)
+
+
+def test_protected_existing_schema_open_never_recreates_disappeared_store(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli import sqlite_util
+
+    db, _store, _scope, _registry = _admitted(tmp_path)
+    path = db.db_path
+    db.close()
+    real_open = sqlite_util.open_db
+
+    def remove_before_open(target, **kwargs):
+        path.unlink()
+        return real_open(target, **kwargs)
+
+    monkeypatch.setattr(ad, "_db_path", lambda: path)
+    monkeypatch.setattr(sqlite_util, "open_db", remove_before_open)
+    with pytest.raises(sqlite3.OperationalError):
+        ad._connect()
+    assert not path.exists()
 
 
 def test_ordinary_delegation_uses_existing_schema_in_mixed_store(tmp_path, monkeypatch):

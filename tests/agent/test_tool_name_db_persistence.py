@@ -25,11 +25,15 @@ def _make_agent(session_db):
         )
 
 
-def test_tool_name_persisted_to_session_db():
+def test_tool_name_persisted_to_session_db(tmp_path):
     """tool_name set by make_tool_result_message must be passed through to
     the batched flush so the column is populated on first write to the
     session DB."""
     session_db = MagicMock()
+    session_db.db_path = tmp_path / "state.db"
+    session_db.read_only = False
+    session_db._read_all.return_value = []
+    session_db._read_one.return_value = None
     agent = _make_agent(session_db)
 
     messages = [

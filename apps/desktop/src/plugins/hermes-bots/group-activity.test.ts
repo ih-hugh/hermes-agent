@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 
 import type * as data from './data'
 import type { GroupActivityEntry } from './group-activity'
@@ -153,7 +153,29 @@ describe('turn arc', () => {
 })
 
 describe('epoch scoping', () => {
-  it('queues follow-ups without cancelling the active turn or losing its reply delta', async () => {
+  it.each([
+    { timing: 'same clock tick', step: 0 },
+    { timing: 'clock moving backwards', step: -1 }
+  ])('queues follow-ups without cancelling the active turn or losing its reply delta ($timing)', async ({ step }) => {
+    let now = 1000
+    let id = 1000
+
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+      now += step
+
+      return now
+    })
+
+    // Reverse lexical UUID order exposes any echo merge that reorders
+    // the local append sequence while delivery watermarks still index it.
+    const ids = vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(
+      () => `00000000-0000-0000-0000-${String(id--).padStart(12, '0')}`
+    )
+
+    onTestFinished(() => {
+      clock.mockRestore()
+      ids.mockRestore()
+    })
     let release!: (reply: string) => void
     const first = new Promise<string>(resolve => { release = resolve })
     const room = await loadRoom({ turn: ({ n }) => n === 1 ? first : '(pass)' })

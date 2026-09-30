@@ -31,6 +31,7 @@ from gateway.platforms.api_server_recovery_artifacts import (
 )
 from gateway.platforms.api_server_recovery_contract import (
     RecoveryAdmission,
+    RecoveryAdmissionResult,
     RecoveryCapabilities,
     RecoveryLimits,
     RecoveryReason,
@@ -82,6 +83,7 @@ class ProtectedKeyReplay:
     outcome: Literal["replayed", "conflict"]
     run_id: str
     status: str
+    admission_identity: RecoveryAdmissionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,78 +409,20 @@ def read_protected_key(
     admission: RecoveryAdmission,
 ) -> ProtectedKeyReplay | None:
     """Read one committed admission without creating a writer or granting work."""
-    from gateway.platforms.api_server_recovery_artifacts import strict_json_loads
+    from hermes_state_recovery import read_admission_identity
 
     try:
-        with _protected_read_snapshot(owner) as (conn, _store_id, _identity):
-            metadata = conn.execute(
-                "SELECT typeof(run_id),length(substr(CAST(run_id AS BLOB),1,256)),"
-                "typeof(session_id),length(substr(CAST(session_id AS BLOB),1,256)),"
-                "typeof(parent_run_id),length(substr(CAST(parent_run_id AS BLOB),1,256)),"
-                "typeof(request_sha256),length(substr(CAST(request_sha256 AS BLOB),1,65)),"
-                "typeof(status_json),length(substr(CAST(status_json AS BLOB),1,131073)),"
-                "typeof(generation),generation FROM recovery_members "
-                "WHERE profile=? AND scope_digest=? AND idempotency_key=?",
-                (owner.profile, owner.scope_digest, key),
-            ).fetchone()
-            require_time()
-            if metadata is None:
-                return None
-            if (
-                metadata[0] != "text"
-                or type(metadata[1]) is not int
-                or not 0 < metadata[1] <= 255
-                or metadata[2] != "text"
-                or type(metadata[3]) is not int
-                or not 0 < metadata[3] <= 255
-                or not (
-                    (metadata[4] == "null" and metadata[5] is None)
-                    or (
-                        metadata[4] == "text"
-                        and type(metadata[5]) is int
-                        and 0 < metadata[5] <= 255
-                    )
-                )
-                or metadata[6] != "text"
-                or metadata[7] != 64
-                or metadata[8] != "text"
-                or type(metadata[9]) is not int
-                or not 0 < metadata[9] <= MAX_RESPONSE_BYTES
-                or metadata[10] != "integer"
-                or metadata[11] not in (0, 1)
-            ):
-                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
-            row = conn.execute(
-                "SELECT run_id,session_id,generation,parent_run_id,request_sha256,status_json "
-                "FROM recovery_members WHERE profile=? AND scope_digest=? AND idempotency_key=?",
-                (owner.profile, owner.scope_digest, key),
-            ).fetchone()
-            require_time()
-            if row is None or any(
-                type(row[index]) is not str for index in (0, 1, 4, 5)
-            ):
-                raise RecoveryHttpRefused(503, "recovery_store_unavailable")
-            if (
-                row[1] != session_id
-                or row[2] != admission.generation
-                or row[3] != admission.parent_run_id
-                or not hmac.compare_digest(row[4], fingerprint)
-            ):
-                return ProtectedKeyReplay("conflict", row[0], "queued")
+        with _protected_read_snapshot(owner) as (conn, store_id, _identity):
             try:
-                status = strict_json_loads(
-                    row[5].encode("utf-8"), max_bytes=MAX_RESPONSE_BYTES
+                source = read_admission_identity(
+                    conn, store_id, owner.profile, owner.scope_digest,
+                    session_id, key, fingerprint, admission,
                 )
-                state = (
-                    cast(dict[str, object], status).get("status")
-                    if type(status) is dict
-                    else None
-                )
-                if type(state) is not str or not state or len(state) > 64:
-                    raise ValueError("invalid protected status")
-            except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
+            except (RecoveryRefused, UnicodeError) as exc:
                 raise RecoveryHttpRefused(503, "recovery_store_unavailable") from exc
-            return ProtectedKeyReplay("replayed", row[0], state)
+            if source is None:
+                return None
+            return ProtectedKeyReplay(*source)
     except RecoveryHttpRefused as exc:
         if exc.status == 404:
             return None

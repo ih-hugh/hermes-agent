@@ -59,7 +59,10 @@ async def test_delivery_replay_is_atomic_across_continuation_and_busy_turn(tmp_p
     try:
         db.create_session("parent", source="api_server")
         db.create_session("other", source="api_server")
-        adapters = [SimpleNamespace(_ensure_session_db=lambda: db), SimpleNamespace(_ensure_session_db=lambda: peer)]
+        adapters = [
+            SimpleNamespace(_session_db=db, _ensure_session_db=lambda: db),
+            SimpleNamespace(_session_db=peer, _ensure_session_db=lambda: peer),
+        ]
         evt = {"type": "async_delegation", "delegation_id": "unique-unit"}
         async def send(adapter, event=evt):
             await persist_delegation_delivery(adapter, text="RESULT", session_id="parent", evt=event)

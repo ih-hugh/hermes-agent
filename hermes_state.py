@@ -194,10 +194,13 @@ def _fts_trigger_catalog_settled(conn: sqlite3.Connection, *, cjk_loaded: bool) 
 
 
 def _ordinary_journal_mode_settled(conn: sqlite3.Connection) -> bool:
-    from hermes_state_wal import resolve_journal_mode
+    from hermes_state_wal import is_sqlite_wal_reset_vulnerable, resolve_journal_mode
 
     actual = _on_disk_journal_mode(conn)
-    return actual in {"wal", "delete"} and (actual == "wal" or resolve_journal_mode() == "delete")
+    return actual == "wal" or (
+        actual == "delete"
+        and (resolve_journal_mode() == "delete" or is_sqlite_wal_reset_vulnerable())
+    )
 
 
 def _ordinary_reconciliation_complete(conn: sqlite3.Connection) -> bool:

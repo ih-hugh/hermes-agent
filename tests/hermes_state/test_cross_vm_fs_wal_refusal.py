@@ -6,11 +6,12 @@ while never live-downgrading an on-disk WAL database and never flagging an ordin
 """
 
 import sqlite3
+import sys
 
 import pytest
 
 import hermes_state_wal
-from hermes_state_wal import WalUnsupportedError, _detect_cross_vm_fs, apply_wal_with_fallback
+from hermes_state_wal import WalUnsupportedError, _detect_cross_vm_fs, _mountinfo_fstype, apply_wal_with_fallback
 
 
 def _mountinfo(tmp_path, lines):
@@ -28,17 +29,18 @@ SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share r
 
 
 class TestDetectCrossVmFs:
-    @pytest.mark.parametrize("path,expected", [
-        ("/data/agent", True),          # fuse.virtiofs bind mount
-        ("/mnt/host/db", True),         # 9p bind mount
-        ("/mnt/my share/db", True),     # octal-escaped mount point
-        ("/home/user/.hermes", False),  # ext4 root
-        ("/data/native/db", False),     # ext4 mounted over the virtiofs tree — longest prefix wins
-        ("/datastore", False),          # sibling path sharing a prefix string, not a mount prefix
+    @pytest.mark.parametrize("path,fstype,expected", [
+        ("/data/agent", "fuse.virtiofs", True),          # fuse.virtiofs bind mount
+        ("/mnt/host/db", "9p", True),                    # 9p bind mount
+        ("/mnt/my share/db", "virtiofs", True),          # octal-escaped mount point
+        ("/home/user/.hermes", "ext4", False),          # ext4 root
+        ("/data/native/db", "ext4", False),             # ext4 over virtiofs: longest prefix wins
+        ("/datastore", "ext4", False),                  # sibling path, not a mount prefix
     ])
-    def test_only_virtiofs_and_9p_mounts_are_flagged(self, tmp_path, path, expected):
+    def test_only_virtiofs_and_9p_mounts_are_flagged(self, tmp_path, path, fstype, expected):
         mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, NESTED_EXT4, SPACE_VIRTIOFS])
-        assert _detect_cross_vm_fs(path, mountinfo_path=mi) is expected
+        assert _mountinfo_fstype(path, mi) == fstype
+        assert _detect_cross_vm_fs(path, mountinfo_path=mi) is (expected if sys.platform == "linux" else False)
 
     @pytest.mark.parametrize("fstype", [
         "ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay", "nfs", "nfs4", "cifs", "fuse.sshfs", "apfs", "f2fs",

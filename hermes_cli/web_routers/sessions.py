@@ -25,6 +25,7 @@ from hermes_cli.web_models import (
 from hermes_cli.web_routers._common import log as _log, http_failure
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import is_transient_sqlite_error
+from hermes_state_recovery import RecoveryRefused
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -224,6 +225,12 @@ def get_sessions(
             db.close()
     except HTTPException:
         raise
+    except RecoveryRefused as exc:
+        _log.exception("GET /api/sessions authority unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Session store authority is unavailable; the session list was not cleared.",
+        ) from exc
     except sqlite3.OperationalError as exc:
         _log.exception("GET /api/sessions failed")
         # 503, not 500: the store is busy, not gone — the desktop keeps its

@@ -109,12 +109,58 @@ class RecoveryAdmission(_Wire):
     generation: Literal[0, 1]
     parent_run_id: str | None = Field(max_length=255)
 
+    @field_validator("generation", mode="before")
+    @classmethod
+    def _integer_generation(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError("generation must be an integer")
+        return value
+
     @field_validator("parent_run_id")
     @classmethod
     def _nonempty_parent(cls, value: str | None) -> str | None:
         if value == "":
             raise ValueError("parent_run_id cannot be empty")
         return value
+
+
+class RecoveryAdmissionResult(_Wire):
+    """Persisted member identity returned only for a protected 202 admission."""
+
+    schema_: Literal["hermes.recovery-admission-result/v1"] = Field(alias="schema")
+    store_id: str
+    profile: str = Field(min_length=1, max_length=128)
+    scope_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    session_id: str = Field(min_length=1, max_length=255)
+    run_id: str = Field(min_length=1, max_length=255)
+    generation: Literal[0, 1]
+    parent_run_id: str | None = Field(max_length=255)
+    idempotency_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    gateway_incarnation: str = Field(min_length=1, max_length=255)
+    provider_admission_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("generation", mode="before")
+    @classmethod
+    def _integer_generation(cls, value: object) -> int:
+        if type(value) is not int:
+            raise ValueError("generation must be an integer")
+        return value
+
+    @field_validator("store_id")
+    @classmethod
+    def _canonical_store_uuid(cls, value: str) -> str:
+        if str(UUID(value)) != value:
+            raise ValueError("store_id must be a canonical UUID")
+        return value
+
+    @model_validator(mode="after")
+    def _lineage(self):
+        if (self.generation == 0) != (self.parent_run_id is None):
+            raise ValueError("admission lineage does not match generation")
+        if self.parent_run_id == "":
+            raise ValueError("parent_run_id cannot be empty")
+        return self
 
 
 class RecoveryMember(_Wire):

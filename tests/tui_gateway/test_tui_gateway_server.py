@@ -16574,6 +16574,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -20782,7 +20786,7 @@ def test_native_vision_turn_persists_a_renderable_image_ref(tmp_path):
     assert not skipped
 
     agent = AIAgent.__new__(AIAgent)
-    agent._session_db = MagicMock()
+    agent._session_db = MagicMock(spec=["append_messages_batch"])
     agent._session_db_created = True
     agent.session_id = "s-1"
     agent._last_flushed_db_idx = 0

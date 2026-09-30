@@ -716,12 +716,14 @@ def _release_header_probe_fds() -> None:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
 def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
-    """Concurrent repairers serialise; the loser sees a healed DB and stops.
+    """Concurrent repairers never operate on the schema at the same time.
 
     Without the cross-process lock both processes back up and operate on
     sqlite_master, i.e. one runs surgery on a database the other is
     simultaneously rewriting. The backup count is the observable proxy for
-    "how many processes entered the critical section".
+    "how many processes entered the critical section". A process observing
+    the other as a live DB holder may safely refuse; a later operator retry
+    after both exit must then complete the one surgery.
     """
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
@@ -746,10 +748,15 @@ def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
         assert proc.returncode == 0, err
         reports.append(json.loads(out.strip().splitlines()[-1]))
 
-    assert all(r["repaired"] for r in reports), reports
-    # Exactly one process did the work; the other found the DB already healthy.
-    strategies = sorted(r["strategy"] for r in reports)
-    assert "already_healthy" in strategies or "repaired_by_other_process" in strategies
+    assert all(
+        r["repaired"] or "stop the gateway" in (r["error"] or "").lower()
+        for r in reports
+    ), reports
+    retry = repair_state_db_schema(db_path)
+    assert retry["repaired"] is True, retry
+    # One process (or the later retry) did the work. A second surgery would
+    # create another forensic backup and risk modifying an already healed DB.
+    assert sum(r["strategy"] == "dedup_schema" for r in (*reports, retry)) == 1
     assert len(list(tmp_path.glob("state.db.malformed-backup-*"))) == 1
 
     conn = sqlite3.connect(str(db_path))

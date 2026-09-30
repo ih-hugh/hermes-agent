@@ -258,6 +258,9 @@ class TestAPIServerDisconnectClosesResponseStore:
         adapter._session_dbs = {}
         adapter._session_db_cache_lock = threading.Lock()
         adapter._session_db_cache_closed = False
+        adapter._protected_admission_tasks = set()
+        adapter._recovery_workers = MagicMock()
+        adapter._recovery_workers.join = AsyncMock(return_value=False)
         adapter.platform = Platform.API_SERVER
         return adapter
 
@@ -318,4 +321,3 @@ class TestAPIServerDisconnectClosesResponseStore:
         # issues, AttributeError, etc.).
         with pytest.raises(sqlite3.ProgrammingError):
             store._conn.execute("SELECT 1").fetchone()
-
