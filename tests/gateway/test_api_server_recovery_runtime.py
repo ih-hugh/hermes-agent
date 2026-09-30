@@ -58,6 +58,10 @@ def _selected_source_fixture(registry, monkeypatch, on_source: Callable[[float],
     module.BundleIdentity = BundleIdentity
     monkeypatch.setitem(sys.modules, "byf_workspace", module)
     monkeypatch.setattr(manager._plugins["byf_workspace"], "module", module)
+    for record in tuple(manager._ownership_ledger["byf_workspace"]):
+        if record.kind == "tool_override_policy":
+            record.dispose()
+    manager._track_tool_override_policy(manager._plugins["byf_workspace"].manifest, module.__name__)
 
     def source(_self, *, deadline: float):
         on_source(deadline)

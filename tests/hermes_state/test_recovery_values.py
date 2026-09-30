@@ -23,6 +23,44 @@ from hermes_state_recovery_values import (
 )
 
 
+@pytest.mark.parametrize("mode", ["python", "json"])
+@pytest.mark.parametrize("generation", [0, 1, False, True, 0.0, 1.0, "0", "1", None, 2])
+@pytest.mark.parametrize("record", ["write_ack", "invocation", "context"])
+def test_retained_value_generation_preserves_exact_integer_identity(mode, generation, record):
+    from hermes_state_recovery_values import WriteAckValue, InvocationValue
+
+    models = {"write_ack": WriteAckValue, "invocation": InvocationValue, "context": SemanticContext}
+    if record == "context":
+        members = (("root", 0), ("nudge", generation)) if generation == 1 else (("root", generation),)
+        value = {"session_id": "session", "members": members, "no_calls": True}
+    else:
+        value = {
+            "schema": "hermes.recovery.artifact-value/v1", "record": record,
+            "session_id": "session", "run_id": "root", "generation": generation,
+        }
+        if record == "write_ack":
+            value.update({
+                "write_id": "write", "mutation": "session", "payload_sha256": "a" * 64,
+                "state": "committed", "ack_revision": 1, "result_json": "{}",
+            })
+        else:
+            value.update({
+                "invocation_id": "invocation", "producer_id": "producer", "sequence": 0,
+                "kind": "create_environment", "state": "returned", "create_invocation_id": None,
+                "container_id": "container", "container_attestation_sha256": "a" * 64,
+                "exit_code": None, "outcome_reason": None,
+            })
+    model = models[record]
+    parse = lambda: model.model_validate(value) if mode == "python" else model.model_validate_json(json.dumps(value))
+    if type(generation) is int and generation in (0, 1):
+        parsed = parse()
+        actual = parsed.members[-1][1] if record == "context" else parsed.generation
+        assert type(actual) is int and actual == generation
+    else:
+        with pytest.raises(ValueError):
+            parse()
+
+
 def test_exact_column_inventory_matches_live_sqlite():
     from hermes_state_common import SCHEMA_SQL
 

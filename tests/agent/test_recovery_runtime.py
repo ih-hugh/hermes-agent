@@ -55,11 +55,12 @@ def _close(store: RecoveryStore, scope: RecoveryScope):
 
 
 def _install_selected_plugin_fixture(registry: ProducerRegistry, monkeypatch):
-    """Represent the selected shim's one real registration, without loading Docker."""
+    """Represent the selected shim and the native loader's inert policy lease."""
     from hermes_cli.plugins import LoadedPlugin, get_plugin_manager
     from hermes_cli.plugins_ledger import PluginRegistration
     from hermes_cli.plugins_manifest import PluginManifest
     from tools import terminal_tool, terminal_tool_config
+    from tools.registry import registry as tool_registry
 
     selected = _SelectedTestProvider()
     registry.provider_capture = SelectedProviderCapture(
@@ -72,9 +73,16 @@ def _install_selected_plugin_fixture(registry: ProducerRegistry, monkeypatch):
     owned = PluginRegistration(
         kind="terminal_environment_provider", key="byf_workspace",
         release=lambda: None, plugin_key="byf_workspace")
+    monkeypatch.setattr(tool_registry, "_plugin_override_policy", dict(tool_registry._plugin_override_policy))
+    monkeypatch.setattr(manager, "_registration_order", list(manager._registration_order))
+    monkeypatch.setattr(manager, "_ownership_ledger", {
+        key: list(records) for key, records in manager._ownership_ledger.items()
+    })
+    manager._track_tool_override_policy(manifest, loaded.module.__name__)
+    policy = manager._ownership_ledger["byf_workspace"][-1]
     monkeypatch.setattr(manager, "_plugins", {**manager._plugins, "byf_workspace": loaded})
     monkeypatch.setattr(
-        manager, "_ownership_ledger", {**manager._ownership_ledger, "byf_workspace": [owned]})
+        manager, "_ownership_ledger", {**manager._ownership_ledger, "byf_workspace": [owned, policy]})
     monkeypatch.setattr(manager, "_discovered", True)
     return manager, owned
 
