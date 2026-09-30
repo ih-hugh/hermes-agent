@@ -1253,6 +1253,9 @@ def _reasoning_config_for_wire(agent):
     session: the request goes out without a reasoning config and the route
     applies its own default.
     """
+    from agent.recovery_producers import current_registry, protected_reasoning_config
+    if current_registry() is not None:
+        return protected_reasoning_config(agent)
     cfg = agent.reasoning_config
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_disable_rejected", False):
@@ -1438,7 +1441,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_opencode_session_headers
 
-    kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    from agent.recovery_producers import protected_reasoning_kwargs
+    kwargs = protected_reasoning_kwargs(
+        agent, _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    )
     return merge_opencode_session_headers(
         kwargs,
         getattr(agent, "provider", None),

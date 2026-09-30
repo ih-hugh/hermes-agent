@@ -107,9 +107,9 @@ def _with_protected_agent(
                 skip_background_review=True,
                 skip_context_files=True,
             )
-        with monkeypatch.context() as patch:
-            _install_selected_plugin_fixture(registry, patch)
-            check(agent)
+        # The issued preparation retains this exact loaded provider and generations.
+        # Reinstalling a fixture here would simulate unsupported plugin drift.
+        check(agent)
 
     try:
         executor.run(body)

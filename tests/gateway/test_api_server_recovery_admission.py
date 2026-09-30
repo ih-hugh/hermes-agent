@@ -527,6 +527,10 @@ async def test_committed_key_replays_without_a_cached_writer_or_runtime_readines
     "extra,headers",
     [
         ({"model_options": {}}, {}),
+        ({"model_options": {"reasoning": {"effort": "low", "enabled": True}}}, {}),
+        ({"model_options": {"reasoning": {"effort": "xhigh"}}}, {}),
+        ({"model_options": {"reasoning": {"effort": "low"}, "fast": True}}, {}),
+        ({"model_options": None}, {}),
         ({"previous_response_id": "response_old"}, {}),
         ({"input": [{"role": "user", "content": "work"}]}, {}),
         ({"hosted_room_dispatch": {}}, {}),
@@ -730,7 +734,7 @@ async def test_new_protected_reserve_uses_exact_prepared_route_and_replays_after
     calls: list[str] = []
     dispatched = asyncio.Event()
 
-    def prepare(owner, *, session_id):
+    def prepare(owner, *, session_id, reasoning_effort=None):
         calls.append("prepare")
         return SimpleNamespace(
             profile=owner.profile,
@@ -971,7 +975,7 @@ def test_root_existing_large_ordinary_history_is_not_loaded_before_reserve_refus
     monkeypatch.setattr(
         api_server_recovery_runtime,
         "prepare_static_chat_runtime",
-        lambda owner, *, session_id: SimpleNamespace(
+        lambda owner, *, session_id, reasoning_effort=None: SimpleNamespace(
             model="gpt-4.1",
             provider="openai-api",
             selected_provider=selected,
@@ -1038,7 +1042,7 @@ def test_nudge_history_bounds_source_before_payload_fetch_and_rolls_back_on_dead
     monkeypatch.setattr(
         api_server_recovery_runtime,
         "prepare_static_chat_runtime",
-        lambda owner, *, session_id: SimpleNamespace(
+        lambda owner, *, session_id, reasoning_effort=None: SimpleNamespace(
             model="gpt-4.1",
             provider="openai-api",
             selected_provider=selected,
@@ -1160,7 +1164,7 @@ async def test_late_committed_reserve_dispatches_after_http_timeout_and_replays(
     captures = 0
     executed = asyncio.Event()
 
-    def prepare(owner, *, session_id):
+    def prepare(owner, *, session_id, reasoning_effort=None):
         return SimpleNamespace(
             profile=owner.profile,
             home=owner.home,
@@ -1272,7 +1276,7 @@ async def test_two_stalled_precommit_workers_retain_slots_and_refuse_third(
     count_lock = threading.Lock()
     count = 0
 
-    def stalled_prepare(owner, *, session_id):
+    def stalled_prepare(owner, *, session_id, reasoning_effort=None):
         nonlocal count
         with count_lock:
             count += 1
@@ -1359,7 +1363,7 @@ async def test_committed_but_undispatched_member_is_explicitly_incomplete(
     )
     selected = type("Selected", (), {})()
 
-    def prepare(owner, *, session_id):
+    def prepare(owner, *, session_id, reasoning_effort=None):
         return SimpleNamespace(
             profile=owner.profile,
             home=owner.home,
@@ -1459,7 +1463,7 @@ async def test_postreserve_registration_does_not_block_unrelated_http(
     )
     selected = type("Selected", (), {})()
 
-    def prepare(owner, *, session_id):
+    def prepare(owner, *, session_id, reasoning_effort=None):
         return SimpleNamespace(
             profile=owner.profile,
             home=owner.home,
@@ -1600,8 +1604,9 @@ async def test_cold_protected_status_uses_two_real_workers_and_retains_timeout_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high"])
 async def test_served_protected_worker_sends_and_accounts_with_real_agent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, effort: str | None
 ) -> None:
     import run_agent  # the gateway's completed turn-machinery warm-up
     from openai import OpenAI
@@ -1618,7 +1623,8 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
     )
     from tests.gateway.test_api_server_recovery_runtime import _profile
 
-    profile = _profile(tmp_path, monkeypatch)
+    model = "gpt-4.1" if effort is None else "gpt-5.6-sol"
+    profile = _profile(tmp_path, monkeypatch, model=model)
     db, _store, _scope, registry = _admitted(profile.home)
     _install_selected_plugin_fixture(registry, monkeypatch)
     selected = registry.provider_capture.provider
@@ -1637,13 +1643,17 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
     def fake_sdk_create(self, **kwargs):
         assert isinstance(self._client, OpenAI)
         sends.append((self._client, kwargs))
-        assert kwargs["model"] == "gpt-4.1"
+        assert kwargs["model"] == model
+        if effort is None:
+            assert "reasoning_effort" not in kwargs
+        else:
+            assert kwargs["reasoning_effort"] == effort
         assert kwargs["stream"] is True
         return iter([
             ChatCompletionChunk(
                 id="chatcmpl-scratch",
                 created=1730000000,
-                model="gpt-4.1",
+                model=model,
                 object="chat.completion.chunk",
                 choices=[
                     Choice(
@@ -1656,7 +1666,7 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
             ChatCompletionChunk(
                 id="chatcmpl-scratch",
                 created=1730000000,
-                model="gpt-4.1",
+                model=model,
                 object="chat.completion.chunk",
                 choices=[],
                 usage=CompletionUsage(
@@ -1670,7 +1680,7 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
     body = {
         "input": "work",
         "session_id": "served-protected",
-        "model": "gpt-4.1",
+        "model": model,
         "provider": "openai-api",
         "recovery": {
             "schema": "hermes.recovery/v1",
@@ -1678,6 +1688,8 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
             "parent_run_id": None,
         },
     }
+    if effort is not None:
+        body["model_options"] = {"reasoning": {"effort": effort}}
     try:
         async with TestClient(TestServer(_app(adapter))) as client:
             response = await client.post(
@@ -1689,7 +1701,12 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
                 },
             )
             assert response.status == 202, await response.text()
-            run_id = (await response.json())["run_id"]
+            root_payload = await response.json()
+            run_id = root_payload["run_id"]
+            assert root_payload["recovery_admission"]["request_sha256"] == hashlib.sha256(json.dumps(
+                {"body": body, "gateway_session_key": ""}, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest()
             for _ in range(100):
                 status = getattr(adapter, "_run_statuses").get(run_id, {})
                 if status.get("status") in {"completed", "failed", "cancelled"}:
@@ -1744,6 +1761,77 @@ async def test_served_protected_worker_sends_and_accounts_with_real_agent(
             ]
             assert ("user", "work") in transcript
             assert ("assistant", "done") in transcript
+            changed = {
+                **body,
+                "model_options": {
+                    "reasoning": {"effort": "medium" if effort != "medium" else "low"}
+                },
+            }
+            conflict = await client.post(
+                "/v1/runs",
+                json=changed,
+                headers={
+                    "Authorization": f"Bearer {_KEY}",
+                    "Idempotency-Key": "byf-recovery-v1:real-constructor",
+                },
+            )
+            assert conflict.status == 409, await conflict.text()
+            assert len(sends) == 1
+            nudge_body = {
+                **body,
+                "input": "nudge work",
+                "recovery": {
+                    "schema": "hermes.recovery/v1",
+                    "generation": 1,
+                    "parent_run_id": run_id,
+                },
+            }
+            nudge_response = await client.post(
+                "/v1/runs",
+                json=nudge_body,
+                headers={
+                    "Authorization": f"Bearer {_KEY}",
+                    "Idempotency-Key": "byf-recovery-v1:real-constructor-nudge",
+                },
+            )
+            assert nudge_response.status == 202, await nudge_response.text()
+            nudge_payload = await nudge_response.json()
+            nudge_id = nudge_payload["run_id"]
+            assert (
+                nudge_payload["recovery_admission"]["request_sha256"]
+                == hashlib.sha256(
+                    json.dumps(
+                        {"body": nudge_body, "gateway_session_key": ""},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                ).hexdigest()
+            )
+            for _ in range(200):
+                nudge_status = adapter._run_statuses.get(nudge_id, {})
+                if nudge_status.get("status") in {"completed", "failed", "cancelled"}:
+                    break
+                await asyncio.sleep(0.02)
+            assert nudge_status.get("status") == "completed", nudge_status
+            assert len(sends) == 2
+            assert len(_store.send_inventory(served_scope, nudge_id)) == 1
+            for _ in range(200):
+                if (
+                    db._read_one(
+                        "SELECT producer_state FROM recovery_members WHERE run_id=?",
+                        (nudge_id,),
+                    )[0]
+                    == "closed"
+                ):
+                    break
+                await asyncio.sleep(0.02)
+            assert (
+                db._read_one(
+                    "SELECT producer_state FROM recovery_members WHERE run_id=?", (nudge_id,)
+                )[0]
+                == "closed"
+            )
     finally:
         await adapter.disconnect()
         db.close()

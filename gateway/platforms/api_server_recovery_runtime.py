@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,11 +69,30 @@ def _mapping(value: object) -> dict[str, object]:
     return value
 
 
+def protected_request_reasoning_effort(model_options: object) -> str:
+    """Accept only the structured effort consumed by the protected route."""
+    options = _mapping(model_options)
+    reasoning = _mapping(options.get("reasoning"))
+    effort = reasoning.get("effort")
+    if (
+        set(options) != {"reasoning"}
+        or set(reasoning) != {"effort"}
+        or type(effort) is not str
+        or effort not in {"low", "medium", "high"}
+    ):
+        _refuse()
+    return cast(str, effort)
+
+
 def prepare_static_chat_runtime(
-    owner: RecoveryOwnerContext, *, session_id: str
+    owner: RecoveryOwnerContext, *, session_id: str, reasoning_effort: str | None = None
 ) -> FrozenProtectedRuntime:
     """Validate exact loaded local inputs before any protected constructor effect."""
     if type(session_id) is not str or not 1 <= len(session_id) <= 128:
+        _refuse()
+    if reasoning_effort is not None and (
+        type(reasoning_effort) is not str or reasoning_effort not in {"low", "medium", "high"}
+    ):
         _refuse()
     inputs = _inspect_static_chat_runtime(owner)
     return _issue_static_preparation(
@@ -93,6 +112,7 @@ def prepare_static_chat_runtime(
             inputs.provider,
             inputs.tool_generation,
             inputs.terminal_generation,
+            reasoning_effort=reasoning_effort,
         )
     )
 
