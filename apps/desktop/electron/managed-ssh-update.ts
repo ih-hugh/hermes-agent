@@ -15,6 +15,7 @@
  */
 
 import { expandRemotePath, shq } from './remote-lifecycle'
+import { assertRemoteSelfUpdateAllowed } from './self-update-remote'
 import { encodedPowerShell, powerShellCommand, psLiteral } from './windows-remote-lifecycle'
 
 const UPDATE_EXIT_INDEPENDENT_HANDOFF = 75
@@ -65,7 +66,7 @@ interface ManagedSshScope {
 
 interface RemoteUpdateTarget {
   ssh: {
-    exec: (command: string, options?: { timeoutMs?: number; stdinData?: string }) => Promise<string>
+    exec: (command: string, options?: { timeoutMs?: number; stdinData?: string; maxOutputBytes?: number }) => Promise<string>
   }
   platform: 'Darwin' | 'Linux' | 'Windows'
   hermesPath: string
@@ -568,6 +569,7 @@ function markerIsClear(observation: RemoteUpdateObservation): boolean {
 }
 
 async function assertManagedUpdatePreflightClear(target: RemoteUpdateTarget, correlationId: string): Promise<void> {
+  await assertRemoteSelfUpdateAllowed(target)
   const observation = await observeManagedRemoteUpdate(target, correlationId)
 
   if (!markerIsClear(observation)) {

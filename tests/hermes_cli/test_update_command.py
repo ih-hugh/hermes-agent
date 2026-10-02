@@ -149,3 +149,17 @@ def test_unrecognized_or_cancel_input_cancels(answer, capsys):
 
     assert self_._pending_relaunch is None
     assert not result
+
+
+def test_installation_sentinel_keeps_interactive_session_before_confirmation(tmp_path, monkeypatch, capsys):
+    from hermes_cli import cli_commands_mixin
+    code = tmp_path / "code"
+    (code / "hermes_cli").mkdir(parents=True)
+    (code / ".hermes-self-update-disabled").touch()
+    monkeypatch.setattr(cli_commands_mixin, "__file__", str(code / "hermes_cli" / "cli_commands_mixin.py"))
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    self_ = _make_self("yes")
+    self_._prompt_text_input_modal = lambda **_kw: pytest.fail("protected update must not prompt")
+    assert _call(self_) is False
+    assert self_._pending_relaunch is None
+    assert "operator-managed maintenance" in capsys.readouterr().out

@@ -2974,6 +2974,14 @@ export interface SystemBatteryResult {
 }
 /** ``agent/battery.py::battery_category`` colour bucket. */
 export type BatteryCategory = 'good' | 'warn' | 'bad' | 'critical' | 'dim'
+export type SystemUpdatePolicyParams = Record<string, never>
+export interface SystemUpdatePolicyResult {
+  schema: 'hermes.update-policy/v1'
+  installation_root: string | null
+  allowed: boolean
+  code: string | null
+  message: string | null
+}
 export interface ProcessStopParams {
   session_id?: string | null
   profile?: string | null
@@ -4542,6 +4550,8 @@ export interface RpcMethods {
   'subscription.upgrade': { params: SubscriptionUpgradeParams; result: SubscriptionUpgradeResult }
   /** Host battery for the status bar; always resolves, ``available: false`` when unreadable. */
   'system.battery': { params: SystemBatteryParams; result: SystemBatteryResult }
+  /** Read-only admission observation for this backend's code installation, before updater preparation. */
+  'system.updatePolicy': { params: SystemUpdatePolicyParams; result: SystemUpdatePolicyResult }
   /** Record the client's column width for server-side rendering. */
   'terminal.resize': { params: TerminalResizeParams; result: TerminalResizeResult }
   /** Persist a toolset / MCP enable-disable change and rebuild the session agent so it takes effect now. */
@@ -4785,6 +4795,7 @@ export const RPC_METHODS = [
   'subscription.state',
   'subscription.upgrade',
   'system.battery',
+  'system.updatePolicy',
   'terminal.resize',
   'tools.configure',
   'tools.list',

@@ -283,7 +283,8 @@ impl Drop for UpdateMarkerGuard {
 
 async fn run_update(app: AppHandle) -> Result<()> {
     let hermes_home = crate::paths::hermes_home();
-    let install_root = hermes_home.join("hermes-agent");
+    let install_root = crate::self_update::admitted_installation(&hermes_home.join("hermes-agent"))
+        .map_err(|message| anyhow!(message))?;
 
     // Mutual exclusion (#50238): publish an "update in progress" marker for the
     // entire duration of this update. A desktop instance the user relaunches
@@ -439,6 +440,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // stare at a scary crash first), retry once automatically. Skip the retry
     // for the concurrent-instance guard (exit 2) — that's a "close Hermes" state
     // a retry can't fix.
+    crate::self_update::admitted_installation(&install_root).map_err(|message| anyhow!(message))?;
     if !matches!(update.exit_code, Some(0) | Some(UPDATE_EXIT_CONCURRENT)) {
         emit_log(
             &app,
@@ -469,6 +471,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // IS the update: drop our claim and retry once with the marker absent.
     // The guard re-removes on Drop (idempotent), and the desktop is already
     // gone at this point, so nothing races the brief marker-free window.
+    crate::self_update::admitted_installation(&install_root).map_err(|message| anyhow!(message))?;
     if should_heal_self_marker_refusal(
         update.exit_code,
         &crate::paths::update_in_progress_marker(),
@@ -492,6 +495,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         )
         .await?;
     }
+    crate::self_update::admitted_installation(&install_root).map_err(|message| anyhow!(message))?;
     let update_ms = started.elapsed().as_millis() as u64;
 
     match update.exit_code {

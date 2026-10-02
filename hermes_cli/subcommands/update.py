@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from argparse import Namespace
 from typing import Callable
 
 
@@ -23,6 +24,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "kind (git/docker/nix), every running Hermes service across all "
             "profiles with its supervisor and running code version, and how "
             "each will be restarted. Read-only; safe on a live fleet.")
+    update_parser.add_argument(
+        "--policy", action="store_true", default=False,
+        help="Print read-only installation admission as JSON. Use alone, without other update flags.")
     update_parser.add_argument(
         "--no-backup", action="store_true", default=False,
         help="Skip ALL pre-update backups for this run (both the quick state snapshot and the full zip; overrides updates.pre_update_backup)",
@@ -67,3 +71,14 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
     update_parser.set_defaults(func=cmd_update)
+
+
+def validate_policy_only(args: Namespace) -> None:
+    """A policy observation cannot also request an update mode or apply option."""
+    import sys
+
+    flags = ("gateway", "check", "plan", "no_backup", "backup", "yes", "keep_stash",
+             "switch_branch", "force", "force_venv")
+    if any(getattr(args, flag, None) for flag in flags) or getattr(args, "branch", None) is not None:
+        print("error: --policy must be used alone, without other update flags", file=sys.stderr)
+        raise SystemExit(2)

@@ -210,6 +210,14 @@ def _toolset_rows(params: dict, *, with_tools: bool) -> list[dict]:
 
 
 # ─── System / process ────────────────────────────────────────────────────────
+@method("system.updatePolicy")
+def _system_update_policy(rid, params: dict) -> dict:
+    from hermes_cli.update_contract import observe_update_policy
+
+    policy = observe_update_policy(Path(__file__).parent.parent)
+    return _ok(rid, policy.model_dump(by_alias=True))
+
+
 @method("system.battery")
 def _(rid, params: dict) -> dict:
     """Host battery for the status bar. Always resolves; ``available: false`` = no battery or read failed."""

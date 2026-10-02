@@ -59,6 +59,8 @@ _UPDATE_REFUSAL_ERROR_CODES = {
     "docker": "docker_update_unsupported", "image-marker": "docker_update_unsupported",
     "image-marker-invalid": "docker_update_unsupported", "apt": "apt_update_required",
     "nix": "nix_update_unsupported",
+    "self-update-disabled": "self_update_disabled",
+    "self-update-guard-unavailable": "self_update_guard_unavailable",
 }
 
 
@@ -273,6 +275,15 @@ async def check_hermes_update(force: bool = False):
         }
 
     install_method = detect_install_method(_server_path("PROJECT_ROOT"))
+    from hermes_cli.update_contract import evaluate_installation_update_guard
+
+    refusal = evaluate_installation_update_guard(_server_path("PROJECT_ROOT"))
+    if refusal is not None:
+        return {
+            "install_method": install_method, "current_version": __version__, "behind": None,
+            "update_available": False, "can_apply": False,
+            "update_command": refusal.update_command, "message": refusal.message,
+        }
     payload: Dict[str, Any] = {
         "install_method": install_method, "current_version": __version__, "behind": None,
         "update_available": False, "can_apply": install_method == "git",

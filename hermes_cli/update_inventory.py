@@ -145,6 +145,24 @@ def _collect_install_shape(plan: UpdatePlan) -> None:
                     plan.install_method = provenance.manager
         plan.update_mechanism = recommended_update_command_for_method(method)
 
+    # Kept outside the legacy probe fallback: an uncertain installation guard
+    # cannot leave the default plan advertising an in-place update.
+    from hermes_cli.config import get_project_root
+    from hermes_cli.update_contract import evaluate_installation_update_guard
+
+    try:
+        project_root = get_project_root()
+    except (OSError, RuntimeError, ValueError):
+        # The config resolver itself resolves the code path, so its failure
+        # must project the same uncertainty as the installation guard.
+        plan.updatable_in_place = False
+        plan.update_mechanism = "operator-managed maintenance"
+        return
+    refusal = evaluate_installation_update_guard(project_root)
+    if refusal is not None:
+        plan.updatable_in_place = False
+        plan.update_mechanism = refusal.update_command
+
 
 def _supervisor_classifier() -> Callable[[int], str]:
     """``pid -> supervisor`` over the service-PID sets; each probe degrades to an empty set."""

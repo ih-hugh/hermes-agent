@@ -141,18 +141,52 @@ describe('createSlashHandler', () => {
     expect(ctx.session.die).toHaveBeenCalledTimes(1)
   })
 
-  it('handles /update locally and exits with code 42 via dieWithCode', () => {
+  it('waits for install policy before exiting with code 42 for /update', async () => {
     vi.useFakeTimers()
     const ctx = buildCtx()
+    ctx.gateway.rpc.mockResolvedValue({
+      schema: 'hermes.update-policy/v1', installation_root: '/scratch/install',
+      allowed: true, code: null, message: null
+    })
 
     expect(createSlashHandler(ctx)('/update')).toBe(true)
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+    expect(ctx.gateway.rpc).toHaveBeenCalledWith('system.updatePolicy', {})
+    expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
+    await Promise.resolve()
     expect(ctx.transcript.sys).toHaveBeenCalledWith('exiting TUI to run update...')
 
     // Advance past the 100ms setTimeout
-    vi.advanceTimersByTime(150)
+    await vi.advanceTimersByTimeAsync(150)
     expect(ctx.session.dieWithCode).toHaveBeenCalledWith(42)
 
+    vi.useRealTimers()
+  })
+
+  it.each([
+    { schema: 'hermes.update-policy/v1', installation_root: '/scratch/install', allowed: false,
+      code: 'self-update-disabled', message: 'Use operator-managed maintenance.' },
+    { schema: 'unknown', installation_root: '/scratch/install', allowed: true, code: null, message: null },
+    { schema: 'hermes.update-policy/v1', installation_root: null, allowed: true, code: null, message: null }
+  ])('keeps the TUI alive when policy refuses or cannot establish authority: %j', async policy => {
+    vi.useFakeTimers()
+    const ctx = buildCtx()
+    ctx.gateway.rpc.mockResolvedValue(policy)
+
+    createSlashHandler(ctx)('/update')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
+    expect(ctx.transcript.sys.mock.calls.flat().join(' ')).toContain('operator-managed maintenance')
+    vi.useRealTimers()
+  })
+
+  it('keeps the TUI alive when the policy RPC is unavailable', async () => {
+    vi.useFakeTimers()
+    const ctx = buildCtx()
+    ctx.gateway.rpc.mockRejectedValue(new Error('Unknown method'))
+    createSlashHandler(ctx)('/update')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
+    expect(ctx.transcript.sys.mock.calls.flat().join(' ')).toContain('operator-managed maintenance')
     vi.useRealTimers()
   })
 

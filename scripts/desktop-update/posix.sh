@@ -63,6 +63,14 @@ done
 [ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# TCC repair takes precedence over inert self-tests and always needs admission.
+if [ "$SELF_TEST_TCC_HEAL" -eq 1 ] || { [ "$SELF_TEST_UI" -ne 1 ] && [ "$SELF_TEST_GATE" -ne 1 ]; }; then
+  source "$SCRIPT_DIR/installation-guard.sh" || {
+    echo "Self-update protection could not be checked for this installation. Use operator-managed maintenance." >&2
+    exit 2
+  }
+  self_update_installation_guard || exit 2
+fi
 HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
 MARKER="$HERMES_HOME/.hermes-update-in-progress"

@@ -360,6 +360,7 @@ import {
   type SecretStoragePolicy,
   writeSecretStoragePolicy
 } from './secret-storage-policy'
+import { inspectSelfUpdateInstallation, runGuardedSelfUpdate } from './self-update-installation'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -404,6 +405,7 @@ import {
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
+  type UpdateScriptHandoff,
   windowsUpdatePrerequisiteError,
   wrapHandoffForDetachedConsole
 } from './updater-process'
@@ -3128,7 +3130,23 @@ async function resolveHealedBranch(updateRoot, branch) {
 // inside applyUpdates. `force` (menu item, Settings "Check now") skips the
 // cache; the renderer's background poller never passes it.
 async function checkUpdates({ force = false }: { force?: boolean } = {}) {
-  const updateRoot = resolveUpdateRoot()
+  const installation = inspectSelfUpdateInstallation(resolveUpdateRoot())
+
+  if (installation.refusal) {
+    return installation.refusal
+  }
+
+  const updateRoot = installation.root
+  const stagedUpdater = resolveUpdaterBinary()
+
+  if (stagedUpdater && !resolveUpdateScriptHandoff(updateRoot)) {
+    const stagedInstallation = inspectSelfUpdateInstallation(path.join(HERMES_HOME, 'hermes-agent'))
+
+    if (stagedInstallation.refusal) {
+      return stagedInstallation.refusal
+    }
+  }
+
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
 
@@ -3936,6 +3954,23 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
+  const selectedRoot = resolveUpdateRoot()
+  const updater = resolveUpdaterBinary()
+  const scriptHandoff = resolveUpdateScriptHandoff(selectedRoot)
+
+  return runGuardedSelfUpdate(
+    selectedRoot,
+    updateRoot => applyAdmittedUpdates(opts, updateRoot, updater, scriptHandoff),
+    updater && !scriptHandoff ? [path.join(HERMES_HOME, 'hermes-agent')] : []
+  )
+}
+
+async function applyAdmittedUpdates(
+  opts: { stopSafeBlockers?: boolean },
+  updateRoot: string,
+  updater: string | null,
+  scriptHandoff: UpdateScriptHandoff | null
+) {
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }
@@ -3943,8 +3978,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   updateInFlight = true
 
   try {
-    const updater = resolveUpdaterBinary()
-
     if (!updater && !IS_WINDOWS) {
       // macOS/Linux: hand off to the repo-owned posix script — same shape as
       // Windows (quit → detached orchestrator → `hermes update` → relaunch),
@@ -3966,9 +3999,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // PowerShell and the checkout — so fall through to the normal hand-off
       // when the script exists. Only when the checkout predates the script do
       // we surface the manual one-liner.
-      const updateRoot = resolveUpdateRoot()
-
-      if (!resolveUpdateScriptHandoff(updateRoot)) {
+      if (!scriptHandoff) {
         // They DO have a working `hermes` on PATH / in the venv, so the
         // correct path is the one-liner in their native medium. We show the
         // EXACT command, branch-pinned to the checkout they're on — bare
@@ -4023,7 +4054,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     })
     repairMacUpdaterHelper(updater)
 
-    const updateRoot = resolveUpdateRoot()
     const { branch: configuredBranch } = readDesktopUpdateConfig()
     const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     const updaterArgs = ['--update', '--branch', branch]
@@ -4040,7 +4070,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // anything.  Runs while the backend is still alive.
     preflightStateDb(HERMES_HOME, rememberLog)
 
-    if (IS_WINDOWS && resolveUpdateScriptHandoff(updateRoot)) {
+    if (IS_WINDOWS && scriptHandoff) {
       const message = windowsUpdatePrerequisiteError(updateRoot)
 
       if (message) {
@@ -4155,7 +4185,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // checkout, so each `hermes update` refreshes the code that drives the
     // next one. Checkouts that predate the script fall back to the binary
     // path unchanged.
-    const scriptHandoff = resolveUpdateScriptHandoff(updateRoot)
     let child
 
     if (scriptHandoff) {
@@ -4511,7 +4540,10 @@ function preflightStateDb(hermesHome, rememberLog) {
 // its own tiny shim window (or nothing, headless) — this process only needs
 // to leave. Checkouts that predate the script get the manual card once.
 async function applyUpdatesPosixHandoff(opts: any) {
-  const updateRoot = resolveUpdateRoot()
+  return runGuardedSelfUpdate(resolveUpdateRoot(), updateRoot => applyAdmittedUpdatesPosixHandoff(opts, updateRoot))
+}
+
+async function applyAdmittedUpdatesPosixHandoff(opts: any, updateRoot: string) {
   const handoff = resolvePosixScriptHandoff(updateRoot)
 
   if (!handoff) {

@@ -814,6 +814,12 @@ def _launch_tui(
     # Exit code 42 = TUI requested an update. Relaunch as `hermes update`;
     # preserve_inherited=False keeps --tui and other flags out of the subcommand.
     if code == 42:
+        from hermes_cli.update_contract import observe_update_policy
+
+        policy = observe_update_policy(PROJECT_ROOT)
+        if not policy.allowed:
+            print(policy.message)
+            sys.exit(2)
         from hermes_cli.relaunch import relaunch
         print("\n☤ Launching update...\n")
         relaunch(["update"], preserve_inherited=False)
