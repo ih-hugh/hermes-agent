@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -138,6 +139,60 @@ class TestCollectInventory:
         assert restored["install_method"] == "git"
         assert len(restored["runtimes"]) == 2
         assert restored["runtimes"][0]["kind"] == "gateway"
+
+
+@pytest.mark.parametrize("resolver_error", [None, OSError, RuntimeError], ids=["unmarked", "unavailable", "looping"])
+def test_plan_root_resolution_is_read_only_and_fail_closed(tmp_path, monkeypatch, capsys, resolver_error):
+    from hermes_cli import main, update_cmd, update_contract, update_receipt
+
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "source.py").write_text("source unchanged\n", encoding="utf-8")
+    (code / "dependencies.txt").write_text("dependencies unchanged\n", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in code.iterdir()}
+    entries_before = sorted(path.name for path in tmp_path.iterdir())
+    profile = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    monkeypatch.setattr(main, "PROJECT_ROOT", code)
+
+    def resolve_root():
+        if resolver_error is not None:
+            raise resolver_error("installation root unavailable")
+        return code
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("read-only plan reached updater preparation or a receipt writer")
+
+    monkeypatch.setattr("hermes_cli.config.get_project_root", resolve_root)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "git")
+    monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: None)
+    monkeypatch.setattr("hermes_cli.image_provenance.read_image_provenance", lambda: None)
+    monkeypatch.setattr("hermes_cli.build_info.get_code_identity", lambda **_kwargs: {})
+    monkeypatch.setattr(update_receipt, "_profile_homes", lambda: [])
+    monkeypatch.setattr(ui, "_collect_gateway_runtimes", lambda *_args: None)
+    monkeypatch.setattr(ui, "_collect_ledger_runtimes", lambda *_args: None)
+    monkeypatch.setattr(main, "_install_hangup_protection", forbidden)
+    monkeypatch.setattr(update_cmd, "_cmd_update_impl", forbidden)
+    monkeypatch.setattr(update_cmd, "_cmd_update_check", forbidden)
+    monkeypatch.setattr(update_contract, "record_refusal_receipt", forbidden)
+    monkeypatch.setattr(update_receipt, "begin_update_receipt", forbidden)
+    monkeypatch.setattr(ui, "record_plan_in_receipt", forbidden)
+
+    plan = ui.collect_runtime_inventory()
+    assert plan.updatable_in_place is (resolver_error is None)
+    assert plan.update_mechanism == ("hermes update" if resolver_error is None else "operator-managed maintenance")
+    main.cmd_update(SimpleNamespace(plan=True))
+    output = capsys.readouterr().out
+    assert "Update plan:" in output
+    if resolver_error is not None:
+        assert "NOT updatable in place" in output
+        assert "operator-managed maintenance" in output
+    else:
+        assert "NOT updatable in place" not in output
+    assert not profile.exists()
+    assert {path.name: path.read_bytes() for path in code.iterdir()} == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == entries_before
 
 
 class TestPrintPlan:

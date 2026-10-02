@@ -2649,6 +2649,14 @@ class CLICommandsMixin:
         """Handle /update — exit the session and relaunch as ``hermes update``. Returns True when
         confirmed (the caller exits the app; the relaunch runs on the main thread after
         prompt_toolkit restores terminal modes), False when cancelled."""
+        from pathlib import Path
+        from hermes_cli.update_contract import evaluate_update_admission, record_refusal_receipt
+
+        refusal = evaluate_update_admission(Path(__file__).parent.parent)
+        if refusal is not None:
+            print(refusal.message)
+            record_refusal_receipt(refusal)
+            return False
         from hermes_cli.config import is_managed, format_managed_message
         if is_managed():
             print(f"  ✗ {format_managed_message('update Hermes Agent')}")

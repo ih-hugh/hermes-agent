@@ -278,3 +278,6 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# Operator-owned installation maintenance protection; never a source/stash item.
+/.hermes-self-update-disabled

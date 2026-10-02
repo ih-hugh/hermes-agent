@@ -538,3 +538,54 @@ when a released upstream protected route passes strict structured shape, immutab
 issued-choice binding, absence, changed-body idempotency and actual root/nudge SDK
 propagation/substitution regressions. Independent fork review/CI/merge precede the
 separate Factory grammar mirror, reviewed pin and installed-pair qualification.
+
+
+## Installation-managed self-update protection — 2026-10-01
+
+BytFactory's shared Hermes source is deployed at an explicitly reviewed fork
+revision, paired with a separately reviewed Factory pin and trusted workspace
+bundle. An ordinary self-update must not replace that source or restart its shared
+services outside the coordinated deployment process. A detached Git HEAD is not
+protection: the existing updater switches it to its update branch.
+
+This patch reserves `.hermes-self-update-disabled` in the physical code
+installation root. The operator explicitly provisions it for a managed
+installation. Presence of any entry disables supported self-update paths; contents
+are neither parsed nor trusted. An uncertain root or marker lookup also refuses.
+The decision is independent of profile home, current directory, remote name and
+force flags. Unmarked installations keep their ordinary update behavior. Existing
+image/package-managed checks remain in force.
+
+The common Python admission check covers CLI and dashboard updates; outer
+interactive, messaging, Desktop and directly invoked update helpers must refuse
+before their own service preparation, source replacement or dependency repair.
+Read-only planning reports the maintenance requirement. The read-only
+`hermes update --policy` command and `system.updatePolicy` TUI RPC expose the
+`hermes.update-policy/v1` admission observation before a caller prepares or drains
+services. Managed SSH updates require this observation from the exact configured
+launcher; an older or unavailable remote interface requires operator maintenance.
+The guard is not a filesystem security boundary against an operator who can remove the marker or
+manually replace the source, nor does it constrain arbitrary third-party installers.
+
+This source PR does not provision the marker, rewrite remotes, update the live
+installation, rebuild its staged helpers, restart the shared gateway or advance
+BytFactory's pin. During later coordinated maintenance, install the reviewed
+source/helpers, configure the fork as `origin` and Nous as `upstream`, provision
+the installation marker, and verify refusal through the deployed entry points.
+Only then is the installed runtime protected. Retain the existing drain, backup,
+compatible-state rollback and post-restart qualification requirements above.
+
+Scratch tests cover entry shapes, uncertain lookups, profile independence,
+preparation refusal, the policy wire contract, staged-target selection and bounded
+remote observation. Affected no-runtime updater fixtures explicitly isolate
+launchd discovery/restart so tests cannot act on the operator's fleet. Native
+observer tests and source review are separate from actual Windows execution,
+full Rust integration, packaged-app qualification and deployed protection; the PR
+records the completed host/CI evidence and any remaining limits.
+
+Upstream submission/equivalence is not established. Retire this patch when a
+released upstream installation-wide maintenance policy passes the same
+profile-independent refusal, pre-effect, invalid-entry, native-helper and
+unmarked-install compatibility regressions. Qualification results and the final
+reviewed patch reference are recorded in the pull request; implementation does
+not establish deployment or live acceptance.

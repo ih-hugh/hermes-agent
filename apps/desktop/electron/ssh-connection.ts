@@ -404,7 +404,7 @@ function sshErrorMessage(kind, conn, stderr?) {
 
 // Resolves { code, stdout, stderr }. On timeout the child is SIGKILLed and the
 // promise rejects with err.kind = TIMEOUT. `spawnFn` is injectable for tests.
-function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData, signal }: any = {}) {
+function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData, signal, maxOutputBytes }: any = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       const error: any = new Error('SSH operation was cancelled.')
@@ -431,6 +431,7 @@ function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData,
 
     let stdout = ''
     let stderr = ''
+    let outputBytes = 0
     let settled = false
 
     const timer: any = setTimeout(() => {
@@ -477,12 +478,39 @@ function runSsh(args, { timeoutMs, spawnFn = spawn, stdin = 'ignore', stdinData,
       onAbort()
     }
 
-    child.stdout?.on('data', d => {
-      stdout += d.toString()
-    })
-    child.stderr?.on('data', d => {
-      stderr += d.toString()
-    })
+    const capture = (stream: 'stdout' | 'stderr', data: Buffer | string) => {
+      if (settled) {
+        return
+      }
+
+      const value = data.toString()
+      outputBytes += Buffer.byteLength(value, 'utf8')
+
+      if (maxOutputBytes != null && outputBytes > maxOutputBytes) {
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // already gone
+        }
+
+        reject(new Error('SSH observation exceeded its output limit.'))
+
+        return
+      }
+
+      if (stream === 'stdout') {
+        stdout += value
+      } else {
+        stderr += value
+      }
+    }
+
+    child.stdout?.on('data', d => capture('stdout', d))
+    child.stderr?.on('data', d => capture('stderr', d))
     child.on('error', error => {
       if (settled) {
         return
@@ -786,7 +814,7 @@ class SshConnection {
 
   // One-shot remote command over the control connection. Resolves stdout;
   // rejects with a classified error on non-zero exit or timeout.
-  async exec(remoteCommand, { timeoutMs, stdinData }: any = {}) {
+  async exec(remoteCommand, { timeoutMs, stdinData, maxOutputBytes }: any = {}) {
     const args = buildExecArgs(this, remoteCommand, this._connectTimeoutMs)
     let result
 
@@ -794,6 +822,7 @@ class SshConnection {
       result = await runSsh(args, {
         timeoutMs: timeoutMs ?? this._execTimeoutMs,
         spawnFn: this._spawnFn,
+        ...(maxOutputBytes != null ? { maxOutputBytes } : {}),
         ...(stdinData != null ? { stdinData } : {})
       })
     } catch (error) {

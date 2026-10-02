@@ -449,6 +449,12 @@ test('exec() treats a hung ssh as a timeout (half-open connection)', async () =>
   )
 })
 
+test.each(['stdout', 'stderr'] as const)('exec() bounds observation bytes from %s', async stream => {
+  const spawnFn = scriptedSpawn([{ code: 0, [stream]: 'é'.repeat(9) }])
+  const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
+  await assert.rejects(() => conn.exec('hermes update --policy', { maxOutputBytes: 16 }), /output limit/)
+})
+
 test('forward() issues -O forward with a loopback-bound -L spec', async () => {
   const spawnFn = scriptedSpawn([{ code: 0 }])
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: '/tmp/d' })
