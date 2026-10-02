@@ -3499,6 +3499,24 @@
       }
     },
     {
+      "name": "system.updatePolicy",
+      "summary": "Read-only admission observation for this backend's code installation, before updater preparation.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SystemUpdatePolicyParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SystemUpdatePolicyResult"
+        }
+      }
+    },
+    {
       "name": "terminal.resize",
       "summary": "Record the client's column width for server-side rendering.",
       "params": [
@@ -30034,6 +30052,68 @@
           "available"
         ],
         "title": "SystemBatteryResult",
+        "type": "object"
+      },
+      "SystemUpdatePolicyParams": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "SystemUpdatePolicyParams",
+        "type": "object"
+      },
+      "SystemUpdatePolicyResult": {
+        "additionalProperties": false,
+        "properties": {
+          "schema": {
+            "const": "hermes.update-policy/v1",
+            "title": "Schema",
+            "type": "string"
+          },
+          "installation_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Installation Root"
+          },
+          "allowed": {
+            "title": "Allowed",
+            "type": "boolean"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          }
+        },
+        "required": [
+          "schema",
+          "installation_root",
+          "allowed",
+          "code",
+          "message"
+        ],
+        "title": "SystemUpdatePolicyResult",
         "type": "object"
       },
       "TaskIdResult": {

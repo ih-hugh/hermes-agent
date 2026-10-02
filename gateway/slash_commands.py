@@ -1224,6 +1224,12 @@ class GatewaySlashCommandsMixin(
                     return t("gateway.update.platform_not_messaging")
             except Exception:
                 return t("gateway.update.platform_not_messaging")
+        from hermes_cli.update_contract import evaluate_update_admission, record_refusal_receipt
+
+        refusal = evaluate_update_admission(Path(__file__).parent.parent)
+        if refusal is not None:
+            record_refusal_receipt(refusal)
+            return refusal.message
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
         if not (Path(__file__).parent.parent.resolve() / '.git').exists():

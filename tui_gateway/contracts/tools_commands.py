@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pydantic import Field
 
+from hermes_cli.update_contract import UpdatePolicy
+
 from .base import JsonValue, Params, Result, WireEnum
 from .registry import method
 
@@ -46,6 +48,18 @@ class SystemBatteryResult(Result):
 
 method("system.battery", params=SystemBatteryParams, result=SystemBatteryResult,
        doc="Host battery for the status bar; always resolves, ``available: false`` when unreadable.")
+
+
+class SystemUpdatePolicyParams(Params):
+    pass
+
+
+class SystemUpdatePolicyResult(UpdatePolicy, Result):
+    pass
+
+
+method("system.updatePolicy", params=SystemUpdatePolicyParams, result=SystemUpdatePolicyResult,
+       doc="Read-only admission observation for this backend's code installation, before updater preparation.")
 
 
 # ── process.* / agents.list ───────────────────────────────────────────────────────────────────

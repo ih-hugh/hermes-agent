@@ -2224,6 +2224,13 @@ def _finalize_update_receipt(code: int, reason: str) -> None:
 
 def _update_preflight_handled(args) -> bool:
     """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
+    if getattr(args, "policy", False):
+        from hermes_cli.subcommands.update import validate_policy_only
+        from hermes_cli.update_contract import observe_update_policy
+
+        validate_policy_only(args)
+        print(observe_update_policy(PROJECT_ROOT).model_dump_json(by_alias=True))
+        return True
     from hermes_cli.config import is_managed, managed_error
 
     if is_managed():

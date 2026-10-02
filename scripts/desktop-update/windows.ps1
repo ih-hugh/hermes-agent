@@ -60,6 +60,22 @@ if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
     throw "-InstallRoot is required"
 }
 
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain) {
+    $ErrorActionPreference = "Stop"
+    try {
+        . (Join-Path $PSScriptRoot "installation-guard.ps1")
+        $installation = Get-HermesSelfUpdateInstallation -InstallRoot $InstallRoot
+        if ($installation.Refusal) {
+            [Console]::Error.WriteLine($installation.Refusal)
+            exit 2
+        }
+        $InstallRoot = $installation.Root
+    } catch {
+        [Console]::Error.WriteLine("Self-update protection could not be checked for this installation. Use operator-managed maintenance.")
+        exit 2
+    }
+}
+
 $ErrorActionPreference = "Continue"
 # Foreground helpers: the script is spawned via `cmd start /min`, so its
 # WinForms window comes up backgrounded unless we explicitly claim focus --

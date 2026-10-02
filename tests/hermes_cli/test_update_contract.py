@@ -175,3 +175,73 @@ def test_refusal_receipt_written_as_refused(tmp_path, monkeypatch):
     steps = {s["name"]: s for s in data["steps"]}
     assert "admission" in steps and steps["admission"]["ok"] is False
     assert "docker pull" in steps["admission"]["detail"]
+
+
+@pytest.mark.parametrize("kind", ["empty", "content", "directory", "symlink", "broken-symlink"])
+def test_installation_sentinel_refuses_every_entry_without_reading_content(tmp_path, monkeypatch, kind):
+    marker = tmp_path / ".hermes-self-update-disabled"
+    if kind == "directory":
+        marker.mkdir()
+    elif kind in {"symlink", "broken-symlink"}:
+        target = tmp_path / "target"
+        if kind == "symlink":
+            target.touch()
+        marker.symlink_to(target)
+    else:
+        marker.write_text("private marker contents" if kind == "content" else "")
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *_a, **_k: "git")
+    refusal = evaluate_update_admission(tmp_path)
+    assert refusal is not None and refusal.code == "self-update-disabled"
+    assert "private marker contents" not in refusal.message
+    assert "operator-managed maintenance" in refusal.message
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError("unavailable")])
+def test_installation_lookup_uncertainty_refuses_before_legacy_fallback(tmp_path, monkeypatch, error):
+    original = Path.lstat
+    def uncertain(path):
+        if path.name == ".hermes-self-update-disabled":
+            raise error
+        return original(path)
+    monkeypatch.setattr(Path, "lstat", uncertain)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *_a, **_k: pytest.fail("legacy fallback"))
+    refusal = evaluate_update_admission(tmp_path)
+    assert refusal is not None and refusal.code == "self-update-guard-unavailable"
+
+
+def test_installation_guard_resolves_code_root_and_refuses_resolution_failure(tmp_path, monkeypatch):
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / ".hermes-self-update-disabled").touch()
+    alias = tmp_path / "alias"
+    alias.symlink_to(code, target_is_directory=True)
+    assert evaluate_update_admission(alias).code == "self-update-disabled"
+    assert evaluate_update_admission(tmp_path / "missing").code == "self-update-guard-unavailable"
+
+
+def test_disappeared_installation_is_not_definite_sentinel_absence(tmp_path, monkeypatch):
+    code = tmp_path / "code"
+    code.mkdir()
+    original = Path.lstat
+    def disappear(path):
+        if path.name == ".hermes-self-update-disabled":
+            code.rmdir()
+        return original(path)
+    monkeypatch.setattr(Path, "lstat", disappear)
+    refusal = evaluate_update_admission(code)
+    assert refusal is not None and refusal.code == "self-update-guard-unavailable"
+
+
+def test_profile_and_cwd_markers_do_not_guard_another_code_installation(tmp_path, monkeypatch):
+    code = tmp_path / "code"
+    code.mkdir()
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / ".hermes-self-update-disabled").touch()
+    monkeypatch.chdir(profile)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr("hermes_cli.image_provenance.IMAGE_PROVENANCE_PATH", tmp_path / "absent-image.json")
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *_a, **_k: "git")
+    assert evaluate_update_admission(code) is None

@@ -42,7 +42,7 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
+def _patch_gateway_discovery(isolated_update_runtime):
     """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
 
     Tests in this file that reach the full success path (e.g. the #87694

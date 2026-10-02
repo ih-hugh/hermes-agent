@@ -54,3 +54,34 @@ def test_retry_policy_distinguishes_self_lock_deferral(tmp_path: Path) -> None:
         "withMarker": True,
     }
     assert marker.exists()
+
+
+@pytest.mark.windows_only
+def test_protected_install_never_retries_existing_dependency_deferral(
+    tmp_path: Path,
+) -> None:
+    install_root = tmp_path / "hermes-agent"
+    install_root.mkdir()
+    (install_root / ".update-incomplete").write_text("stale dependency deferral")
+    (install_root / ".hermes-self-update-disabled").mkdir()
+    policy = str(RETRY_POLICY).replace("'", "''")
+    root = str(install_root).replace("'", "''")
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f". '{policy}'; @((Test-HermesUpdateShouldRetry -ExitCode 2 -InstallRoot '{root}'), "
+            f"(Test-HermesUpdateShouldRetry -ExitCode 1 -InstallRoot '{root}')) | ConvertTo-Json -Compress",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == [False, False]
+    assert (
+        install_root / ".update-incomplete"
+    ).read_text() == "stale dependency deferral"

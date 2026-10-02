@@ -544,3 +544,28 @@ class TestWatchUpdateProgress:
         assert "continued after" in sent
         assert "Hermes update finished" in sent
         assert not (hermes_home / ".update_pending.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_installation_sentinel_refuses_before_pending_files_and_detached_spawn(tmp_path, monkeypatch):
+    import gateway.slash_commands as commands
+    import gateway.run as run
+    code = tmp_path / "code"
+    (code / "gateway").mkdir(parents=True)
+    (code / ".git").mkdir()
+    (code / ".hermes-self-update-disabled").touch()
+    home = tmp_path / "profile"
+    home.mkdir()
+    exit_marker = home / ".update_exit_code"
+    exit_marker.write_text("retained")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    monkeypatch.setattr(commands, "__file__", str(code / "gateway" / "slash_commands.py"))
+    monkeypatch.setattr(run, "_hermes_home", home)
+    monkeypatch.setattr(run, "_resolve_hermes_bin", lambda: pytest.fail("resolved updater before refusal"))
+    runner = _make_runner()
+    result = await runner._handle_update_command(_make_event())
+    assert "operator-managed maintenance" in result
+    assert exit_marker.read_text() == "retained"
+    assert not (home / ".update_pending.json").exists()
+    assert not (home / ".update_output.txt").exists()

@@ -4,6 +4,15 @@ function Test-HermesUpdateShouldRetry {
         [string]$InstallRoot
     )
 
+    try {
+        $ErrorActionPreference = "Stop"
+        if (-not (Get-Command Get-HermesSelfUpdateInstallation -ErrorAction SilentlyContinue)) {
+            . (Join-Path $PSScriptRoot "installation-guard.ps1")
+        }
+        $installation = Get-HermesSelfUpdateInstallation -InstallRoot $InstallRoot
+        if ($installation.Refusal) { return $false }
+    } catch { return $false }
+
     if ($ExitCode -eq 0) { return $false }
     if ($ExitCode -ne 2) { return $true }
 

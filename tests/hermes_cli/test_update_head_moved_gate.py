@@ -19,6 +19,11 @@ import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runtime(isolated_update_runtime):
+    pass
+
+
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     calls = {"n": 0}

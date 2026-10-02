@@ -1,4 +1,4 @@
-"""Image-managed install refusal contract.
+"""Installation-wide self-update refusal contract.
 
 A refusal prints the real update command for the deployment kind, records a ``refused`` receipt (so
 fleet tooling sees "this install cannot self-update, use <command>" instead of a silent non-update),
@@ -10,18 +10,81 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 logger = logging.getLogger(__name__)
+
+SELF_UPDATE_DISABLED_SENTINEL = ".hermes-self-update-disabled"
+
+
+class UpdatePolicy(BaseModel):
+    """Read-only observation of the installation loaded by this interpreter."""
+
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["hermes.update-policy/v1"] = Field(alias="schema")
+    installation_root: str | None
+    allowed: StrictBool
+    code: str | None
+    message: str | None
 
 
 @dataclass(frozen=True)
 class UpdateRefusal:
     """Why an in-place update is refused, and what to run instead."""
 
-    code: str              # image-marker | image-marker-invalid | docker | nix | apt
+    code: str              # installation guard, image marker, or deployment kind
     message: str           # full user-facing text (multi-line ok)
     update_command: str    # the one-line remediation command
+
+
+def evaluate_installation_update_guard(project_root: Path) -> Optional[UpdateRefusal]:
+    """Only definite absence at the physical code root permits self-update.
+
+    The operator-owned entry is presence-only: never follow it or read its content.
+    This maintenance guard is independent of profile/configuration overrides.
+    """
+    command = "operator-managed maintenance"
+    try:
+        root = project_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return UpdateRefusal(
+            code="self-update-guard-unavailable",
+            message="✗ Cannot establish self-update protection for this installation. "
+                    "Self-update is refused. Use operator-managed maintenance.",
+            update_command=command,
+        )
+    try:
+        (root / SELF_UPDATE_DISABLED_SENTINEL).lstat()
+    except FileNotFoundError:
+        # ENOENT can also mean the resolved installation disappeared while
+        # looking up its entry. That is uncertainty, not permission to update.
+        try:
+            root.stat()
+        except OSError:
+            pass
+        else:
+            return None
+        return UpdateRefusal(
+            code="self-update-guard-unavailable",
+            message="✗ Cannot establish self-update protection for this installation. "
+                    "Self-update is refused. Use operator-managed maintenance.",
+            update_command=command,
+        )
+    except OSError:
+        return UpdateRefusal(
+            code="self-update-guard-unavailable",
+            message="✗ Cannot establish self-update protection for this installation. "
+                    "Self-update is refused. Use operator-managed maintenance.",
+            update_command=command,
+        )
+    return UpdateRefusal(
+        code="self-update-disabled",
+        message="✗ Self-update is disabled for this installation. "
+                "Use operator-managed maintenance.",
+        update_command=command,
+    )
 
 
 def _refusal(code: str, method: str, message: Optional[Callable[[str], str]] = None) -> UpdateRefusal:
@@ -40,8 +103,12 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
     """Return an :class:`UpdateRefusal` when in-place update must not run.
 
     ``None`` means the install is eligible for in-place update (git checkout or unknown-but-
-    mutable). Never raises; on any internal error it falls back to the heuristic layer only.
+    mutable). Installation lookup uncertainty refuses; legacy deployment probes retain
+    their heuristic fallback.
     """
+    refusal = evaluate_installation_update_guard(project_root)
+    if refusal is not None:
+        return refusal
     # Layer 1: baked provenance marker — authoritative when present.
     try:
         from hermes_cli.image_provenance import read_image_provenance
@@ -73,6 +140,35 @@ def evaluate_update_admission(project_root: Path) -> Optional[UpdateRefusal]:
     except Exception as exc:
         logger.debug("Install-method admission check failed: %s", exc)
     return None
+
+
+def observe_update_policy(project_root: Path) -> UpdatePolicy:
+    """Observe admission without receipts, updater preparation or remote probes."""
+    root = None
+    try:
+        root = project_root.resolve(strict=True)
+        refusal = evaluate_update_admission(root)
+        if refusal is None:
+            from hermes_cli.config import format_managed_message, is_managed
+
+            if is_managed():
+                refusal = UpdateRefusal(
+                    code="managed-install",
+                    message=format_managed_message("update Hermes Agent"),
+                    update_command="operator-managed maintenance",
+                )
+    except Exception:
+        refusal = UpdateRefusal(
+            code="self-update-guard-unavailable",
+            message="✗ Cannot establish self-update protection for this installation. "
+                    "Self-update is refused. Use operator-managed maintenance.",
+            update_command="operator-managed maintenance",
+        )
+    return UpdatePolicy(
+        schema="hermes.update-policy/v1", installation_root=str(root) if root is not None else None,
+        allowed=refusal is None, code=refusal.code if refusal else None,
+        message=refusal.message if refusal else None,
+    )
 
 
 def record_refusal_receipt(refusal: UpdateRefusal) -> None:
