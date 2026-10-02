@@ -63,12 +63,25 @@ def test_handoff_children_run_from_install_root(tmp_path: Path) -> None:
     assert "WORKING-DIRECTORY SELF-TEST: PASS" in result.stdout
 
 
-def test_handoff_fails_closed_when_install_root_cannot_be_entered(tmp_path: Path) -> None:
+def test_handoff_fails_closed_when_install_root_cannot_be_entered(
+    tmp_path: Path,
+) -> None:
     install_root = tmp_path / "missing" / "checkout"
+    home = install_root.parent
+    home.mkdir()
+    result_file = home / ".hermes-update-result.json"
+    result_file.write_bytes(b"existing result")
+    marker = home / ".hermes-update-in-progress"
+    marker.write_bytes(b"existing updater")
     launch_cwd = tmp_path / "profile-home"
     launch_cwd.mkdir()
 
     result = _run_cwd_self_test(install_root, launch_cwd, tmp_path / "temp")
 
-    assert result.returncode == 3, result.stdout
-    assert "cannot enter the install root" in result.stdout
+    assert result.returncode == 2, result.stdout
+    assert "operator-managed maintenance" in result.stdout
+    assert not install_root.exists()
+    assert not (home / "logs").exists()
+    assert result_file.read_bytes() == b"existing result"
+    assert marker.read_bytes() == b"existing updater"
+    assert not list(launch_cwd.iterdir())

@@ -27,7 +27,10 @@ export function inspectSelfUpdateInstallation(root: string): { root: string; ref
       code = 'self-update-disabled'
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { root: physicalRoot, refusal: null }
+        // Missing parent directories also produce marker ENOENT.
+        if (fs.statSync(physicalRoot).isDirectory()) {
+          return { root: physicalRoot, refusal: null }
+        }
       }
     }
   } catch {

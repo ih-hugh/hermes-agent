@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import { inspectSelfUpdateInstallation, runGuardedSelfUpdate } from './self-update-installation'
 
@@ -103,6 +103,51 @@ test('a distinct staged target refuses before preparing the unmarked selected ch
     assert.deepEqual(admitted, { ok: true, root: fs.realpathSync(selected) })
     assert.equal(preparations, 1)
   } finally {
+    fs.rmSync(scratch, { recursive: true, force: true })
+  }
+})
+
+test.each([false, true])('a lost physical root refuses preparation even when protected=%s', async protectedRoot => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-lost-update-root-'))
+  let restoreLookup: (() => void) | undefined
+
+  try {
+    const root = path.join(scratch, 'install')
+    const moved = path.join(scratch, 'moved')
+    fs.mkdirSync(root)
+
+    if (protectedRoot) {
+      fs.writeFileSync(path.join(root, '.hermes-self-update-disabled'), '')
+    }
+
+    const physicalRoot = fs.realpathSync.native(root)
+    const marker = path.join(physicalRoot, '.hermes-self-update-disabled')
+    const nativeLstat = fs.lstatSync
+
+    const lookup = vi.spyOn(fs, 'lstatSync').mockImplementation(candidate => {
+      if (candidate === marker) {
+        fs.renameSync(root, moved)
+      }
+
+      return nativeLstat(candidate)
+    })
+
+    restoreLookup = () => lookup.mockRestore()
+    let preparations = 0
+
+    const result = await runGuardedSelfUpdate(root, async () => {
+      preparations += 1
+
+      return { ok: true }
+    })
+
+    assert.equal(result.ok, false)
+    assert.equal(preparations, 0)
+    assert.equal(fs.existsSync(root), false)
+    assert.equal(fs.existsSync(path.join(moved, '.hermes-self-update-disabled')), protectedRoot)
+    assert.equal('error' in result && result.error, 'self-update-guard-unavailable')
+  } finally {
+    restoreLookup?.()
     fs.rmSync(scratch, { recursive: true, force: true })
   }
 })
