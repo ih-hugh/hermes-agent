@@ -490,6 +490,142 @@ def test_refuse_helper_raises_while_deleted_wal_held(tmp_path, force_wal):
 # (``proc_pidinfo(PROC_PIDLISTFDS)`` + ``proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)``) that supplies
 # each descriptor's ``(st_dev, st_ino)``. The judgement is unchanged: identity, never path text.
 
+@pytest.mark.parametrize("descriptor_count", [600, 1200])
+def test_darwin_fd_iteration_materializes_at_most_linear_list_bytes(
+    monkeypatch, descriptor_count,
+):
+    """Copying the whole completed list per FD exceeds a linear byte budget."""
+    import ctypes
+    import struct
+
+    copied_bytes = 0
+    capacities = []
+    queries = []
+    real_create_buffer = ctypes.create_string_buffer
+
+    def counted_buffer(size):
+        base = type(real_create_buffer(size))
+
+        class CountedBuffer(base):
+            def __getattribute__(self, name):
+                nonlocal copied_bytes
+                # ctypes supplies raw through its native attribute getter.
+                if name == "raw" and getattr(self, "is_listing", False):
+                    copied_bytes += ctypes.sizeof(self)
+                return super().__getattribute__(name)
+
+        return CountedBuffer()
+
+    class DescriptorLists:
+        def proc_pidinfo(self, pid, flavor, arg, listing, size):
+            assert (pid, flavor, arg) == (41, 1, 0)
+            listing.is_listing = True
+            capacities.append(size)
+            for index in range(min(descriptor_count, size // 8)):
+                # A listed non-vnode can become a vnode before the later query.
+                struct.pack_into("<iI", listing, index * 8, index + 10, 2 if index % 2 else 1)
+            return min(descriptor_count * 8, size)
+
+        def proc_pidfdinfo(self, pid, fd, flavor, record, size):
+            assert (pid, flavor, size) == (41, 2, 1200)
+            queries.append(fd)
+            struct.pack_into("<I", record, 24, 17)
+            struct.pack_into("<Q", record, 32, fd + 1)
+            record[176:195] = b"/scratch/state.db\x00\x00"
+            return size
+
+    monkeypatch.setattr(ctypes, "create_string_buffer", counted_buffer)
+    monkeypatch.setattr(hermes_state_dbfile, "_darwin_libproc", DescriptorLists)
+    monkeypatch.setattr(hermes_state_dbfile, "_darwin_all_pids", lambda _lib: [41])
+    observed = list(hermes_state_dbfile._iter_darwin_fd_targets())
+    assert queries == list(range(10, descriptor_count + 10))
+    assert observed == [
+        (41, fd, "/scratch/state.db", (17, fd + 1))
+        for fd in range(10, descriptor_count + 10)
+    ]
+    assert len(capacities) > 1, "the fixture must exercise list-buffer growth"
+    assert copied_bytes <= 2 * descriptor_count * 8
+
+
+@pytest.mark.macos_only
+def test_darwin_descriptor_pressure_preserves_refusal_before_sqlite(
+    tmp_path, monkeypatch,
+):
+    """A linked control stays safe; its retired inode refuses before any DB open."""
+    import resource
+    import threading
+
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 640:
+        pytest.skip("existing FD limit cannot accommodate the bounded pressure fixture")
+    path = tmp_path / "state.db"
+    path.write_bytes(b"scratch main generation")
+    sidecar = Path(str(path) + "-wal")
+    sidecar.write_bytes(b"linked generation")
+    ready = threading.Event()
+    release = threading.Event()
+    holder = []
+    errors = []
+
+    def hold_descriptors():
+        descriptors = []
+        try:
+            descriptors.extend(os.open(os.devnull, os.O_RDONLY) for _ in range(540))
+            descriptors.append(os.open(path, os.O_RDONLY))
+            fd = os.open(sidecar, os.O_RDONLY)
+            descriptors.append(fd)
+            st = os.fstat(fd)
+            holder.append((fd, (st.st_dev, st.st_ino)))
+            ready.set()
+            if not release.wait(60):
+                errors.append("holder release timed out")
+        except Exception as exc:
+            errors.append(repr(exc))
+            ready.set()
+        finally:
+            for fd in descriptors:
+                os.close(fd)
+
+    worker = threading.Thread(target=hold_descriptors)
+    worker.start()
+    try:
+        assert ready.wait(30), "descriptor holder did not become ready"
+        assert not errors
+        assert hermes_state_dbfile.count_db_holders(path) >= 1
+        assert iter_deleted_sqlite_sidecar_holders(path) == []
+        refuse_deleted_wal_generation(path)
+        fd, retired_identity = holder[0]
+        sidecar.unlink()
+        sidecar.write_bytes(b"replacement generation")
+        st = sidecar.stat()
+        assert (st.st_dev, st.st_ino) != retired_identity
+        observed = []
+        original = hermes_state_dbfile._iter_darwin_fd_targets
+
+        def observe_retired_descriptor():
+            for item in original():
+                if item[:2] == (os.getpid(), fd):
+                    observed.append(item[3])
+                yield item
+
+        def forbidden_connect(*_args, **_kwargs):
+            pytest.fail("SQLite opened before retired-generation refusal")
+
+        monkeypatch.setattr(
+            hermes_state_dbfile, "_iter_darwin_fd_targets", observe_retired_descriptor
+        )
+        monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
+        with pytest.raises(DeletedWalGenerationError):
+            SessionDB(path)
+        assert retired_identity in observed
+        assert path.read_bytes() == b"scratch main generation"
+        assert sidecar.read_bytes() == b"replacement generation"
+    finally:
+        release.set()
+        worker.join(30)
+    assert not worker.is_alive()
+    assert not errors
+
+
 @pytest.mark.macos_only
 def test_iter_finds_self_after_wal_unlink_on_darwin(tmp_path, force_wal):
     path = tmp_path / "state.db"
