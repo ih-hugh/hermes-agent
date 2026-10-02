@@ -589,3 +589,43 @@ profile-independent refusal, pre-effect, invalid-entry, native-helper and
 unmarked-install compatibility regressions. Qualification results and the final
 reviewed patch reference are recorded in the pull request; implementation does
 not establish deployment or live acceptance.
+
+
+## Cold Darwin admission buffer — 2026-10-01
+
+The stale-WAL observer and best-effort database holder count share a native
+file-descriptor iterator. It previously materialized the entire ctypes FD-list
+buffer for every descriptor, creating quadratic byte-copy work during cold
+SessionDB acquisition. The maintained patch reads each descriptor directly from
+the existing buffer. It preserves every PID and listed FD query, query order,
+buffer growth/lifetime, both stale-generation refusal observations, candidate
+requery, native path/case and device/inode judgments, and existing handling of
+uninspectable processes. No cache, type filter, prewarm, deadline, schema,
+dependency or recovery authority changes.
+
+The deterministic resource regression fails on the unchanged fork base and passes
+with the patch; it allows linear copying and verifies complete ordered queries,
+including descriptors whose earlier listed type differs from the later vnode
+query. Actual macOS descriptor-pressure coverage preserves the linked control,
+retired-generation refusal before SQLite, and holder counting. The affected local
+selection passed 294 tests, failed three and skipped 22 Linux cases. All three
+failures reproduced on exact base `888bd1ec`: two admission event-wait assertions
+and one quiescent-repair assertion refused by the separate native holder census.
+This local selection remains non-green; independent review and exact-head CI are
+still required.
+
+One names-only source measurement of fresh cold DB acquisition refused on baseline
+after 10.262 seconds and acquired on the candidate in 2.081 seconds. Both native
+scans ran under the unchanged five-second context. The deadline is cooperative: a
+refusal may return after native work settles, and initialized scratch DB/profile
+files remained in both cases. This is not a hard cancellation or no-effect claim.
+Host load was uncontrolled; no speedup guarantee is inferred. The source-only
+measurement did not run the protected HTTP/provider/workspace request, and it
+does not clear the original installed-pair HTTP 504.
+
+No upstream submission or equivalent released upstream fix is qualified here.
+Retire this patch when a released upstream equivalent preserves observation and
+refusal behavior and passes the retained resource/native regressions. Reviewed
+fork merge and exact-head CI precede a separate reviewed BytFactory pin and renewed
+original source-pair qualification. Shared gateway provisioning, deployment and
+activation remain separate gates.
